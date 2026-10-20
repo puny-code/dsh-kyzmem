@@ -106,7 +106,7 @@
     "compression": "^1.8.2",
     "content-type": "^3.1.1",
     "ipaddr.js": "^2.5.0",
-    "js-yaml": "^4.1.0",
+    "js-yaml": "^5.5.0",
     "lightningcss": "^1.32.0",
     "tsdown": "^0.23.1",
     "typescript": "^5.9.3",
