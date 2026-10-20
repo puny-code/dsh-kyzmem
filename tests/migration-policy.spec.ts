@@ -37,7 +37,10 @@ describe('legacy migration policy against the real module and SQLite files', () 
       expect(new Date(pointer.claimedAt).toISOString()).toBe(pointer.claimedAt)
       expect(migrateProjectDb(dir, second)).toBe('already-migrated')
       const warning = migrationWarning(dir, second, 'already-migrated')!
-      for (const name of [first.dbName, second.dbName, second.legacyDbName, first.cwd, 'kyzmem_export']) expect(warning).toContain(name)
+      // cwd 是经 JSON.stringify 落进警告文本的：Windows 路径的反斜杠会被转义成 `\\`，
+      // 直接 toContain(原始路径) 在 Windows 上必然失败。断言转义后的形态。
+      const escapedCwd = JSON.stringify(first.cwd).slice(1, -1)
+      for (const name of [first.dbName, second.dbName, second.legacyDbName, escapedCwd, 'kyzmem_export']) expect(warning).toContain(name)
       expect(existsSync(join(dir, second.dbName))).toBe(false)
       expect(migrateProjectDb(dir, first)).toBe('none')
       expect(readFileSync(`${legacy}.migrated-to`)).toEqual(pointerBytes)

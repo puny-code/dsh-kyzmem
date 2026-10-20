@@ -18,26 +18,6 @@ export type IngestModeConfig = 'off' | 'light' | 'eager'
 /** 信念巩固档位：off 仅允许手动 kyzmem_reflect；suggest 会话结束只登记待巩固；auto 会话结束后自动巩固。 */
 export type ReflectModeConfig = 'off' | 'suggest' | 'auto'
 
-/** Jev System One 模型子配置：DEFER 模糊带自动裁决与矛盾边确认；默认关闭时四态判定保持纯规则。 */
-export interface JevConfig {
-  /** 是否启用 Jev 裁决；默认 false。显式 true 时 apiKey 必填，缺失在加载期报错。 */
-  enabled?: boolean
-  /** Jev API 密钥（Bearer 认证）。 */
-  apiKey?: string
-  /** Jev API 端点根地址；默认 https://api.typesafe.ai。 */
-  baseUrl?: string
-  /** Jev 模型名；默认 jev-latest。 */
-  model?: string
-  /** 单次裁决请求的超时毫秒数；默认 3000。 */
-  timeoutMs?: number
-  /** 模糊带裁决：Noul 概率高于该值判「同一条」并自动 merge；默认 0.85。 */
-  deferMergeAbove?: number
-  /** 模糊带裁决：Noul 概率低于该值判「不同条」并放行 accept；默认 0.15。 */
-  deferAcceptBelow?: number
-  /** 矛盾确认：Noul 概率达到该值才建立 contradicts 边，低于则放弃建边；默认 0.8。 */
-  contradictMinProbability?: number
-}
-
 /** 插件配置。 */
 export interface KyzmemConfig {
   /** 两个 SQLite 分库与嵌入模型缓存的根目录；默认 `~/.dsh/kyzmem`。 */
@@ -60,10 +40,8 @@ export interface KyzmemConfig {
   provider?: string
   /** 蒸馏/摄取覆盖路由的 model；必须与 provider 成对提供。 */
   model?: string
-  /** 衰减：最近访问超过该天数才可能被归档；默认 30。 */
+  /** 衰减：从未被检索命中、且最近访问超过该天数才可能被归档；默认 90。 */
   decayAfterDays?: number
-  /** 衰减：importance 低于该值才可能被归档；默认 0.3。 */
-  decayImportanceBelow?: number
   /** 画像注入的 token 预算（估算 ceil(len/4)）；默认 1024。 */
   injectTokenBudget?: number
   /** 画像分级递减预算：首条正文字符数；默认 160。 */
@@ -96,8 +74,6 @@ export interface KyzmemConfig {
   historyBackfillIncludeSeeded?: boolean
   /** 历史回填默认规则：是否包含无 cwd 的会话（无法归属项目分库）；默认 false。 */
   historyBackfillIncludeNoCwd?: boolean
-  /** Jev System One 裁决子配置；默认关闭（纯规则四态判定，行为与旧版一致）。 */
-  jev?: JevConfig
   /**
    * Язык текстов, которые плагин формирует сам: имена комнат, сообщения инструментов.
    * «auto» (по умолчанию) — язык системы. Интерфейс панели настраивается отдельно,
@@ -128,18 +104,6 @@ export interface ResolvedHistoryRules {
   readonly includeNoCwd: boolean
 }
 
-/** 解析后的 Jev 子配置（默认值已落地，实现不再判空）。 */
-export interface ResolvedJevConfig {
-  readonly enabled: boolean
-  readonly apiKey: string | undefined
-  readonly baseUrl: string
-  readonly model: string
-  readonly timeoutMs: number
-  readonly deferMergeAbove: number
-  readonly deferAcceptBelow: number
-  readonly contradictMinProbability: number
-}
-
 /** 解析后的完整配置（显式默认值集中在此一步，实现不再 `?? 默认`）。 */
 export interface ResolvedKyzmemConfig {
   readonly dbDir: string
@@ -153,7 +117,6 @@ export interface ResolvedKyzmemConfig {
   /** 成对校验后的路由覆盖；undefined = 从会话日志解析路由。 */
   readonly routeOverride: { readonly provider: string; readonly model: string } | undefined
   readonly decayAfterDays: number
-  readonly decayImportanceBelow: number
   readonly injectTokenBudget: number
   readonly injectItemBudgetStart: number
   readonly injectItemBudgetDecay: number
@@ -166,8 +129,6 @@ export interface ResolvedKyzmemConfig {
   readonly reviewScheduling: boolean
   /** 历史回填默认规则（历史会话 → 学习核心的一次性/按需回填）。 */
   readonly historyBackfill: ResolvedHistoryRules
-  /** Jev System One 裁决子配置（默认关闭）。 */
-  readonly jev: ResolvedJevConfig
   /** Язык вывода серверной половины (после разворачивания «auto» в язык системы). */
   readonly language: KyzmemLanguage
   /** Слова пользователя для вычистки секретов (действуют поверх языковых наборов). */
@@ -177,13 +138,13 @@ export interface ResolvedKyzmemConfig {
 /** 合法配置键集合（未知键 loud 失败）。 */
 const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'legacyMigration', 'dbDir', 'injectProfile', 'profileTopN', 'modelCacheDir', 'hfEndpoint',
-  'ingest', 'reflect', 'provider', 'model', 'decayAfterDays', 'decayImportanceBelow',
+  'ingest', 'reflect', 'provider', 'model', 'decayAfterDays',
   'injectTokenBudget', 'injectItemBudgetStart', 'injectItemBudgetDecay', 'injectItemBudgetFloor',
   'rankRecencyWeight', 'rankProofWeight', 'queryRewrite',
   'autoSlot', 'reviewScheduling', 'assessReminder',
   'historyBackfillDays', 'historyBackfillMaxTurnsPerSession', 'historyBackfillMaxTotalTurns',
   'historyBackfillIncludeSubagents', 'historyBackfillIncludeSeeded', 'historyBackfillIncludeNoCwd',
-  'jev', 'language', 'redactWords',
+  'language', 'redactWords',
 ])
 
 const INGEST_MODES: ReadonlySet<string> = new Set(['off', 'light', 'eager'])
@@ -202,7 +163,6 @@ export const Config: z<KyzmemConfig> = z.object({
   provider: z.string(),
   model: z.string(),
   decayAfterDays: z.number().step(1).min(1).max(3650),
-  decayImportanceBelow: z.number().min(0).max(1),
   injectTokenBudget: z.number().step(1).min(128).max(8192),
   injectItemBudgetStart: z.number().step(1).min(40).max(2000),
   injectItemBudgetDecay: z.number().min(0.5).max(1),
@@ -219,16 +179,6 @@ export const Config: z<KyzmemConfig> = z.object({
   historyBackfillIncludeSubagents: z.boolean(),
   historyBackfillIncludeSeeded: z.boolean(),
   historyBackfillIncludeNoCwd: z.boolean(),
-  jev: z.object({
-    enabled: z.boolean(),
-    apiKey: z.string(),
-    baseUrl: z.string(),
-    model: z.string(),
-    timeoutMs: z.number().step(1).min(1000).max(60000),
-    deferMergeAbove: z.number().min(0.5).max(1),
-    deferAcceptBelow: z.number().min(0).max(0.5),
-    contradictMinProbability: z.number().min(0.5).max(1),
-  }) as unknown as z<JevConfig>,
   language: z.string() as unknown as z<LanguageSetting>,
   redactWords: z.array(z.string()),
 })
@@ -265,9 +215,6 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
   }
   if (config.decayAfterDays !== undefined && (!Number.isInteger(config.decayAfterDays) || config.decayAfterDays < 1 || config.decayAfterDays > 3650)) {
     throw new Error('dsh-kyzmem: decayAfterDays must be an integer in [1, 3650]')
-  }
-  if (config.decayImportanceBelow !== undefined && (config.decayImportanceBelow < 0 || config.decayImportanceBelow > 1)) {
-    throw new Error('dsh-kyzmem: decayImportanceBelow must be in [0, 1]')
   }
   if (config.injectTokenBudget !== undefined && (!Number.isInteger(config.injectTokenBudget) || config.injectTokenBudget < 128 || config.injectTokenBudget > 8192)) {
     throw new Error('dsh-kyzmem: injectTokenBudget must be an integer in [128, 8192]')
@@ -307,30 +254,6 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     && (!Number.isInteger(config.historyBackfillMaxTotalTurns) || config.historyBackfillMaxTotalTurns < 1 || config.historyBackfillMaxTotalTurns > 5000)) {
     throw new Error('dsh-kyzmem: historyBackfillMaxTotalTurns must be an integer in [1, 5000]')
   }
-  const jev = config.jev
-  if (jev !== undefined) {
-    if (jev.enabled !== undefined && typeof jev.enabled !== 'boolean') {
-      throw new Error('dsh-kyzmem: jev.enabled must be a boolean')
-    }
-    if (jev.enabled === true && (jev.apiKey === undefined || jev.apiKey === '')) {
-      throw new Error('dsh-kyzmem: jev.enabled=true requires jev.apiKey')
-    }
-    if (jev.timeoutMs !== undefined && (!Number.isInteger(jev.timeoutMs) || jev.timeoutMs < 1000 || jev.timeoutMs > 60000)) {
-      throw new Error('dsh-kyzmem: jev.timeoutMs must be an integer in [1000, 60000]')
-    }
-    if (jev.deferMergeAbove !== undefined && (jev.deferMergeAbove < 0.5 || jev.deferMergeAbove > 1)) {
-      throw new Error('dsh-kyzmem: jev.deferMergeAbove must be in [0.5, 1]')
-    }
-    if (jev.deferAcceptBelow !== undefined && (jev.deferAcceptBelow < 0 || jev.deferAcceptBelow > 0.5)) {
-      throw new Error('dsh-kyzmem: jev.deferAcceptBelow must be in [0, 0.5]')
-    }
-    if (jev.contradictMinProbability !== undefined && (jev.contradictMinProbability < 0.5 || jev.contradictMinProbability > 1)) {
-      throw new Error('dsh-kyzmem: jev.contradictMinProbability must be in [0.5, 1]')
-    }
-    if ((jev.deferAcceptBelow ?? 0.15) >= (jev.deferMergeAbove ?? 0.85)) {
-      throw new Error('dsh-kyzmem: jev.deferAcceptBelow must be less than jev.deferMergeAbove')
-    }
-  }
   const dbDir = config.dbDir ?? join(homedir(), '.dsh', 'kyzmem')
   return {
     dbDir,
@@ -344,8 +267,7 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     language: resolveLanguage(config.language ?? 'auto'),
     redactWords: config.redactWords ?? [],
     routeOverride: hasProvider && hasModel ? { provider: config.provider!, model: config.model! } : undefined,
-    decayAfterDays: config.decayAfterDays ?? 30,
-    decayImportanceBelow: config.decayImportanceBelow ?? 0.3,
+    decayAfterDays: config.decayAfterDays ?? 90,
     injectTokenBudget: config.injectTokenBudget ?? 1024,
     injectItemBudgetStart: config.injectItemBudgetStart ?? 160,
     injectItemBudgetDecay: config.injectItemBudgetDecay ?? 0.9,
@@ -363,16 +285,6 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
       includeSubagents: config.historyBackfillIncludeSubagents ?? false,
       includeSeeded: config.historyBackfillIncludeSeeded ?? false,
       includeNoCwd: config.historyBackfillIncludeNoCwd ?? false,
-    },
-    jev: {
-      enabled: config.jev?.enabled ?? false,
-      apiKey: config.jev?.apiKey,
-      baseUrl: config.jev?.baseUrl ?? 'https://api.typesafe.ai',
-      model: config.jev?.model ?? 'jev-latest',
-      timeoutMs: config.jev?.timeoutMs ?? 3000,
-      deferMergeAbove: config.jev?.deferMergeAbove ?? 0.85,
-      deferAcceptBelow: config.jev?.deferAcceptBelow ?? 0.15,
-      contradictMinProbability: config.jev?.contradictMinProbability ?? 0.8,
     },
   }
 }

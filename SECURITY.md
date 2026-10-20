@@ -16,7 +16,7 @@ Worth knowing before you report — this plugin:
 
 - ingests **full session content** (user and assistant text) into local SQLite databases under `~/.dsh/kyzmem/`;
 - renders that content in the panel (loopback HTTP, see below);
-- optionally calls external LLM endpoints (the judge "Jev", remote embedders) with content you configured it to send.
+- optionally calls external LLM endpoints (remote embedders) with content you configured it to send.
 
 Secrets are redacted before storage (`src/redact.ts` — PEM/Bearer/`sk-`/`ghp_`/AKIA patterns, locale-specific labelled rules, plus your own deny-list in config). The panel is served on loopback only, behind the host's auth, with write actions further gated by peer/origin/content-type checks.
 

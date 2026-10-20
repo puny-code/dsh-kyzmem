@@ -47,20 +47,19 @@ describe('KyzmemStore v2 additions', () => {
     expect(stats.opLogCount).toBeGreaterThan(0)
   })
 
-  it('decay 归档低重要性且长期未访问的条目', async () => {
+  it('decay 归档长期零访问的条目（importance 不再是判据）', async () => {
     const path = join(dir, 'user.db')
     await store.write({ scope: 'user', kind: 'fact', content: '将被衰减', importance: 0.1 })
-    await store.write({ scope: 'user', kind: 'fact', content: '重要性高保留', importance: 0.9 })
+    await store.write({ scope: 'user', kind: 'fact', content: '重要性高但同样零访问', importance: 0.9 })
     // 把全部条目的最近访问时间拨回 40 天前，模拟长期未访问；
-    // 并清掉写入期自动排的复习日程——进入复习调度的条目不参与自动衰减（由复习结果决定命运）。
+    // 并清掉写入期自动排的复习日程——复习宽限期内（30 天）的条目不参与自动归档。
     const { DatabaseSync } = await import('node:sqlite')
     const raw = new DatabaseSync(path)
     raw.prepare('UPDATE nodes SET last_accessed_at = ?, next_review_at = NULL').run(Date.now() - 40 * 86_400_000)
     raw.close()
-    const archived = await store.decay({ importanceBelow: 0.3, olderThanDays: 30 })
-    expect(archived).toBe(1)
-    const survivors = await store.topActive('user', 10)
-    expect(survivors.map(record => record.content)).toEqual(['重要性高保留'])
+    const archived = await store.decay({ olderThanDays: 30 })
+    expect(archived).toBe(2)
+    expect(await store.topActive('user', 10)).toEqual([])
   })
 
   it('findContradictions 只报高相似近邻，linkEdge 幂等建边', async () => {
@@ -281,7 +280,7 @@ describe('KyzmemStore 宫殿与复习调度（schema v6）', () => {
     expect((await migrated.get(asMemoryId('legacy-1')))?.slot).toEqual({ room: 'fact', index: 2 })
     await migrated.close()
     const check = new DatabaseSync(path)
-    expect((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value).toBe('13')
+    expect((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value).toBe('14')
     const indexes = (check.prepare('PRAGMA index_list(nodes)').all() as unknown as { name: string }[]).map(row => row.name)
     expect(indexes).toContain('nodes_slot')
     expect(indexes).toContain('nodes_review_due')
@@ -306,6 +305,6 @@ describe('KyzmemStore 宫殿与复习调度（schema v6）', () => {
     const check = new DatabaseSync(path)
     const version = (check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value
     check.close()
-    expect(version).toBe('13')
+    expect(version).toBe('14')
   })
 })

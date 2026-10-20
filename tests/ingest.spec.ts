@@ -292,7 +292,10 @@ describe('ingestPreviousTurn', () => {
 
 describe('摄取节流', () => {
   it('activityScore 四信号计分与封顶', () => {
-    expect(activityScore({ userChars: 0, completedTurns: 0, toolResults: 0, toolNames: new Set() })).toBe(0)
+    // 零工具轮次也记 1 分多样性：用户立规矩（"以后文案别对仗"）往往一句工具都不调，
+    // 记 0 分会让这类轮次的算术上限（3+1+0+0=4）永远够不到 ACTIVITY_THRESHOLD。
+    expect(activityScore({ userChars: 0, completedTurns: 0, toolResults: 0, toolNames: new Set() })).toBe(1)
+    expect(activityScore({ userChars: 300, completedTurns: 2, toolResults: 0, toolNames: new Set() })).toBeGreaterThanOrEqual(ACTIVITY_THRESHOLD)
     expect(activityScore({ userChars: 300, completedTurns: 1, toolResults: 10, toolNames: new Set(['a', 'b', 'c']) })).toBe(8)
     // userChars 封顶 3 分（150 字符即满档），toolResults 封顶 2 分（10 条即满档），多样性 1-2 种工具 1 分。
     expect(activityScore({ userChars: 150, completedTurns: 0, toolResults: 10, toolNames: new Set(['a', 'b']) })).toBe(6)

@@ -13,8 +13,7 @@ describe('resolveConfig', () => {
     expect(resolved.ingest).toBe('off')
     expect(resolved.legacyMigration).toBe('eager')
     expect(resolved.routeOverride).toBeUndefined()
-    expect(resolved.decayAfterDays).toBe(30)
-    expect(resolved.decayImportanceBelow).toBe(0.3)
+    expect(resolved.decayAfterDays).toBe(90)
     expect(resolved.injectTokenBudget).toBe(1024)
     expect(resolved.rankRecencyWeight).toBe(0.2)
     expect(resolved.rankProofWeight).toBe(0.1)
@@ -30,7 +29,7 @@ describe('resolveConfig', () => {
       dbDir: '/tmp/e', injectProfile: false, profileTopN: 3, modelCacheDir: '/tmp/m',
       hfEndpoint: 'https://hf-mirror.com', ingest: 'eager',
       provider: 'deepseek', model: 'deepseek-v4-flash',
-      decayAfterDays: 7, decayImportanceBelow: 0.5,
+      decayAfterDays: 7,
       injectTokenBudget: 2048, rankRecencyWeight: 0, rankProofWeight: 1.5,
       queryRewrite: false,
       injectItemBudgetStart: 200, injectItemBudgetDecay: 0.8, injectItemBudgetFloor: 40,
@@ -44,7 +43,6 @@ describe('resolveConfig', () => {
     expect(resolved.ingest).toBe('eager')
     expect(resolved.routeOverride).toEqual({ provider: 'deepseek', model: 'deepseek-v4-flash' })
     expect(resolved.decayAfterDays).toBe(7)
-    expect(resolved.decayImportanceBelow).toBe(0.5)
     expect(resolved.injectTokenBudget).toBe(2048)
     expect(resolved.rankRecencyWeight).toBe(0)
     expect(resolved.rankProofWeight).toBe(1.5)
@@ -75,7 +73,6 @@ describe('resolveConfig', () => {
 
   it('decay 参数越界 loud 失败', () => {
     expect(() => resolveConfig({ decayAfterDays: 0 })).toThrow(/decayAfterDays/)
-    expect(() => resolveConfig({ decayImportanceBelow: 2 })).toThrow(/decayImportanceBelow/)
   })
 
   it('injectTokenBudget 越界 loud 失败', () => {
@@ -107,60 +104,6 @@ describe('resolveConfig', () => {
 
   it('assessReminder 非布尔 loud 失败', () => {
     expect(() => resolveConfig({ assessReminder: 'yes' as never })).toThrow(/assessReminder/)
-  })
-})
-
-describe('jev config', () => {
-  it('缺省关闭，端点/模型/三阈值落默认值', () => {
-    const resolved = resolveConfig({}).jev
-    expect(resolved.enabled).toBe(false)
-    expect(resolved.apiKey).toBeUndefined()
-    expect(resolved.baseUrl).toBe('https://api.typesafe.ai')
-    expect(resolved.model).toBe('jev-latest')
-    expect(resolved.timeoutMs).toBe(3000)
-    expect(resolved.deferMergeAbove).toBe(0.85)
-    expect(resolved.deferAcceptBelow).toBe(0.15)
-    expect(resolved.contradictMinProbability).toBe(0.8)
-  })
-
-  it('显式子配置全量透传（enabled=false 时 apiKey 可缺）', () => {
-    const resolved = resolveConfig({
-      jev: { enabled: true, apiKey: 'k', baseUrl: 'https://j.example', model: 'jev-x', timeoutMs: 5000, deferMergeAbove: 0.9, deferAcceptBelow: 0.1, contradictMinProbability: 0.9 },
-    }).jev
-    expect(resolved.enabled).toBe(true)
-    expect(resolved.apiKey).toBe('k')
-    expect(resolved.baseUrl).toBe('https://j.example')
-    expect(resolved.model).toBe('jev-x')
-    expect(resolved.timeoutMs).toBe(5000)
-    expect(resolved.deferMergeAbove).toBe(0.9)
-    expect(resolved.deferAcceptBelow).toBe(0.1)
-    expect(resolved.contradictMinProbability).toBe(0.9)
-  })
-
-  it('enabled=true 缺 apiKey loud 失败', () => {
-    expect(() => resolveConfig({ jev: { enabled: true } })).toThrow(/jev\.apiKey/)
-    expect(() => resolveConfig({ jev: { enabled: true, apiKey: '' } })).toThrow(/jev\.apiKey/)
-  })
-
-  it('enabled 非布尔 loud 失败', () => {
-    expect(() => resolveConfig({ jev: { enabled: 'yes' as never } })).toThrow(/jev\.enabled/)
-  })
-
-  it('timeoutMs 越界或非整数 loud 失败', () => {
-    expect(() => resolveConfig({ jev: { timeoutMs: 999 } })).toThrow(/jev\.timeoutMs/)
-    expect(() => resolveConfig({ jev: { timeoutMs: 60001 } })).toThrow(/jev\.timeoutMs/)
-    expect(() => resolveConfig({ jev: { timeoutMs: 2500.5 } })).toThrow(/jev\.timeoutMs/)
-  })
-
-  it('三阈值越界 loud 失败', () => {
-    expect(() => resolveConfig({ jev: { deferMergeAbove: 0.4 } })).toThrow(/deferMergeAbove/)
-    expect(() => resolveConfig({ jev: { deferAcceptBelow: 0.6 } })).toThrow(/deferAcceptBelow/)
-    expect(() => resolveConfig({ jev: { contradictMinProbability: 0.2 } })).toThrow(/contradictMinProbability/)
-  })
-
-  it('deferAcceptBelow ≥ deferMergeAbove 交叉 loud 失败', () => {
-    // 各自合法（端点 0.5）但组合无效：accept 阈值不得高于 merge 阈值。
-    expect(() => resolveConfig({ jev: { deferAcceptBelow: 0.5, deferMergeAbove: 0.5 } })).toThrow(/less than/)
   })
 })
 

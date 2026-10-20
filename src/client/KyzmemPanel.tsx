@@ -37,7 +37,6 @@ const ICONS = {
   beliefs: <><path d="M9 18h6" /><path d="M10 21h4" /><path d="M12 3a6 6 0 00-3.5 10.9c.7.5 1.1 1.2 1.3 2.1h4.4c.2-.9.6-1.6 1.3-2.1A6 6 0 0012 3z" /></>,
   log: <><line x1="5" y1="6" x2="19" y2="6" /><line x1="5" y1="12" x2="19" y2="12" /><line x1="5" y1="18" x2="13" y2="18" /></>,
   backfill: <><path d="M12 4v11" /><path d="M7 10l5 5 5-5" /><line x1="4" y1="20" x2="20" y2="20" /></>,
-  jev: <><path d="M12 3 L4 8 V16 L12 21 L20 16 V8 Z" /><path d="M9 12l2 2 4-4" /></>,
   spiral: <><path d="M12 12 m -3 0 a 3 3 0 1 0 6 0 a 3 3 0 1 0 -6 0" /><path d="M12 12 m -7 0 a 7 7 0 1 0 14 0 a 7 7 0 1 0 -14 0" fill="none" /><path d="M12 12 m -11 0 a 11 11 0 1 0 22 0 a 11 11 0 1 0 -22 0" fill="none" strokeDasharray="2 3" /></>,
   // Scope 三宫格
   user: <><circle cx="12" cy="8" r="4" /><path d="M4 20c0-4 4-6 8-6s8 2 8 6" /></>,
@@ -2647,233 +2646,6 @@ function HistoryBackfillCard({ t, toast }: { t: T; toast: ToastController }): Re
   )
 }
 
-/** Jev 面板视图（GET/POST /api/kyzmem/jev-config 的响应体；密钥只有掩码，明文不出进程）。 */
-interface JevPanelView {
-  readonly enabled: boolean
-  readonly apiKeySet: boolean
-  readonly apiKeyMask: string | null
-  readonly baseUrl: string
-  readonly model: string
-  readonly timeoutMs: number
-  readonly deferMergeAbove: number
-  readonly deferAcceptBelow: number
-  readonly contradictMinProbability: number
-}
-
-/**
- * Jev 裁决配置：面板覆盖 cordis.yml 的连接字段（开关 / 密钥 / 端点 / 模型 / 超时），
- * 保存进 `<dbDir>/jev-config.json`（0600）后立即生效，无需重启。密钥输入框只进不出
- * （placeholder 回显掩码）；留空 = 保留现有覆盖，清除走「清除已存密钥」。
- */
-function JevConfigCard({ t, toast }: { t: T; toast: ToastController }): React.ReactElement {
-  const [view, setView] = useState<JevPanelView | null>(null)
-  const [enabled, setEnabled] = useState(false)
-  const [apiKey, setApiKey] = useState('')
-  const [baseUrl, setBaseUrl] = useState('')
-  const [model, setModel] = useState('')
-  const [timeoutMs, setTimeoutMs] = useState('3000')
-  const [busy, setBusy] = useState(false)
-  const [testing, setTesting] = useState(false)
-
-  // 初载：视图只读展示 + 表单初始值；密钥不回填输入框（保持空 = 不改动）。
-  useEffect(() => {
-    let cancelled = false
-    api<JevPanelView>('jev-config')
-      .then((data) => {
-        if (cancelled) return
-        setView(data)
-        setEnabled(data.enabled)
-        setBaseUrl(data.baseUrl)
-        setModel(data.model)
-        setTimeoutMs(String(data.timeoutMs))
-      })
-      .catch((error: Error) => { if (!cancelled) toast.push('error', `${t('jevLoadFailed')}: ${error.message}`) })
-    return () => { cancelled = true }
-  }, [t, toast])
-
-  const save = (): void => {
-    setBusy(true)
-    api<{ ok: boolean; view: JevPanelView }>('jev-config', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      // 密钥留空 = 不发送该字段（保留现有覆盖）；清空语义走 clearKey。
-      body: JSON.stringify({
-        enabled,
-        baseUrl: baseUrl.trim(),
-        model: model.trim(),
-        timeoutMs: Number(timeoutMs),
-        ...(apiKey.trim() === '' ? {} : { apiKey: apiKey.trim() }),
-      }),
-    })
-      .then((data) => {
-        setView(data.view)
-        setApiKey('')
-        toast.push('success', t('jevSaved'))
-      })
-      .catch((error: Error) => { toast.push('error', error.message) })
-      .finally(() => { setBusy(false) })
-  }
-
-  const clearKey = (): void => {
-    setBusy(true)
-    api<{ ok: boolean; view: JevPanelView }>('jev-config', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      // 空串 = 清除面板密钥覆盖，回落 cordis.yml 的值。
-      body: JSON.stringify({ apiKey: '' }),
-    })
-      .then((data) => { setView(data.view); toast.push('success', t('jevKeyCleared')) })
-      .catch((error: Error) => { toast.push('error', error.message) })
-      .finally(() => { setBusy(false) })
-  }
-
-  // 连接测试：用当前输入值（不落覆盖文件）发最小 ping 问题；密钥留空 = 测已存值。
-  const testConnection = (): void => {
-    setTesting(true)
-    api<{ ok: boolean; elapsedMs: number; probability: number | undefined; error: string | undefined }>('jev-test', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        baseUrl: baseUrl.trim(),
-        model: model.trim(),
-        ...(apiKey.trim() === '' ? {} : { apiKey: apiKey.trim() }),
-      }),
-    })
-      .then((result) => {
-        if (result.ok) toast.push('success', t('jevTestOk', { ms: result.elapsedMs, p: result.probability }))
-        else toast.push('error', t('jevTestFail', { error: result.error ?? '' }))
-      })
-      .catch((error: Error) => { toast.push('error', error.message) })
-      .finally(() => { setTesting(false) })
-  }
-
-  if (view === null) return <span className={styles.jevMuted}>{t('loading')}</span>
-
-  return (
-    <div className={styles.jev}>
-      <p className={styles.jevIntro}>{t('jevIntro')}</p>
-      <div className={styles.jevToggleRow}>
-        <label className={styles.jevToggle}>
-          <input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} />
-          {t('jevEnabled')}
-        </label>
-        <span className={styles.jevStatus}>{view.enabled ? t('jevStatusOn') : t('jevStatusOff')}</span>
-      </div>
-      <div className={styles.jevForm}>
-        <label className={styles.jevField}>
-          <span>{t('jevApiKey')}</span>
-          <input className={styles.input} type="password" value={apiKey} autoComplete="off"
-            placeholder={view.apiKeyMask ?? t('jevApiKeyUnset')}
-            onChange={event => setApiKey(event.target.value)} />
-          <span className={styles.jevMuted}>{t('jevApiKeyHint')}</span>
-        </label>
-        <label className={styles.jevField}>
-          <span>{t('jevBaseUrl')}</span>
-          <input className={styles.input} value={baseUrl} onChange={event => setBaseUrl(event.target.value)} />
-        </label>
-        <label className={styles.jevField}>
-          <span>{t('jevModel')}</span>
-          <input className={styles.input} value={model} onChange={event => setModel(event.target.value)} />
-        </label>
-        <label className={styles.jevField}>
-          <span>{t('jevTimeoutMs')}</span>
-          <input className={styles.input} type="number" min={1000} max={60000} value={timeoutMs}
-            onChange={event => setTimeoutMs(event.target.value)} />
-        </label>
-      </div>
-      <div className={styles.jevMuted}>{t('jevThresholdsTitle')}</div>
-      <div className={styles.jevMuted}>{t('jevThresholdLine', {
-        merge: view.deferMergeAbove,
-        accept: view.deferAcceptBelow,
-        contradict: view.contradictMinProbability,
-      })}</div>
-      <div className={styles.jevActions}>
-        <button type="button" className={`${styles.button} ${styles.primary}`} disabled={busy} onClick={save}>
-          {t('jevSave')}
-        </button>
-        <button type="button" className={styles.button} disabled={busy || testing} onClick={testConnection}>
-          {t('jevTest')}
-        </button>
-        {view.apiKeySet && (
-          <button type="button" className={styles.button} disabled={busy} onClick={clearKey}>
-            {t('jevClearKey')}
-          </button>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/** 近期裁决观测行视图（GET /api/kyzmem/jev-observations 的 items 元素）。 */
-interface JevObservationView {
-  readonly at: number
-  readonly site: 'band' | 'contradiction'
-  readonly question: string
-  readonly answered: boolean
-  readonly probability: number | undefined
-  readonly elapsedMs: number
-  readonly error: string | undefined
-  readonly verdict: 'merge' | 'accept' | 'defer' | 'confirm' | 'reject' | 'fallback'
-}
-
-/** verdict → 徽标文案键（动态模板字符串在 KyzmemKey union 下不可静态检查，改用映射表）。 */
-const VERDICT_KEY: Readonly<Record<JevObservationView['verdict'], KyzmemKey>> = {
-  merge: 'jevObsVerdictMerge',
-  accept: 'jevObsVerdictAccept',
-  defer: 'jevObsVerdictDefer',
-  confirm: 'jevObsVerdictConfirm',
-  reject: 'jevObsVerdictReject',
-  fallback: 'jevObsVerdictFallback',
-}
-
-/**
- * 近期裁决观测：轮询 /api/kyzmem/jev-observations（1.5s），展示判定结果 / Jev 是否给出答案 /
- * 耗时 / 回落原因，帮助排查「这条为什么被搁置」。数据只存进程内存，重启清空。
- */
-function JevObservationsCard({ t, toast }: { t: T; toast: ToastController }): React.ReactElement {
-  const [items, setItems] = useState<readonly JevObservationView[] | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    // 初载失败弹 toast；轮询失败静默重试（观测卡不值得刷屏打扰）。
-    const reload = (reportFailure: boolean): void => {
-      api<{ items: readonly JevObservationView[] }>('jev-observations')
-        .then((data) => { if (!cancelled) setItems(data.items) })
-        .catch((error: Error) => {
-          if (cancelled) return
-          setItems(previous => previous ?? [])
-          if (reportFailure) toast.push('error', `${t('jevObsLoadFailed')}: ${error.message}`)
-        })
-    }
-    reload(true)
-    const timer = window.setInterval(() => reload(false), 1500)
-    return () => { cancelled = true; window.clearInterval(timer) }
-  }, [t, toast])
-
-  if (items === null) return <span className={styles.jevMuted}>{t('loading')}</span>
-  if (items.length === 0) return <span className={styles.jevMuted}>{t('jevObsEmpty')}</span>
-
-  return (
-    <div className={styles.jevObs}>
-      <div className={styles.jevObsHead}>{t('jevObsTitle')}</div>
-      {items.map((item, index) => (
-        <div key={`${item.at}-${item.site}-${index}`} className={styles.jevObsItem}>
-          <span className={styles.jevObsTime}>{new Date(item.at).toLocaleTimeString()}</span>
-          <span>{item.site === 'band' ? t('jevObsSiteBand') : t('jevObsSiteContradiction')}</span>
-          <span className={item.verdict === 'fallback'
-            ? styles.jevObsBadgeWarn
-            : item.verdict === 'confirm' || item.verdict === 'merge' ? styles.jevObsBadgeGood : styles.jevObsBadge}>
-            {t(VERDICT_KEY[item.verdict])}
-          </span>
-          <span>{item.answered ? `p=${item.probability?.toFixed(3)}` : t('jevObsNoAnswer')}</span>
-          <span>{item.elapsedMs}ms</span>
-          {item.error !== undefined && <span className={styles.jevObsError}>{t('jevObsErrorLine', { error: item.error })}</span>}
-        </div>
-      ))}
-    </div>
-  )
-}
-
 /** 导入预览条目与汇总（POST /api/kyzmem/import dryRun=true 的响应形状）。 */
 interface ImportEntryView {
   readonly id: string
@@ -3209,7 +2981,7 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
   /** 批量遗忘的两段式确认。 */
   const [confirmForget, setConfirmForget] = useState(false)
-  /** Tab 视图：today 今日速览 / library 陈展列表 / corridor 走廊与检索 / episodes 往事时间线 / entities 实体词典 / log 管家日志 / backfill 历史回填 / jev Jev 裁决配置。 */
+  /** Tab 视图：today 今日速览 / library 陈展列表 / corridor 走廊与检索 / episodes 往事时间线 / entities 实体词典 / log 管家日志 / backfill 历史回填。 */
   const [activeTab, setActiveTab] = useState<'today' | 'library' | 'corridor' | 'spiral' | 'episodes' | 'entities' | 'beliefs' | 'log' | 'ops'>('today')
   /** 项目宫殿来源（持久化）：'follow' = 跟随 GUI 当前工作区；其它值 = 固定的 host 分库 dbName。 */
   const [projectMode, setProjectMode] = usePersistedString('library.project', 'follow')
@@ -3575,7 +3347,7 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
           className={activeTab === 'ops' ? `${styles.tabItem} ${styles.on}` : styles.tabItem}
           aria-selected={activeTab === 'ops'}
           onClick={() => { setActiveTab('ops') }}>
-          <Icon name="jev" className={styles.tabIcon} />
+          <Icon name="backfill" className={styles.tabIcon} />
           {t('tabOps')}
         </button>
       </div>
@@ -3854,7 +3626,7 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
 
       {activeTab === 'ops' && (
         <div className={styles.tabPanel}>
-          {/* ops tab 是三件工具的容器，不是独立页面：去掉 PageHeader，让每个 sectionHead
+          {/* ops tab 是后台管线的容器，不是独立页面：去掉 PageHeader，让每个 sectionHead
               作为唯一标题层，与 library/corridor 等"单页面"tab 的视觉语言对齐。 */}
           <section className={styles.section}>
             <div className={styles.sectionHead}>
@@ -3863,20 +3635,6 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
             </div>
             <div className={styles.panelCard}>
               <HistoryBackfillCard t={t} toast={toast} />
-            </div>
-          </section>
-          <section className={styles.section}>
-            <div className={styles.sectionHead}>
-              <h4 className={styles.sectionTitle}>{t('tabJev')}</h4>
-              <span className={styles.sectionHint}>{t('pageHeaderJevSubtitle')}</span>
-            </div>
-            <div className={styles.panelCard}>
-              <JevConfigCard t={t} toast={toast} />
-            </div>
-          </section>
-          <section className={styles.section}>
-            <div className={styles.panelCard}>
-              <JevObservationsCard t={t} toast={toast} />
             </div>
           </section>
         </div>

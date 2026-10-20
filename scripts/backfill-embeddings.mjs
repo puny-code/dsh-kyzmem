@@ -9,6 +9,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite'
+import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { pipeline, env } from '@huggingface/transformers'
@@ -17,9 +18,14 @@ const dbDir = process.argv[2] ?? join(homedir(), '.dsh', 'kyzmem')
 const modelCacheDir = join(dbDir, 'models')
 const MODEL_ID = 'Xenova/bge-small-zh-v1.5'
 
-const dbs = ['user.db', 'project-db'].map(name => join(dbDir, name)).filter(p => {
-  try { return new DatabaseSync(p, { readOnly: true }) && true } catch { return false }
-})
+const dbs = (() => {
+  try {
+    // 分库名是 user.db / shared.db / project-<hash>.db，写死清单会漏掉全部项目库，统一按目录扫描。
+    return readdirSync(dbDir).filter(name => name.endsWith('.db')).map(name => join(dbDir, name))
+  } catch {
+    return []
+  }
+})()
 if (dbs.length === 0) {
   console.log('[backfill] 未找到任何记忆分库，无需回填')
   process.exit(0)

@@ -187,7 +187,7 @@ describe('KyzmemStore (sqlite)', () => {
     const db2 = new DatabaseSync(path)
     const version = (db2.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value
     db2.close()
-    expect(version).toBe('13')
+    expect(version).toBe('14')
   })
 
   it('v3 库打开时顺序迁移到 v5（数据保留，修订表可用）', async () => {
@@ -437,7 +437,7 @@ describe('episodeTimeline (episode 情景独立时间线)', () => {
     db.close()
     expect(tables).toContain('session_summaries')
     expect(tables).toContain('observations')
-    expect(version).toBe('13')
+    expect(version).toBe('14')
     // v8 旧库（手工降版）重开时经 MIGRATIONS['8'] 建出摘要表，数据零搬运。
     const legacyPath = join(dir, 'legacy-v8.db')
     const legacy = await openKyzmemStore(legacyPath)

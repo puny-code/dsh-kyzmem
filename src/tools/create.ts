@@ -35,7 +35,7 @@ import type { AssessVerdict, NextStrategy } from '../retrieve/evidence.ts'
 import { placardImprovementHint } from '../imagery/score.ts'
 import type { HistoryBackfillRules, HistoryEstimate, HistoryRunResult } from '../ingest/history.ts'
 import { applyMerge, confirmContradictions, decideWrite } from '../write-disposition.ts'
-import type { MemoryJudge, WriteDisposition } from '../write-disposition.ts'
+import type { DropReason, MemoryJudge, WriteDisposition } from '../write-disposition.ts'
 import type { KyzmemLanguage } from '../i18n/language.ts'
 import { message } from '../i18n/messages.ts'
 import { resolveRoomInput, roomLabel } from '../i18n/rooms.ts'
@@ -307,6 +307,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     readonly items?: readonly { id: string; kind: string; importance: number; slot?: { room: string; index: number }; disposition: Exclude<WriteDisposition, 'drop'>; mergedInto?: string }[]
     /** 批量模式：失败条目（index 为 items 数组下标）。 */
     readonly failed?: readonly { index: number; reason: string }[]
+    /** 批量模式：被 DROP 的条数（过短/逐字重复）。 */
+    readonly dropped?: number
   }
 
   /** kyzmem_save 呈现文本：矛盾警告 text 优先；批量输出汇总成功与失败。 */
@@ -320,6 +322,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       if (merged > 0) states.push(message('tool.saveBatchMerged', { count: merged }))
       if (deferred > 0) states.push(message('tool.saveBatchDeferred', { count: deferred }))
       if (states.length > 0) parts.push(states.join(message('tool.separatorClause')))
+      if ((value.dropped ?? 0) > 0) parts.push(message('tool.saveBatchDropped', { count: value.dropped ?? 0 }))
       for (const item of items) {
         const slot = item.slot === undefined ? '' : `, ${roomLabel(item.slot.room, deps.language)}#${item.slot.index}`
         const state = item.disposition === 'merge'
@@ -359,7 +362,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
 
   /**
    * 写入单条已清洗内容（四态处置）：MERGE 不新建条目只强化既有；
-   * DEFER 写入并建 contradicts 边待裁决；ACCEPT 原样写入。
+   * DEFER 写入并建 contradicts 边待裁决；ACCEPT 原样写入；
+   * DROP 不落库（过短/逐字重复），只回传原因让调用方如实告知。
    */
   async function writeWithDisposition(
     store: KyzmemStore,
@@ -372,13 +376,17 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       embedding?: Float32Array
       imagery?: ImageryLabel
     },
-  ): Promise<WriteOutcome> {
+  ): Promise<WriteOutcome | { readonly dropped: DropReason }> {
     const { embedding } = item
-    // judge + content 成对提供时，DEFER 模糊带交 Jev 三路裁决；未注入 judge 时行为与纯规则四态一致。
-    const decision = await decideWrite(store, item.kind, embedding, deps.judge === undefined ? {} : { judge: deps.judge, content: item.content })
+    // judge + content 成对提供时，DEFER 模糊带交判断器三路裁决；未注入 judge 时行为与纯规则四态一致。
+    const decision = await decideWrite(store, item.kind, embedding, deps.judge === undefined ? { content: item.content } : { judge: deps.judge, content: item.content })
+    if (decision.disposition === 'drop') return { dropped: decision.reason }
     if (decision.disposition === 'merge') {
-      const record = await applyMerge(store, decision, item.content)
-      return { disposition: 'merge', record, relatedId: decision.into.id, similarity: decision.similarity, candidates: [] }
+      const record = await applyMerge(store, decision, item.content, embedding)
+      // 目标在并发窗口内被清除且重试失败：降级为 accept（宁可多一条，不能丢一条）。
+      if (record !== undefined) {
+        return { disposition: 'merge', record, relatedId: decision.into.id, similarity: decision.similarity, candidates: [] }
+      }
     }
     const record = await store.write({
       scope: item.scope,
@@ -435,6 +443,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     readonly count: number
     readonly items: { id: string; kind: string; importance: number; disposition: Exclude<WriteDisposition, 'drop'>; mergedInto?: string }[]
     readonly failed: { index: number; reason: string }[]
+    /** 被 DROP 的条目数（过短/逐字重复，不落库也不计入失败）。 */
+    readonly dropped: number
   }
 
   /** 批量保存：统一清洗/校验/批量内去重，一次批量嵌入，逐条写入；单条失败不阻塞其余。 */
@@ -477,6 +487,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       : await embedder.embed(prepared.map(item => item.content.trim()))
     // 第三步：逐条处置写入；单条失败记入 failed 不阻塞其余（defer 的矛盾边照建，可经 kyzmem_review 查看）。
     const saved: { id: string; kind: string; importance: number; slot?: { room: string; index: number }; disposition: Exclude<WriteDisposition, 'drop'>; mergedInto?: string }[] = []
+    let droppedCount = 0
     for (const [position, item] of prepared.entries()) {
       try {
         const embedding = vectors?.[position]
@@ -488,6 +499,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           sourceSessionId,
           ...(embedding === undefined ? {} : { embedding }),
         })
+        // DROP：过短或逐字重复，不落库、不计失败（op_log 已在判定处留痕）。
+        if ('dropped' in outcome) { droppedCount += 1; continue }
         // merge 处置无新条目，实体挂被并入的既有条目；其余挂新条目。
         const nodeId = outcome.disposition === 'merge' && outcome.relatedId !== undefined
           ? asMemoryId(outcome.relatedId)
@@ -506,7 +519,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         failed.push({ index: item.index, reason: error instanceof Error ? error.message : String(error) })
       }
     }
-    return { count: saved.length, items: saved, failed }
+    return { count: saved.length, items: saved, failed, dropped: droppedCount }
   }
 
   const save = defineTool({
@@ -609,6 +622,12 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         ...(imagery === undefined ? {} : { imagery }),
       })
       // 实体关联：merge 挂被并入的既有条目，accept/defer 挂新条目；失败静默。
+      if ('dropped' in outcome) {
+        // DROP：如实告知模型「这次没记」，原因来自规则判定（太短/逐字重复），op_log 已有审计行。
+        return {
+          text: message(outcome.dropped === 'chitchat' ? 'tool.saveDroppedChitchat' : 'tool.saveDroppedDuplicate'),
+        }
+      }
       if (mentions.length > 0) {
         const nodeId = outcome.disposition === 'merge' && outcome.relatedId !== undefined
           ? asMemoryId(outcome.relatedId)

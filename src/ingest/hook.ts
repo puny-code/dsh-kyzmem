@@ -282,9 +282,11 @@ export interface TurnSignals {
   readonly toolNames: ReadonlySet<string>
 }
 
-/** 工具多样性得分：无工具 0；1-2 种 1；≥3 种 2。 */
+/** 工具多样性得分：1-2 种 1；≥3 种 2；无工具也给 1（对话本身就是活动信号——
+ * 零工具轮若记 0 分，纯问答轮上限只有 4，永远够不到 ACTIVITY_THRESHOLD，结果是用户
+ * 口头立的规矩永远不入库、而工具密集的流程噪声反而稳定入库的反向选择）。 */
 function toolDiversity(distinct: number): number {
-  return distinct === 0 ? 0 : distinct <= 2 ? 1 : 2
+  return distinct <= 2 ? 1 : 2
 }
 
 /**
@@ -545,13 +547,18 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
     // 疑似矛盾/修正落库并建 contradicts 边待裁决（DEFER）；其余 ACCEPT。
     const vector = embedder === undefined ? undefined : (await embedder.embed([content]))[0]
     // judge + content 成对提供时，DEFER 模糊带（0.88-0.92 之外按阈值）交 Jev 三路裁决；失败静默降级回 defer。
-    const decision = await decideWrite(target, kind, vector, deps.judge === undefined ? {} : { judge: deps.judge, content })
+    const decision = await decideWrite(target, kind, vector, deps.judge === undefined ? { content } : { judge: deps.judge, content })
+    // DROP：过短或与库内条目逐字相同——不落库、不计失败（op_log 已在判定处留痕）。
+    if (decision.disposition === 'drop') { dropped += 1; continue }
     if (decision.disposition === 'merge') {
-      await applyMerge(target, decision, content)
-      await linkEntities(decision.into.id)
-      writtenContents.push(content)
-      merged += 1
-      continue
+      const mergedRecord = await applyMerge(target, decision, content, vector)
+      // 目标在并发窗口内被清除且重试失败 → 降级为 accept（继续走下方新建，宁可多一条）。
+      if (mergedRecord !== undefined) {
+        await linkEntities(mergedRecord.id)
+        writtenContents.push(content)
+        merged += 1
+        continue
+      }
     }
     const record = await target.write({
       scope,

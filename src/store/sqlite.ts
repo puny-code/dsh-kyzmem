@@ -31,7 +31,7 @@ import type { KyzmemStore, RoomState } from './interface.ts'
 
 /** 当前 schema 版本；结构性变更必须 +1。可空列与伴随表走增量迁移（见 openKyzmemStore 的迁移段）。
  *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。 */
-const SCHEMA_VERSION = 13
+const SCHEMA_VERSION = 14
 /** 增量迁移表：key 为起始版本，value 为升到下一版本的 SQL（可多语句）。
  *  v2 → v3：nodes 补可空列 outcome（使用效果回报）。
  *  v3 → v4：新增 nodes_revisions 修订表（update 归档旧条目时的内容快照）。
@@ -113,6 +113,10 @@ const MIGRATIONS: Readonly<Record<string, string>> = {
     UPDATE nodes SET slot_room = replace(slot_room, '决策堂', 'decision') WHERE slot_room LIKE '决策堂%';
     UPDATE nodes SET slot_room = replace(slot_room, '往事廊', 'episode') WHERE slot_room LIKE '往事廊%';
     UPDATE nodes SET slot_room = replace(slot_room, '技法坊', 'skill') WHERE slot_room LIKE '技法坊%';`,
+  // v13：op_log 此前一个索引都没有，而 hasAudit 是 "WHERE op = ? AND detail = ?" 全表扫
+  // 且被 pending 重放 N+1 调用 → 启动随使用时长单调变慢。补两条：查重与按时间清理。
+  '13': `CREATE INDEX IF NOT EXISTS op_log_op_detail ON op_log (op, detail);
+    CREATE INDEX IF NOT EXISTS op_log_at ON op_log (at);`,
 }
 /** RRF 融合常数：score = Σ 1/(K + rank)。 */
 const RRF_K = 60
@@ -130,6 +134,11 @@ const CONFIDENCE_BUMP = 0.05
 const OUTCOME_PENALTY = 0.1
 /** 审计视图返回的操作日志条数上限。 */
 const REVIEW_LOG_LIMIT = 20
+/** op_log.detail 的字符上限：写入端曾把整段请求体塞进来（实测平均 15.1KB、峰值 142KB），
+ * user.db 97% 体积被 op_log 吃掉（72.7MB/月）。超限一律截断。 */
+const OP_LOG_DETAIL_MAX = 512
+/** 已排期条目的复习保护期（天）：复习逾期超过该天数才允许被衰减归档。 */
+const DECAY_REVIEW_GRACE_DAYS = 30
 
 /** 节点表的行结构（snake_case 对应列名）。 */
 interface NodeRow {
@@ -450,6 +459,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     CREATE INDEX IF NOT EXISTS node_entities_entity ON node_entities (entity_id);
     CREATE INDEX IF NOT EXISTS facts_entity ON facts (entity_id);
     CREATE INDEX IF NOT EXISTS observations_status ON observations (status, proof_count, updated_at);
+    CREATE INDEX IF NOT EXISTS op_log_op_detail ON op_log (op, detail);
+    CREATE INDEX IF NOT EXISTS op_log_at ON op_log (at);
   `)
   // v6 索引不在此处建：旧库此刻还没有 slot_room / next_review_at 列（迁移在后面才跑），
   // 对已存在的表建这两个索引会抛 no such column。新建库走下方补建，旧库由 MIGRATIONS['5'] 建。
@@ -537,8 +548,11 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   const sqlRevisionsById = db.prepare('SELECT content, kind, importance, superseded_at FROM nodes_revisions WHERE node_id = ? ORDER BY superseded_at DESC')
   const sqlTopActive = db.prepare("SELECT * FROM nodes WHERE scope = ? AND status = 'active' ORDER BY importance DESC, confidence DESC LIMIT ?")
   const sqlEdgeUpsert = db.prepare('INSERT OR IGNORE INTO edges (from_id, to_id, type, created_at) VALUES (?, ?, ?, ?)')
-  const sqlNeighbors = db.prepare(`SELECT * FROM edges WHERE from_id IN (SELECT value FROM json_each(?))
-    AND type IN ('supports','refines','related') LIMIT ?`)
+  // 边表列名是 snake_case，MemoryEdge 是 camelCase：必须显式取别名，否则下方一跳扩展读到的
+  // `edge.from` / `edge.to` 恒为 undefined，扩展永远不会发生（P0 级静默失效）。
+  const sqlNeighbors = db.prepare(`SELECT from_id AS "from", to_id AS "to", type FROM edges
+    WHERE from_id IN (SELECT value FROM json_each(?))
+    AND type IN ('supports','refines','related','supersedes') LIMIT ?`)
   const sqlEdgesTouching = db.prepare('SELECT from_id, to_id, type FROM edges WHERE from_id = ? OR to_id = ?')
   const sqlCountBy = db.prepare('SELECT status, COUNT(*) AS n FROM nodes GROUP BY status')
   const sqlCountKind = db.prepare('SELECT kind, COUNT(*) AS n FROM nodes GROUP BY kind')
@@ -557,10 +571,12 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   const sqlImportContentMatch = db.prepare('SELECT id FROM nodes WHERE content = ? LIMIT 1')
   const sqlImportAttachEmbedding = db.prepare('UPDATE nodes SET embedding = ? WHERE id = ?')
   const sqlImportEntityAliases = db.prepare('UPDATE entities SET aliases_json = ?, updated_at = ? WHERE id = ?')
+  // 衰减（批零 0.3 重写）：旧判据是双死门——importance 实测中位 0.7–0.8 恒不 < 0.3，
+  // 且写入默认排复习（next_review_at 永非空）→ 命中数恒为 0，等于从没衰减过。
+  // 新判据按「真的没人用过」判：从未被检索命中 + 久未访问 + 复习也早逾期（或本就未排期）。
   const sqlDecay = db.prepare(`UPDATE nodes SET status = 'archived'
-    WHERE status = 'active' AND importance < ? AND last_accessed_at < ? AND next_review_at IS NULL`)
-  // 进入 SM-2 复习调度的条目（next_review_at 非空）不参与自动衰减：到期未复习的记忆
-  // 该被优先复习而非归档，其退出由翻新清单 demote 规则（人工确认）接管。
+    WHERE status = 'active' AND access_count = 0 AND last_accessed_at < ?
+      AND (next_review_at IS NULL OR next_review_at < ?)`)
   const sqlScheduleReview = db.prepare(`UPDATE nodes
     SET next_review_at = ?, ease_factor = ?, interval_days = ?, review_reps = ?, last_accessed_at = ?
     WHERE id = ?`)
@@ -875,7 +891,7 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
           if (row === undefined || row.status !== 'active' || !query.scopes.includes(row.scope as KyzmemScope)) continue
           const baseScore = scores.get(edge.from)?.score
           if (baseScore === undefined) continue
-          scores.set(edge.to, { score: baseScore * 0.5, via: 'fts' })
+          scores.set(edge.to, { score: baseScore * 0.5, via: 'graph' })
           viaEdgeOf.set(edge.to, { from: asMemoryId(edge.from), type: edge.type })
         }
       }
@@ -1439,10 +1455,12 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     },
 
     async decay(options: DecayOptions) {
-      const cutoff = Date.now() - options.olderThanDays * 86_400_000
-      const result = sqlDecay.run(options.importanceBelow, cutoff)
+      const now = Date.now()
+      const cutoff = now - options.olderThanDays * 86_400_000
+      const reviewCutoff = now - (options.reviewGraceDays ?? DECAY_REVIEW_GRACE_DAYS) * 86_400_000
+      const result = sqlDecay.run(cutoff, reviewCutoff)
       const changed = Number(result.changes)
-      if (changed > 0) sqlLog.run(Date.now(), 'decay', 'BATCH', JSON.stringify({ archived: changed }))
+      if (changed > 0) sqlLog.run(now, 'decay', 'BATCH', JSON.stringify({ archived: changed }))
       return changed
     },
 
@@ -1737,7 +1755,11 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     },
 
     async audit(op: string, targetId: string, detail: string | null) {
-      sqlLog.run(Date.now(), op, targetId, detail)
+      // detail 一律截断到 512 字符：调用方可能塞入整段提示词，而 op_log 是常读常扫的表。
+      const capped = detail === null || detail.length <= OP_LOG_DETAIL_MAX
+        ? detail
+        : `${detail.slice(0, OP_LOG_DETAIL_MAX)}…`
+      sqlLog.run(Date.now(), op, targetId, capped)
     },
 
     async hasAudit(op: string, detail: string) {

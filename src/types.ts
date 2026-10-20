@@ -286,8 +286,8 @@ export interface SearchHit {
   readonly record: MemoryRecord
   /** 融合得分（RRF），越高越相关。 */
   readonly score: number
-  /** 该条命中的贡献道：fts 关键词 / vec 语义 / both。 */
-  readonly via: 'fts' | 'vec' | 'both'
+  /** 该条命中的贡献道：fts 关键词 / vec 语义 / both / graph 经关系边一跳扩展引入。 */
+  readonly via: 'fts' | 'vec' | 'both' | 'graph'
   /** 经关系边一跳扩展引入时，来源条目 id 与边类型。 */
   readonly viaEdge?: { readonly from: MemoryId; readonly type: KyzmemEdgeType }
   /** 编码特异性线索（schema v6 起）：同房间相邻桩位的条目 id——提取时重建编码情境。 */
@@ -534,10 +534,12 @@ export interface ImportResult {
   readonly entitiesMerged: number
 }
 
-/** 衰减参数：低于 importanceBelow 且 lastAccessedAt 超过 olderThanDays 的 active 条目归档。 */
+/** 衰减参数：从未被检索命中、且 lastAccessedAt 早于 olderThanDays 的 active 条目归档。
+ * 复习保护期（reviewGraceDays）：已排期的条目要等复习逾期超过该天数才失去保护；
+ * 未排期条目不受此保护。importance 不再参与衰减判据（旧判据实测命中恒 0，见批零 0.3）。 */
 export interface DecayOptions {
-  readonly importanceBelow: number
   readonly olderThanDays: number
+  readonly reviewGraceDays?: number
 }
 
 /** 闭馆三问的答案（墓志铭）。写入 op_log 的 forget 详情，方便 kyzmem_audit_forgotten 考古。 */

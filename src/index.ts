@@ -46,12 +46,12 @@ import type { LlmRoute, SessionEventLike } from './llm/client.ts'
 import { registerKyzmemRoutes } from './routes.ts'
 import type { ProjectPalaceView, RouteDeps } from './routes.ts'
 import { migrateProjectDb, migrationWarning, resolveProjectIdentity } from './project/identity.ts'
+import { importLegacyData } from './legacy/import.ts'
 import { findProjectPalace, listProjectPalaces } from './project/registry.ts'
 import type { ProjectPalace, WorkspaceRef } from './project/registry.ts'
 import { openKyzmemStore } from './store/sqlite.ts'
 import type { KyzmemStore } from './store/interface.ts'
 import { createKyzmemTools } from './tools/create.ts'
-import { resolveJevField } from './jev/runtime.ts'
 import { currentUserRequestText, renderMemoryPacket } from './security/sanitize.ts'
 import { wrapWithRationale } from './selection-rationale.ts'
 import { buildAssessReminder, evidenceBatches } from './retrieve/evidence.ts'
@@ -291,7 +291,6 @@ async function preStep(
         embedder,
         mode,
         routeOverride: resolved.routeOverride,
-        ...resolveJevField(resolved.jev, resolved.dbDir),
         call: params => streamText(ctx, { ...params, sessionId: agent.session.id }),
         logRequest,
         signal,
@@ -311,7 +310,6 @@ async function preStep(
         embedder,
         mode,
         routeOverride: resolved.routeOverride,
-        ...resolveJevField(resolved.jev, resolved.dbDir),
         call: params => streamText(ctx, { ...params, sessionId: agent.session.id }),
         logRequest,
         signal,
@@ -528,6 +526,13 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
   setExtraRedactWords(resolved.redactWords)
   mkdirSync(resolved.dbDir, { recursive: true, mode: 0o700 })
 
+  // 老插件（@kenz1117/dsh-engram → ~/.dsh/engram）的历史数据一次性导入：
+  // 只拷不搬、不覆盖、成功写标记；任何失败都只告警，绝不阻断插件启动。
+  const legacy = importLegacyData(resolved.dbDir)
+  if (legacy !== undefined && (legacy.databases.length > 0 || legacy.models)) {
+    console.log('[dsh-kyzmem] imported legacy data:', JSON.stringify({ databases: legacy.databases, skipped: legacy.skipped, models: legacy.models }))
+  }
+
   // 项目标识：git origin 归一化哈希 → 完整 cwd 哈希；按配置检查旧库迁移。
   const identity = resolveProjectIdentity(process.cwd())
   const migration = migrateProjectDb(resolved.dbDir, identity, resolved.legacyMigration)
@@ -631,8 +636,16 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
   void embedder
 
   // 辅助请求写 kyzmem 自己的操作日志（下游插件禁止向会话日志写未知事件类型）。
+  // 只记归因要用的四个标量：整段 userText 曾把 op_log 撑到平均 15.1KB/条、峰值 142KB，
+  // user.db 97% 的体积被 op_log 吃掉（实测 72.7MB/月）。
   const logIngestRequest = (data: IngestRequestEventData): void => {
-    void openStore('user').then(store => store.audit('ingest-request', 'AUX', JSON.stringify(data))).catch(() => { /* 审计失败不影响摄取 */ })
+    const detail = JSON.stringify({
+      round: data.round,
+      provider: data.route.provider,
+      model: data.route.model,
+      chars: data.userText.length,
+    })
+    void openStore('user').then(store => store.audit('ingest-request', 'AUX', detail)).catch(() => { /* 审计失败不影响摄取 */ })
   }
 
   // preStep 的可变状态：route 记录当前会话在用的路由，历史回填优先复用它。
@@ -763,10 +776,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     routeOverride: resolved.routeOverride ?? preStepState.route,
     // 辅助调用归属：审计经 logRequest 带会话 id 落 op_log，streamText 只需一个稳定标识。
     call: callParams => streamText(ctx, { ...callParams, sessionId: '' }),
-    logRequest: logIngestRequest,
-    // 面板覆盖免缓存装配：每次回填运行时读 jev-config.json，面板保存立即生效。
-    ...resolveJevField(resolved.jev, resolved.dbDir),
-  })
+    logRequest: logIngestRequest,  })
 
   /** 回填任务（进程内单例；面板轮询它的进度，工具同步等待自己的那一次运行）。 */
   let backfillJob:
@@ -851,10 +861,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     resolveProjectStore,
     embedder,
     call: callParams => streamText(ctx, { ...callParams, sessionId: callParams.sessionId ?? '' }),
-    routeOverride: resolved.routeOverride,
-    // 面板覆盖免缓存装配：工具每次调用时读 jev-config.json，面板保存立即生效。
-    ...resolveJevField(resolved.jev, resolved.dbDir),
-    queryRewrite: resolved.queryRewrite,
+    routeOverride: resolved.routeOverride,    queryRewrite: resolved.queryRewrite,
     exportDir: `${resolved.dbDir}/exports`,
     language: resolved.language,
     historyBackfill: { estimate: historyApi.estimate, run: historyApi.run },
@@ -877,10 +884,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
       dbDir: resolved.dbDir,
       pluginVersion: VERSION,
       language: resolved.language,
-      embedder,
-      // Jev 面板配置：yml 基线 + dbDir（覆盖文件路径派生），读写全走 jev/runtime 纯函数。
-      jev: { base: resolved.jev, dbDir: resolved.dbDir },
-      history: {
+      embedder,      history: {
         estimate: historyApi.estimate,
         start: historyApi.start,
         cancel: historyApi.cancel,
@@ -924,7 +928,6 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
         embedder,
         mode,
         routeOverride: resolved.routeOverride,
-        ...resolveJevField(resolved.jev, resolved.dbDir),
         call: params => streamText(ctx, { ...params, sessionId: session.id }),
         logRequest: logIngestRequest,
         signal: AbortSignal.timeout(FINAL_INGEST_TIMEOUT_MS),
@@ -1023,7 +1026,6 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     }
     for (const target of targets) {
       const archived = await (await target.open()).decay({
-        importanceBelow: resolved.decayImportanceBelow,
         olderThanDays: resolved.decayAfterDays,
       })
       if (archived > 0) console.warn(message('core.warnDecayArchived', { label: target.label, count: archived }))
@@ -1050,7 +1052,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
       const store = await openStore('user')
       const report = await runConsolidation(store, embedder, {
         olderThanDays: resolved.decayAfterDays,
-        importanceBelow: resolved.decayImportanceBelow,
+        importanceBelow: 0.3,
       })
       console.log(message('core.logConsolidationDone', {
         archived: report.archived,
