@@ -1,0 +1,120 @@
+{
+  "name": "dsh-kyzmem",
+  "description": "深度求索 Harness 插件：跨会话长期记忆（学习核心）。基于 @kenz1117/dsh-engram 的个人修改版，仅本人自用。",
+  "version": "0.10.0",
+  "icon": "icon.svg",
+  "logo": "icon-256.svg",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/puny-code/dsh-kyzmem.git"
+  },
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg",
+    "./icon.svg": "./icon.svg",
+    "./logo.svg": "./icon-256.svg"
+  },
+  "files": [
+    "lib/",
+    "scripts/",
+    "cordis.patch.yml",
+    "icon.svg",
+    "icon-256.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "prepare": "node scripts/link-peers.mjs && node scripts/ensure-build.mjs",
+    "bundle": "tsdown",
+    "watch": "tsdown --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "backfill": "node scripts/backfill-embeddings.mjs"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "memory",
+    "long-term-memory",
+    "cross-session",
+    "sqlite",
+    "fts5",
+    "embeddings",
+    "learning-core"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-client-ui-layout": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-layout": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "compression": "^1.8.2",
+    "content-type": "^3.1.1",
+    "ipaddr.js": "^2.5.0",
+    "js-yaml": "^4.1.0",
+    "lightningcss": "^1.32.0",
+    "tsdown": "^0.23.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "packageManager": "pnpm@10.15.0",
+  "homepage": "https://github.com/puny-code/dsh-kyzmem",
+  "bugs": {
+    "url": "https://github.com/puny-code/dsh-kyzmem/issues"
+  }
+}

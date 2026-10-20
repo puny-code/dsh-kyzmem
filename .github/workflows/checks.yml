@@ -1,0 +1,61 @@
+name: checks
+
+# The two gates from the README's "Checks before a PR" that a bare runner can
+# run, plus a lockfile check.
+#
+# `typecheck`, `test` and `bundle` are deliberately absent. `.npmrc` records the
+# reason: the `@deepseek-ai/*` peers are not installable from npm (the chain
+# there is incomplete, and harness internals use the `workspace:^` protocol), so
+# `scripts/link-peers.mjs` takes them from a sibling `deepseek-harness`
+# workspace. A hosted runner has no such workspace, and `src/index.ts`,
+# `src/config.ts`, `src/llm/client.ts` and `src/tools/create.ts` import *values*
+# from those peers — tsc, vitest and tsdown all fail to resolve them there.
+#
+# The gates below touch no peer at all: the first reads `src/` as text, the
+# second imports three peer-free modules.
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # pnpm 版本单一来源 = package.json 的 packageManager 字段（这里的 version:
+      # 与它并存会让 pnpm/action-setup 直接报 Multiple versions 错误——0.9.0 后实测踩坑）。
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      # --ignore-scripts: `prepare` runs scripts/ensure-build.mjs, which builds
+      # both bundles — and building needs the peers.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: message dictionary parity
+        run: node scripts/check-messages.mjs
+      - name: language pattern acceptance
+        run: node scripts/check-patterns.mjs
+      # Packaging smoke (audit 2026-10-18 §7): 0.8.0–0.8.14 shipped a tarball a
+      # clean profile could not install (peers not optional — PR #23). Two cheap
+      # guards that run without the peers:
+      #  1. the published metadata must keep every @deepseek-ai/* peer optional;
+      #  2. the dependency tree of the packed tarball must resolve from the
+      #     registry (--dry-run: metadata only, no model downloads).
+      # lib/ itself cannot be built here (see the header comment) — tarball
+      # contents are verified locally by scripts/ensure-build.mjs at publish.
+      - name: packaging smoke
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const peers = Object.keys(pkg.peerDependencies ?? {});
+            const meta = pkg.peerDependenciesMeta ?? {};
+            const notOptional = peers.filter(p => meta[p]?.optional !== true);
+            if (peers.length === 0) throw new Error('no peerDependencies declared');
+            if (notOptional.length > 0) throw new Error('peers not optional: ' + notOptional.join(', '));
+            console.log('peers optional:', peers.join(', '));
+          "
+          npm pack --ignore-scripts
+          mkdir smoketest && cd smoketest && npm init -y
+          npm install --dry-run --ignore-scripts "$(find .. -name 'kenz1117-dsh-kyzmem-*.tgz' | head -1)"

@@ -1,0 +1,58 @@
+/* 记忆螺旋视图（v0.9.x · Memory Spiral）。
+   与走廊（corridor）共享的双栏布局：左 SVG 画布、右统计 + 图例。
+   画布走 16:10 比例 + 圆角 + 描边；侧栏不抢占成卡片，让 SVG 成为视觉焦点。 */
+
+.wrap { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr); gap: var(--space-4); align-items: stretch; }
+@media (max-width: 960px) { .wrap { grid-template-columns: 1fr; } }
+
+/* SVG 容器：保留 viewBox 比例自适应；呼吸底色用 radial brand tint 与走廊呼应。 */
+.canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 600 / 380;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--dsw-alias-border-l2);
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--brand-1) 5%, transparent), transparent 65%),
+    color-mix(in srgb, var(--dsw-alias-bg-base) 70%, transparent);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 中心标签「现在」：微缩小字号 + 当前主题字色。 */
+.centerLabel {
+  font-size: 10px;
+  fill: var(--dsw-alias-label-tertiary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* 节点动画：opacity 由 JS 控制，spring 缩放入场让重排不刺眼。 */
+.canvas circle { transition: opacity var(--dur-fast) var(--ease-spring); }
+.canvas circle:nth-child(odd) { animation: spiralNodeIn var(--dur-slow) var(--ease-spring) backwards; }
+.canvas circle:nth-child(even) { animation: spiralNodeIn var(--dur-slow) var(--ease-spring) backwards; animation-delay: 60ms; }
+@keyframes spiralNodeIn {
+  from { opacity: 0; transform: scale(0.5); transform-origin: center; transform-box: fill-box; }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* 侧栏：图例 + 统计。 */
+.side { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; padding: var(--space-4); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); border-radius: var(--radius-card); }
+.sideTitle { margin: 0; font-size: var(--fs-micro); font-weight: 600; color: var(--dsw-alias-label-tertiary); letter-spacing: 0.06em; text-transform: uppercase; }
+
+.legend { display: flex; flex-direction: column; gap: 6px; padding-bottom: var(--space-3); border-bottom: 1px solid var(--dsw-alias-border-soft); }
+.legendItem { display: flex; align-items: center; gap: 8px; font-size: var(--fs-body); color: var(--dsw-alias-label-secondary); }
+.legendDot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+.stats { display: flex; flex-direction: column; gap: var(--space-3); }
+.stat { display: flex; flex-direction: column; gap: 2px; padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-control); }
+.statLabel { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); letter-spacing: 0.04em; text-transform: uppercase; }
+.statValue { font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; line-height: 1.2; }
+.statAccent { color: var(--brand-2); }
+.statFaint { font-size: var(--fs-body); font-weight: 500; opacity: 0.7; }
+
+/* 工具条 segmented control 容器：与其他 tab 同款 toolbarCard 表面。 */
+.toolbar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-card); margin-bottom: var(--space-3); }
+.meta { margin-left: auto; font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }

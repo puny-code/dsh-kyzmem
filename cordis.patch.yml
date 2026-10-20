@@ -1,0 +1,6 @@
+# dsh-kyzmem bundle patch：dsh plugin add dsh-kyzmem 时以单条目插入 profile 根，
+# 行 id 指向本插件 host 半（注册 kyzmem_ 工具与画像注入）。
+# 发布物不带 config：所有配置走 profile 侧显式声明，默认 ingest=off。
+- insert:
+    - id: dsh-kyzmem
+      name: 'dsh-kyzmem'
