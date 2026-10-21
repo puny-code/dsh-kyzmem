@@ -37,14 +37,14 @@ afterEach(async () => {
 })
 
 describe('schema v15', () => {
-  it('新库版本号 15，nodes 含 5 个新列与 2 个新索引', async () => {
+  it('新库版本号 16，nodes 含 5 个新列与 2 个新索引', async () => {
     const { DatabaseSync } = await import('node:sqlite')
     const db = new DatabaseSync(path)
     const version = (db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value
     const columns = (db.prepare('PRAGMA table_info(nodes)').all() as unknown as { name: string }[]).map(row => row.name)
     const indexes = (db.prepare('PRAGMA index_list(nodes)').all() as unknown as { name: string }[]).map(row => row.name)
     db.close()
-    expect(version).toBe('15')
+    expect(version).toBe('16')
     for (const column of ['invalid_at', 'expires_at', 'source_tier', 'last_retrieved_at', 'last_reviewed_at']) {
       expect(columns).toContain(column)
     }
@@ -79,7 +79,7 @@ describe('schema v15', () => {
     const version = (check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value
     const indexes = (check.prepare('PRAGMA index_list(nodes)').all() as unknown as { name: string }[]).map(row => row.name)
     check.close()
-    expect(version).toBe('15')
+    expect(version).toBe('16')
     expect(indexes).toContain('nodes_invalid')
     expect(indexes).toContain('nodes_expires')
   })

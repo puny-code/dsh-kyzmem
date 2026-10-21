@@ -25,14 +25,14 @@ import type {
   MemoryRecord, ObservationId, ObservationListFilter, ObservationRecord, ObservationWriteInput,
   ProfileBlock, ProfileBlockVersion, ReviewGrade, ReviewView, SearchHit, SearchResult, SearchChannelStat,
   Slot, StoreStats, ConflictAction, ConflictListResult, ConflictPair, KyzmemSourceTier, OperationLogRow,
-  TimelineQuery, UpdateInput, WriteInput,
+  TimelineQuery, UpdateInput, WriteInput, MemoryAnchor, SessionSummaryRecord,
   EpisodeTimelineQuery, EpisodeTimelineResult,
 } from '../types.ts'
 import type { KyzmemStore, RoomState } from './interface.ts'
 
 /** 当前 schema 版本；结构性变更必须 +1。可空列与伴随表走增量迁移（见 openKyzmemStore 的迁移段）。
  *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。 */
-const SCHEMA_VERSION = 15
+const SCHEMA_VERSION = 16
 /** 增量迁移表：key 为起始版本，value 为升到下一版本的 SQL（可多语句）。
  *  v2 → v3：nodes 补可空列 outcome（使用效果回报）。
  *  v3 → v4：新增 nodes_revisions 修订表（update 归档旧条目时的内容快照）。
@@ -136,6 +136,15 @@ const MIGRATIONS: Readonly<Record<string, string>> = {
     UPDATE nodes SET last_reviewed_at = last_accessed_at WHERE last_reviewed_at IS NULL;
     CREATE INDEX IF NOT EXISTS nodes_invalid ON nodes (invalid_at);
     CREATE INDEX IF NOT EXISTS nodes_expires ON nodes (expires_at);`,
+  // v15 → v16（文件锚）：三列全可空，存量条目零搬运——没有锚点的条目渲染行为与 v15 完全一致。
+  // anchor_path 存工作区相对路径（`/` 分隔；绝对路径与 `..` 逃逸在写入端就被拒），
+  // anchor_hash 是 `sha256(mtimeMs + ':' + size)` 的前 16 位（不读文件内容），
+  // anchor_checked_at 是最后一次计算/校验该指纹的时刻（渲染期复验只读不写，留给后续批量任务）。
+  // 索引：渲染/复验按「有锚点的条目」扫描是新热点，所以按 anchor_path 建索引。
+  '15': `ALTER TABLE nodes ADD COLUMN anchor_path TEXT;
+    ALTER TABLE nodes ADD COLUMN anchor_hash TEXT;
+    ALTER TABLE nodes ADD COLUMN anchor_checked_at INTEGER;
+    CREATE INDEX IF NOT EXISTS nodes_anchor ON nodes (anchor_path);`,
 }
 /** RRF 融合常数：score = Σ 1/(K + rank)。 */
 const RRF_K = 60
@@ -206,6 +215,9 @@ interface NodeRow {
   source_tier: string
   last_retrieved_at: number | null
   last_reviewed_at: number | null
+  anchor_path: string | null
+  anchor_hash: string | null
+  anchor_checked_at: number | null
 }
 
 /** 把意象铭牌序列化为 JSON（缺省序列化为 null，落库）。 */
@@ -271,6 +283,10 @@ function rowToRecord(row: NodeRow): MemoryRecord {
     sourceTier: row.source_tier as KyzmemSourceTier,
     ...(row.last_retrieved_at === null ? {} : { lastRetrievedAt: row.last_retrieved_at }),
     ...(row.last_reviewed_at === null ? {} : { lastReviewedAt: row.last_reviewed_at }),
+    // v16 文件锚：三列同生同灭（写入端要么全写要么全不写），缺 path/hash 就不带对象键。
+    ...(row.anchor_path === null || row.anchor_hash === null
+      ? {}
+      : { anchor: { path: row.anchor_path, hash: row.anchor_hash, checkedAt: row.anchor_checked_at ?? 0 } }),
   }
 }
 
@@ -474,7 +490,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       review_reps INTEGER DEFAULT 0,
       invalid_at INTEGER, expires_at INTEGER,
       source_tier TEXT NOT NULL DEFAULT 'agent-inferred',
-      last_retrieved_at INTEGER, last_reviewed_at INTEGER);
+      last_retrieved_at INTEGER, last_reviewed_at INTEGER,
+      anchor_path TEXT, anchor_hash TEXT, anchor_checked_at INTEGER);
     CREATE TABLE IF NOT EXISTS edges (
       from_id TEXT NOT NULL, to_id TEXT NOT NULL, type TEXT NOT NULL, created_at INTEGER NOT NULL,
       PRIMARY KEY (from_id, to_id, type));
@@ -520,15 +537,16 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     CREATE INDEX IF NOT EXISTS op_log_op_detail ON op_log (op, detail);
     CREATE INDEX IF NOT EXISTS op_log_at ON op_log (at);
   `)
-  // v6/v15 索引不在此处建：旧库此刻还没有 slot_room / next_review_at / invalid_at 等列
+  // v6/v15/v16 索引不在此处建：旧库此刻还没有 slot_room / next_review_at / invalid_at / anchor_path 等列
   // （迁移在后面才跑），对已存在的表建这些索引会抛 no such column。
-  // 新建库走下方补建，旧库由 MIGRATIONS['5'] / MIGRATIONS['14'] 建。
+  // 新建库走下方补建，旧库由 MIGRATIONS['5'] / MIGRATIONS['14'] / MIGRATIONS['15'] 建。
   const versionRow = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string } | undefined
   if (versionRow === undefined) {
     db.exec(`CREATE INDEX IF NOT EXISTS nodes_slot ON nodes (slot_room, slot_index);
       CREATE INDEX IF NOT EXISTS nodes_review_due ON nodes (next_review_at);
       CREATE INDEX IF NOT EXISTS nodes_invalid ON nodes (invalid_at);
-      CREATE INDEX IF NOT EXISTS nodes_expires ON nodes (expires_at);`)
+      CREATE INDEX IF NOT EXISTS nodes_expires ON nodes (expires_at);
+      CREATE INDEX IF NOT EXISTS nodes_anchor ON nodes (anchor_path);`)
     db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION))
   } else {
     // 顺序增量迁移：按 MIGRATIONS 逐版升到当前版本（保数据）；更高版本或断链（缺迁移）拒绝加载。
@@ -579,8 +597,9 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     (id, scope, kind, content, importance, confidence, status, created_at, last_accessed_at, access_count,
      source_session_id, source_round, source_seq, embedding, imagery_json,
      slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days,
-     expires_at, source_tier, last_retrieved_at, last_reviewed_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+     expires_at, source_tier, last_retrieved_at, last_reviewed_at,
+     anchor_path, anchor_hash, anchor_checked_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   const sqlFtsInsert = db.prepare('INSERT INTO nodes_fts (node_id, content) VALUES (?, ?)')
   // v15：状态流转不再伪装成「访问」。旧实现把 last_accessed_at 当万能时间戳，forget/restore/
   // archive 都刷新它，于是「久未访问」这个衰减判据被自己的维护动作写坏（永远新鲜）。
@@ -680,8 +699,9 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     (id, scope, kind, content, importance, confidence, status, created_at, last_accessed_at, access_count,
      source_session_id, source_round, source_seq, embedding, outcome, imagery_json,
      slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days, review_reps,
-     invalid_at, expires_at, source_tier, last_retrieved_at, last_reviewed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+     invalid_at, expires_at, source_tier, last_retrieved_at, last_reviewed_at,
+     anchor_path, anchor_hash, anchor_checked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   const sqlImportContentMatch = db.prepare('SELECT id FROM nodes WHERE content = ? LIMIT 1')
   const sqlImportAttachEmbedding = db.prepare('UPDATE nodes SET embedding = ? WHERE id = ?')
   // 已有向量的批量读取（维护/整理复用）：只回 embedding 非空的条目，调用方对缺口再算。
@@ -740,6 +760,10 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     ON CONFLICT (session_id) DO UPDATE SET summary = excluded.summary, updated_at = excluded.updated_at`)
   const sqlSessionSummaryGet = db.prepare('SELECT session_id, summary FROM session_summaries WHERE session_id = ?')
   const sqlSessionSummaryMany = db.prepare('SELECT session_id, summary FROM session_summaries WHERE session_id IN (SELECT value FROM json_each(?))')
+  // 最近一条摘要：`[RESUME]` 恢复简报的开场素材（`rowid` 做同毫秒写入的定序兜底）。
+  const sqlSessionSummaryLatest = db.prepare(
+    'SELECT session_id, summary, updated_at FROM session_summaries ORDER BY updated_at DESC, rowid DESC LIMIT 1',
+  )
   const sqlEntityAll = db.prepare('SELECT * FROM entities')
   const sqlEntityGet = db.prepare('SELECT * FROM entities WHERE id = ?')
   const sqlEntityInsert = db.prepare('INSERT INTO entities (id, name, kind, aliases_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -857,6 +881,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       input.slot?.room ?? null, input.slot?.index ?? null, input.imageryScore ?? null,
       initialReview, initialReview === null ? null : 2.5, initialReview === null ? null : 0,
       expiresAt, input.sourceTier ?? 'agent-inferred', at, at,
+      // v16 文件锚：指纹由调用方算好（store 不做文件 I/O）；缺省三列同写 NULL。
+      input.anchor?.path ?? null, input.anchor?.hash ?? null, input.anchor?.checkedAt ?? null,
     )
     sqlFtsInsert.run(id, tokenizeForFts(content))
     sqlLog.run(at, op, id, JSON.stringify({ kind: input.kind, scope: input.scope }))
@@ -1252,6 +1278,14 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       return row?.summary
     },
 
+    async latestSessionSummary(): Promise<SessionSummaryRecord | undefined> {
+      const row = sqlSessionSummaryLatest.get() as unknown as
+        | { session_id: string; summary: string; updated_at: number }
+        | undefined
+      if (row === undefined) return undefined
+      return { sessionId: row.session_id, summary: row.summary, updatedAt: row.updated_at }
+    },
+
     async update(input: UpdateInput) {
       const old = getRow(input.id)
       if (old === undefined) throw new KyzmemError('NOT_FOUND', message('store.entryNotFound', { id: input.id }))
@@ -1267,7 +1301,16 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         sqlLog.run(at, 'superseded', input.id, JSON.stringify({ supersededBy: id }))
         // 新条目是新物品：重新排桩/评分/排期（宫殿里修正一件物品 = 在新桩位放新版）。
         const imagery = input.imagery ?? jsonToImagery(old.imagery_json)
-        const updateInput: WriteInput = { scope: input.scope, kind: input.kind, content }
+        // 文件锚（v16）：显式给 = 按调用方算好的新指纹写；null = 明确清空；缺省 = 继承旧锚点，
+        // 且 checkedAt 原样带过来——「写入」不等于「复验过」，刷新它会让面板的 stale 统计失真。
+        const inheritedAnchor: MemoryAnchor | undefined = old.anchor_path === null || old.anchor_hash === null
+          ? undefined
+          : { path: old.anchor_path, hash: old.anchor_hash, checkedAt: old.anchor_checked_at ?? 0 }
+        const anchor = input.anchor === undefined ? inheritedAnchor : input.anchor ?? undefined
+        const updateInput: WriteInput = {
+          scope: input.scope, kind: input.kind, content,
+          ...(anchor === undefined ? {} : { anchor }),
+        }
         const automationFields = applyWriteAutomation(updateInput, id, at, imagery)
         insertRecord(
           id,
@@ -1659,6 +1702,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
             // 用 createdAt/lastAccessedAt 兜底，保证 recency 与衰减判据仍有值可读。
             r.invalidAt ?? null, r.expiresAt ?? null, r.sourceTier ?? 'agent-inferred',
             r.lastRetrievedAt ?? r.createdAt, r.lastReviewedAt ?? r.lastAccessedAt,
+            // v16 文件锚：老备份没有该字段时按无锚点导入（三列同 NULL），不影响既有条目。
+            r.anchor?.path ?? null, r.anchor?.hash ?? null, r.anchor?.checkedAt ?? null,
           )
           sqlFtsInsert.run(r.id, tokenizeForFts(c.content))
         }

@@ -143,6 +143,15 @@ export const zh = {
   'tool.searchConflictCue': '与 {ids} 冲突待裁决',
   'tool.searchExamineHint': '以上只含元信息（不含正文）。需要原文时：kyzmem_examine ids=[{ids}]',
 
+  // ---- 文件锚（schema v16：save/update 的 anchor 参数与 search/examine 的 stale 标注）----
+  'tool.anchorDescription': '工作区相对路径',
+  'tool.anchorPathInvalid': 'kyzmem: anchor 必须是工作区相对路径（不能是绝对路径，也不能含 ..）：{path}',
+  'tool.anchorSavedHint': '锚点：{path}（文件改动后这条会标为「可能过期」）。',
+  'tool.anchorMissingHint': '未写锚点：工作区里找不到该文件（记忆已保存，只是无法自证新鲜）。',
+  'tool.anchorMergedHint': '锚点未写入：本条并入了既有记忆 {id}，请对那条用 kyzmem_update 设 anchor。',
+  'tool.searchAnchorMissing': '[锚点丢失]',
+  'tool.searchAnchorStale': '[可能过期]',
+
   // ---- Схема и результат kyzmem_facts ----
   'tool.factsDescription': '查询或写入某实体的事实链。asOf 为时点回看，replaces 取代旧事实。返回带有效期与 id 的事实链。',
   'tool.factsEntityIdDescription': '实体 id（优先于 entity）',
@@ -534,6 +543,15 @@ export const en = {
   'tool.searchConflictCue': 'in conflict with {ids}, pending adjudication',
   'tool.searchExamineHint': 'The lines above are metadata only (no body text). For the original text: kyzmem_examine ids=[{ids}]',
 
+  // ---- File anchors (schema v16: the anchor parameter of save/update and the stale marks in search/examine) ----
+  'tool.anchorDescription': 'Workspace-relative file path',
+  'tool.anchorPathInvalid': 'kyzmem: anchor must be a workspace-relative path (no absolute path, no ..): {path}',
+  'tool.anchorSavedHint': 'Anchor: {path} (this memory is marked possibly stale once the file changes).',
+  'tool.anchorMissingHint': 'Anchor not stored: no such file in the workspace (memory saved, freshness unverified).',
+  'tool.anchorMergedHint': 'Anchor not stored: merged into existing memory {id}; set the anchor on it with kyzmem_update.',
+  'tool.searchAnchorMissing': '[anchor missing]',
+  'tool.searchAnchorStale': '[possibly stale]',
+
   // ---- kyzmem_facts schema and result ----
   'tool.factsDescription': 'Query or write facts about one entity; asOf=point-in-time, replaces supersedes. Returns the fact chain and ids.',
   'tool.factsEntityIdDescription': 'entity id (preferred over entity)',
@@ -924,6 +942,15 @@ export const ru = {
   'tool.searchTierWeb': '[не подтверждено:web]',
   'tool.searchConflictCue': 'конфликтует с {ids}, ждёт решения',
   'tool.searchExamineHint': 'Выше только метаданные (без текста). Оригинал: kyzmem_examine ids=[{ids}]',
+
+  // ---- Файловые якоря (schema v16: параметр anchor у save/update и пометки stale в search/examine) ----
+  'tool.anchorDescription': 'Путь файла в рабочей области',
+  'tool.anchorPathInvalid': 'kyzmem: anchor — путь относительно рабочей области (без абсолютного пути и без ..): {path}',
+  'tool.anchorSavedHint': 'Якорь: {path} (после изменения файла запись помечается как возможно устаревшая).',
+  'tool.anchorMissingHint': 'Якорь не записан: файла нет в рабочей области (запись сохранена, свежесть не подтверждена).',
+  'tool.anchorMergedHint': 'Якорь не записан: запись объединена с существующей {id}; задайте anchor ей через kyzmem_update.',
+  'tool.searchAnchorMissing': '[якорь потерян]',
+  'tool.searchAnchorStale': '[возможно устарело]',
 
   // ---- Схема и результат kyzmem_facts ----
   'tool.factsDescription': 'Запрос или запись фактов об одной сущности. asOf — взгляд на момент, replaces заменяет старый факт. Вернёт цепочку фактов с периодами и id.',

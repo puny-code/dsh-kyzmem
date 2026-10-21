@@ -62,6 +62,7 @@ import {
   runQueryRecall, shouldQueryRecallText, shouldRunQueryRecall, withTimeBudget,
 } from './retrieve/query-recall.ts'
 import { estimateTokens } from './token.ts'
+import { renderResumeBriefing, shouldRunResumeBriefing, RESUME_PROJECT_OPEN_MS } from './resume-briefing.ts'
 import type { KyzmemScope, MemoryId, Slot } from './types.ts'
 
 /** Cordis 插件名（loader 诊断与注入 source 使用）。 */
@@ -391,6 +392,10 @@ async function preStep(
      * 每会话只记一次，压缩后键变（允许再记一次）。
      */
     queryRecallNoTextKey: string | null
+    /** `[RESUME]`：已注入过简报的 agent（会话）id——同一会话只注入一次。 */
+    resumeAgent: string | null
+    /** `[RESUME]`：上次注入时观察到的压缩计数（压缩后允许再注入一次）。 */
+    resumeCompactions: number | null
     route: LlmRoute | undefined
   },
   logRequest: (data: IngestRequestEventData) => void,
@@ -526,9 +531,40 @@ async function preStep(
   // 首问原文做一次轻检索，把最相关的几条并进同一个 <memory_context>——不改检索算法，
   // 只把它调到正确的时机。为什么放在这个位置：上面已确认本步确实在注入路径上
   // （step===1 或压缩后），不会为注定跳过注入的轮次白跑一次检索。
+  /**
+   * 取「上一条会话摘要」：项目库先探存在（不为一次性 cwd 建空库），打开与查询共用
+   * RESUME_PROJECT_OPEN_MS 预算——打不开（超时/迁移中）就当作没有简报。失败静默：
+   * 简报是增强项，不是依赖。
+   */
+  const loadResumeSummary = async (): Promise<{ summary: string; updatedAt: number } | undefined> => {
+    const cwd = sessionCwd(agent.session)
+    if (cwd === undefined) return undefined
+    try {
+      return await withTimeBudget((async () => {
+        const projectStore = await openProjectStoreIfExists(cwd)
+        if (projectStore === undefined) return undefined
+        const latest = await projectStore.latestSessionSummary()
+        return latest === undefined ? undefined : { summary: latest.summary, updatedAt: latest.updatedAt }
+      })(), RESUME_PROJECT_OPEN_MS)
+    } catch {
+      return undefined
+    }
+  }
   const requestText = currentUserRequestText(decision.messages)
   const agentId = String(agent.id)
   const sessionId = String(agent.session.id)
+  // `[RESUME]` 恢复简报（方案 §7 D）：素材本来就在库里——`session_summaries` 的最近一条摘要、
+  // 今日待回忆数、未清的 pending 摄取。模型不会主动问「上次聊到哪了」，而这是记忆插件最该
+  // 先回答的问题。只在「本会话第一次注入 / 压缩后重注入」时取一次；项目库必须先存在
+  // （与首问召回同口径：不为一次性 cwd 建空库）。任何 I/O 失败都只是「没有简报」。
+  const resumeGate = shouldRunResumeBriefing({
+    enabled: resolved.resumeBriefing,
+    agentId,
+    resumeAgent: state.resumeAgent,
+    resumeCompactions: state.resumeCompactions,
+    compactionCount,
+  })
+  const resumeSummary = resumeGate ? await loadResumeSummary() : undefined
   // 每个分支都留一行审计：上线后要能回答「召回有没有跑、为什么没注入」（风险报告 M4）。
   const auditQueryRecall = (detail: Record<string, unknown>): void => {
     const payload = JSON.stringify(detail)
@@ -632,14 +668,40 @@ async function preStep(
     state.queryRecallAgent = agentId
     auditQueryRecall({ outcome: 'off', chars: 0, tookMs: 0, top: resolved.queryRecallTop, ids: [] })
   }
-  // 画像空（例如库内条目全被 tier 过滤）但首问召回到了东西时，仍值得注入这一包。
-  if (top.length === 0 && curated === undefined && recallBlock === '') return decision
+  // 画像空（例如库内条目全被 tier 过滤）但首问召回到了东西时，仍值得注入这一包；
+  // 同理，只剩 `[RESUME]` 简报时也值得——「上次聊到哪」本身就是内容。
+  if (top.length === 0 && curated === undefined && recallBlock === '' && resumeSummary === undefined) return decision
   // 今日待回忆提示（检索练习调度）：有到期条目时在画像末尾附一行，引导 agent 主动自测。
   // user + project 两库合并计数；50 为计数上限（超过显示 50+）。
   const dueTotal = resolved.reviewScheduling
     ? (await Promise.all((['user', 'project'] as const).map(async scope =>
         (await openStore(scope)).dueReviews(Date.now(), 50)))).reduce((sum, rows) => sum + rows.length, 0)
     : 0
+  // `[RESUME]` 小节：放在画像之前（开场三行），整块有硬上限（resumeBriefingChars）。
+  // 未清 pending 数取 user 库的 op_log（pending 键恒落会话主库，与写入落点解耦）；取不到就算 0。
+  let resumeBlock = ''
+  if (resumeSummary !== undefined) {
+    let pendingIngests = 0
+    try {
+      pendingIngests = (await store.listAuditDetails('ingest-pending')).length
+    } catch {
+      // 计数是增强项：读不出来就省略那一行，简报照发。
+      pendingIngests = 0
+    }
+    resumeBlock = renderResumeBriefing({
+      summary: resumeSummary.summary,
+      updatedAt: resumeSummary.updatedAt,
+      due: dueTotal,
+      pendingIngests,
+      chars: resolved.resumeBriefingChars,
+      language: resolved.language,
+    })
+    // 只有真的渲染出内容才消耗本会话的唯一机会（摘要被清洗成空串时不算注入过）。
+    if (resumeBlock !== '') {
+      state.resumeAgent = agentId
+      state.resumeCompactions = compactionCount
+    }
+  }
   const detailed = renderProfileWithCurated(
     curated,
     top,
@@ -649,14 +711,16 @@ async function preStep(
     // 控制面外移：footnote 不进 <memory_context>，在下面拼到协议包之后。
     false,
   )
-  let text = detailed.text
+  // 简报永远在包首：它是开场三行，画像与信念是常驻层，召回回答的是本轮提问。
+  const withResume = (body: string): string => (resumeBlock === '' ? body : `${resumeBlock}\n\n${body}`)
+  let text = withResume(detailed.text)
   // 超预算压缩：装不下的条目交给辅助 LLM 压短后重渲染；失败保持索引行降级不变。
   if (detailed.overflow.length > 0) {
     const compressed = await compressProfileOverflow(ctx, agent, resolved.routeOverride, detailed.overflow, signal)
     if (compressed !== undefined) {
       // 辅助请求审计（压缩产物随注入消息进会话日志；请求本身落 op_log 供归因）。
       void openStore('user').then(auditStore => auditStore.audit('compress-request', 'AUX', JSON.stringify({ count: detailed.overflow.length }))).catch(() => { /* 审计失败不影响注入 */ })
-      text = renderProfileWithCurated(
+      text = withResume(renderProfileWithCurated(
         curated,
         top.map(record => {
           const shorter = compressed.get(record.id)
@@ -666,7 +730,7 @@ async function preStep(
         resolved.language,
         { start: resolved.injectItemBudgetStart, decay: resolved.injectItemBudgetDecay, floor: resolved.injectItemBudgetFloor },
         false,
-      ).text
+      ).text)
     }
   }
   // 巩固信念区块：active 信念按证据数/新近度取前 N，拼入同一份画像包；
@@ -972,6 +1036,8 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     queryRecallAgent: string | null
     queryRecallCompactions: number | null
     queryRecallNoTextKey: string | null
+    resumeAgent: string | null
+    resumeCompactions: number | null
     route: LlmRoute | undefined
   } = {
     pendingReplayed: false,
@@ -983,6 +1049,8 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     queryRecallAgent: null,
     queryRecallCompactions: null,
     queryRecallNoTextKey: null,
+    resumeAgent: null,
+    resumeCompactions: null,
     route: undefined,
   }
 

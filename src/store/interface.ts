@@ -11,7 +11,8 @@ import type {
   ForgettingTombstone, ForgottenAuditRow, ImportOptions, ImportPreview, ImportResult, ListFilter, ListResult,
   MemoryId, MemoryOutcome, MemoryRecord, ObservationId, ObservationListFilter, ObservationRecord,
   ObservationWriteInput, OperationLogRow, ProfileBlock, ProfileBlockVersion,
-  ReviewGrade, ReviewView, SearchQuery, SearchResult, Slot, StoreStats, TimelineQuery, UpdateInput, WriteInput,
+  ReviewGrade, ReviewView, SearchQuery, SearchResult, SessionSummaryRecord, Slot, StoreStats,
+  TimelineQuery, UpdateInput, WriteInput,
 } from '../types.ts'
 
 /** 一个房间的占用状态（slotCountsByRoom 的行）。 */
@@ -69,6 +70,11 @@ export interface KyzmemStore {
   setSessionSummary(sessionId: string, summary: string): Promise<void>
   /** 读取会话摘要；未生成过返回 undefined。 */
   getSessionSummary(sessionId: string): Promise<string | undefined>
+  /**
+   * 最近一条会话摘要（`updated_at` 倒序取 1）：`[RESUME]` 恢复简报的开场素材。
+   * 数据本来就有——取不出来是因为此前只有「按 id 查」这一个入口。
+   */
+  latestSessionSummary(): Promise<SessionSummaryRecord | undefined>
   /** 修正：旧条目转 archived，建立 supersedes 边（from=新，to=旧），返回新条目。 */
   update(input: UpdateInput): Promise<MemoryRecord>
   /** 软删（可恢复）。 */

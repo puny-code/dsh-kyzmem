@@ -23,6 +23,10 @@ export const zh = {
   'core.recallItem': '- [{kind}] {content}（{ref}）',
   'core.recallExamineHint': '需要原文用 kyzmem_examine ids=[{ids}]',
   'core.recallBatchNote': 'batch {batchId}：evidenceRefs 用行内括号里的 ref',
+  // ---- [RESUME] 恢复简报（resume-briefing：上一条会话摘要 + 今日待回忆 + 未完成摄取）----
+  'core.resumeHeader': '[RESUME] 上次会话（{date}）：{summary}',
+  'core.resumeDue': '今日待回忆 {count} 条',
+  'core.resumePendingIngest': '上次未完成摄取 {count} 条',
   'core.compressSystem': '把记忆条目压缩为更短的一句话表述（每条不超过 40 个字符），保留可跨会话复用的关键信息（事实、偏好、决策、方法）。\n只输出一个 JSON 数组，每项形如 {"id": "原样返回的id", "content": "压缩后表述"}，条目数量与 id 必须与输入一一对应。\n不要输出 JSON 以外的任何内容。',
 
   // ---- Обоснование отбора (selection-rationale) ----
@@ -94,6 +98,10 @@ export const en = {
   'core.recallItem': '- [{kind}] {content} ({ref})',
   'core.recallExamineHint': 'For the original text use kyzmem_examine ids=[{ids}]',
   'core.recallBatchNote': 'batch {batchId}: use the ref in parentheses as evidenceRefs',
+  // ---- [RESUME] briefing (resume-briefing: previous session summary + due reviews + pending ingests) ----
+  'core.resumeHeader': '[RESUME] Last session ({date}): {summary}',
+  'core.resumeDue': 'Review due today: {count}',
+  'core.resumePendingIngest': 'Unfinished ingests: {count}',
   'core.compressSystem': 'Compress each memory entry into a shorter single-sentence wording (at most 40 characters per entry), keeping the key information that can be reused across sessions (facts, preferences, decisions, methods).\nOutput only one JSON array, each item shaped like {"id": "the id returned verbatim", "content": "the compressed wording"}; the number of items and the ids must correspond one-to-one with the input.\nDo not output anything other than JSON.',
 
   // ---- Selection rationale (selection-rationale) ----
@@ -165,6 +173,10 @@ export const ru = {
   'core.recallItem': '- [{kind}] {content} ({ref})',
   'core.recallExamineHint': 'Чтобы получить исходный текст, используйте kyzmem_examine ids=[{ids}]',
   'core.recallBatchNote': 'batch {batchId}: evidenceRefs — это ref в скобках',
+  // ---- Сводка [RESUME] (resume-briefing: сводка прошлой сессии + что пора вспомнить + незавершённые извлечения) ----
+  'core.resumeHeader': '[RESUME] Прошлая сессия ({date}): {summary}',
+  'core.resumeDue': 'Сегодня пора вспомнить: {count}',
+  'core.resumePendingIngest': 'Незавершённых извлечений: {count}',
   'core.compressSystem': 'Сожми каждую запись памяти в более короткую однострочную формулировку (не более 40 символов на запись), сохранив ключевую информацию, пригодную для повторного использования между сессиями (факты, предпочтения, решения, методы).\nВыведи только один JSON-массив, каждый элемент вида {"id": "id, возвращённый как есть", "content": "сжатая формулировка"}; число элементов и id должны взаимно однозначно соответствовать входу.\nНе выводи ничего, кроме JSON.',
 
   // ---- Обоснование отбора (selection-rationale) ----

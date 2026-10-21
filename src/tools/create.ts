@@ -18,7 +18,7 @@ import type { LlmRoute } from '../llm/client.ts'
 import type { KyzmemStore } from '../store/interface.ts'
 import { embedImportedRecords, parseImportData, parseMarkdownExport } from '../store/import.ts'
 import { parseEntityMentions } from '../ingest/hook.ts'
-import type { KyzmemKind, KyzmemScope, KyzmemSourceTier, EntityId, EntityMention, ExportData, FactRecord, FactWriteInput, ImageryLabel, MemoryId } from '../types.ts'
+import type { KyzmemKind, KyzmemScope, KyzmemSourceTier, EntityId, EntityMention, ExportData, FactRecord, FactWriteInput, ImageryLabel, MemoryAnchor, MemoryId } from '../types.ts'
 import type { MemoryRecord, SearchHit } from '../types.ts'
 import { EPISODE_PROXIMITY_MS_DEFAULT, EPISODE_TIMELINE_LIMIT_DEFAULT, asEntityId, asFactId, asMemoryId, normalizeEntityName } from '../types.ts'
 import { renderMemoryPacket, sanitizeProtocolText } from '../security/sanitize.ts'
@@ -33,6 +33,7 @@ import {
 } from '../retrieve/evidence.ts'
 import type { AssessVerdict, NextStrategy } from '../retrieve/evidence.ts'
 import { placardImprovementHint } from '../imagery/score.ts'
+import { checkAnchors, computeAnchor, normalizeAnchorPath } from '../anchor.ts'
 import type { HistoryBackfillRules, HistoryEstimate, HistoryRunResult } from '../ingest/history.ts'
 import { applyMerge, confirmContradictions, decideWrite } from '../write-disposition.ts'
 import type { DropReason, MemoryJudge, WriteDisposition } from '../write-disposition.ts'
@@ -202,6 +203,21 @@ const execSessionCwd = new AsyncLocalStorage<string | undefined>()
 function sessionCwdOf(exec: ToolRunContext): string | undefined {
   const cwd = exec.agent?.session?.header?.cwd
   return cwd === undefined || cwd === '' ? undefined : cwd
+}
+
+/**
+ * 文件锚的解析根：会话 cwd 优先，无 cwd 回退插件进程目录。
+ * 与 project scope 的落点同一口径——锚点写进哪座宫殿，就该按哪座工作区解析。
+ */
+function anchorRootOf(exec: ToolRunContext): string {
+  return sessionCwdOf(exec) ?? process.cwd()
+}
+
+/** anchor 参数解析：缺省/空串 = 没给；其余原样交给 normalizeAnchorPath 校验。 */
+function anchorRequestOf(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const trimmed = raw.trim()
+  return trimmed === '' ? undefined : trimmed
 }
 
 /** 工具入参时间解析：ISO 或可解析日期字符串 → epoch 毫秒；缺省 undefined；不可解析 loud 失败。 */
@@ -534,6 +550,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       imagery?: ImageryLabel
       /** 来源分级默认由调用方决定：显式 save 是用户确认，自动摄取才是 agent-inferred。 */
       sourceTier?: KyzmemSourceTier
+      /** 文件锚（schema v16）：调用方已按工作区算好；缺省 = 不写锚点。 */
+      anchor?: MemoryAnchor
     },
   ): Promise<WriteOutcome | { readonly dropped: DropReason }> {
     const { embedding } = item
@@ -556,6 +574,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       ...(item.sourceTier === undefined ? {} : { sourceTier: item.sourceTier }),
       ...(embedding === undefined ? {} : { embedding }),
       ...(item.imagery === undefined ? {} : { imagery: item.imagery }),
+      ...(item.anchor === undefined ? {} : { anchor: item.anchor }),
     })
     if (decision.disposition === 'defer') {
       // defer 时 embedding 必然存在（decideWrite 在无嵌入时只判 accept）。
@@ -720,6 +739,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
       importance: { type: 'number', description: message('tool.saveImportanceDescription') },
       placard: { type: 'string', description: message('tool.savePlacardDescription') },
+      anchor: { type: 'string', description: message('tool.anchorDescription') },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
@@ -750,7 +770,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       render: (_args: any, value: any) => [{ type: 'text', text: renderSaveResultText(value as SaveResultView) }],
     },
     async execute(args, exec) {
-      const input = args as { content?: unknown; kind?: unknown; entities?: unknown; items?: unknown; scope?: unknown; importance?: unknown; placard?: unknown }
+      const input = args as { content?: unknown; kind?: unknown; entities?: unknown; items?: unknown; scope?: unknown; importance?: unknown; placard?: unknown; anchor?: unknown }
       const sourceSessionId = exec.agent?.id ?? null
       // 批量模式：items 与 content/kind 互斥，同传 loud 失败。
       if (input.items !== undefined) {
@@ -774,6 +794,20 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       const embeddings = embedder === undefined ? undefined : await embedder.embed([content.trim()])
       const imagery = placardOf(input.placard)
       const mentions = parseEntityMentions(input.entities)
+      // 文件锚（schema v16）：只收工作区相对路径；文件不存在就**不写锚点**并在结果里说明，
+      // 绝不因为「顺手给了个 anchor」让保存失败——记忆本身仍然有效，只是无法自证新鲜。
+      const anchorRequest = anchorRequestOf(input.anchor)
+      let anchor: MemoryAnchor | undefined
+      let anchorHint = ''
+      if (anchorRequest !== undefined) {
+        if (normalizeAnchorPath(anchorRequest) === undefined) {
+          throw new Error(message('tool.anchorPathInvalid', { path: anchorRequest }))
+        }
+        anchor = await computeAnchor(anchorRootOf(exec), anchorRequest, Date.now())
+        anchorHint = anchor === undefined
+          ? message('tool.anchorMissingHint')
+          : message('tool.anchorSavedHint', { path: anchor.path })
+      }
       const outcome = await writeWithDisposition(store, {
         scope,
         kind: input.kind as KyzmemKind,
@@ -785,6 +819,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         sourceTier: 'user-confirmed',
         ...(embeddings?.[0] === undefined ? {} : { embedding: embeddings[0] }),
         ...(imagery === undefined ? {} : { imagery }),
+        ...(anchor === undefined ? {} : { anchor }),
       })
       // 实体关联：merge 挂被并入的既有条目，accept/defer 挂新条目；失败静默。
       if ('dropped' in outcome) {
@@ -807,6 +842,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       // MERGE：复述并入既有条目——不新建、不挂门牌，只强化并明确告知（防模型误以为新建成功）。
       if (outcome.disposition === 'merge') {
         const sim = (outcome.similarity ?? 0).toFixed(2)
+        // 并入不新建条目 ⇒ 本次给的 anchor 无处可挂；如实说明，别让模型以为锚点生效了。
+        const mergeAnchorHint = anchorRequest === undefined ? '' : `\n${message('tool.anchorMergedHint', { id: record.id })}`
         return {
           id: record.id,
           kind: record.kind,
@@ -814,13 +851,14 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           disposition: 'merge' as const,
           ...(outcome.relatedId === undefined ? {} : { mergedInto: outcome.relatedId }),
           ...(outcome.similarity === undefined ? {} : { similarity: outcome.similarity }),
-          text: message('tool.saveMergeText', { similarity: sim, mergedInto: outcome.relatedId ?? '' }),
+          text: `${message('tool.saveMergeText', { similarity: sim, mergedInto: outcome.relatedId ?? '' })}${mergeAnchorHint}`,
         }
       }
       // 门牌质量提示：低分（不合「唯一·差异化·带日期」纪律）附增强建议。
       const placardHint = imagery === undefined || record.imageryScore === undefined
         ? ''
         : `\n${placardImprovementHint(record.imageryScore) ?? ''}`
+      const anchorSuffix = anchorHint === '' ? '' : `\n${anchorHint}`
       // DEFER：疑似矛盾/修正——落库并建 contradicts 边，报告候选由模型/用户裁决。
       if (outcome.disposition === 'defer') {
         const listed = candidates.map(candidate => message('tool.contradictionEntry', { content: candidate.content, id: candidate.id })).join(message('tool.separatorSemicolon'))
@@ -830,12 +868,12 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           importance: record.importance,
           disposition: 'defer' as const,
           ...(outcome.similarity === undefined ? {} : { similarity: outcome.similarity }),
-          text: message('tool.saveDeferText', { id: record.id, listed, placardHint }),
+          text: `${message('tool.saveDeferText', { id: record.id, listed, placardHint })}${anchorSuffix}`,
         }
       }
       const slot = record.slot === undefined ? '' : `, ${roomLabel(record.slot.room, deps.language)}#${record.slot.index}`
       const base = message('tool.saveAcceptedText', { id: record.id, kind: record.kind, importance: record.importance, slot })
-      return { id: record.id, kind: record.kind, importance: record.importance, disposition: 'accept' as const, text: `${base}${placardHint}` }
+      return { id: record.id, kind: record.kind, importance: record.importance, disposition: 'accept' as const, text: `${base}${placardHint}${anchorSuffix}` }
     },
   })
 
@@ -945,12 +983,26 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         }
       }
       /**
+       * 文件锚实时复验（schema v16）：只对将要渲染的前 ANCHOR_CHECK_LIMIT 条带锚点的命中各
+       * stat 一次——渲染路径上每条一次 stat 是硬成本，不能随 limit 无界增长。
+       * 标注**只影响展示**、不影响排序（第一版不做降权）：stale 的记忆仍然值得被看到，
+       * 由模型自己判断要不要用；顺手在行上标出来比整条沉底更诚实。
+       */
+      const anchorStates = await checkAnchors(
+        merged.map(hit => ({ id: String(hit.record.id), anchor: hit.record.anchor })),
+        anchorRootOf(exec),
+      )
+      /**
        * 来源分级 / 过期 / 冲突标记。为什么要显式标：工具输出与网页内容是「未确认」上下文，
        * 模型很容易把召回里的二手信息当已确认事实复述；标记贴在行上，比在提示里说一遍可靠。
        */
       const markersOf = (hit: SearchHit): string => {
         const parts: string[] = []
         if (hit.expired === true) parts.push(message('tool.searchExpired'))
+        // 锚点三态：intact 不标（干净的行才可读），missing/stale 各一句。
+        const anchorState = anchorStates.get(String(hit.record.id))
+        if (anchorState === 'missing') parts.push(message('tool.searchAnchorMissing'))
+        else if (anchorState === 'stale') parts.push(message('tool.searchAnchorStale'))
         if (hit.record.sourceTier === 'tool-output') parts.push(message('tool.searchTierTool'))
         else if (hit.record.sourceTier === 'web-content') parts.push(message('tool.searchTierWeb'))
         if (hit.cues?.contradicts !== undefined && hit.cues.contradicts.length > 0) {
@@ -1412,17 +1464,21 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
       kind: { type: 'string', enum: [...KINDS], description: message('tool.updateKindDescription') },
       placard: { type: 'string', description: message('tool.updatePlacardDescription') },
+      anchor: { type: 'string', description: message('tool.anchorDescription') },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
         id: { type: 'string', required: true },
         superseded: { type: 'string', required: true },
+        anchorHint: { type: 'string' },
       } },
-      render: (_args: any, value: any) =>
-        [{ type: 'text', text: message('tool.updateRendered', { id: value.id, superseded: value.superseded }) }],
+      render: (_args: any, value: any) => [{
+        type: 'text',
+        text: `${message('tool.updateRendered', { id: value.id, superseded: value.superseded })}${typeof value.anchorHint === 'string' ? `\n${value.anchorHint}` : ''}`,
+      }],
     },
-    async execute(args) {
-      const input = args as { id: string; content: string; scope?: unknown; kind?: KyzmemKind; placard?: unknown }
+    async execute(args, exec) {
+      const input = args as { id: string; content: string; scope?: unknown; kind?: KyzmemKind; placard?: unknown; anchor?: unknown }
       // 入库前协议剥离 + 密钥脱敏，与 kyzmem_save 同一防线。
       const content = redactSecrets(sanitizeProtocolText(input.content))
       if (content.trim() === '') throw new Error(message('tool.updateContentEmptyAfterSanitize'))
@@ -1433,6 +1489,21 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       const embedder = await deps.embedder
       const embeddings = embedder === undefined ? undefined : await embedder.embed([content.trim()])
       const imagery = placardOf(input.placard)
+      // 文件锚：显式给 = 按新路径重算（不刷新不算复验）；不给 = 继承旧锚点（store 侧处理）；
+      // 显式给了但文件又不在 = 明确清空（换了文件，旧锚点指向的根本不是这个路径了）。
+      const anchorRequest = anchorRequestOf(input.anchor)
+      let anchorField: MemoryAnchor | null | undefined
+      let anchorHint = ''
+      if (anchorRequest !== undefined) {
+        if (normalizeAnchorPath(anchorRequest) === undefined) {
+          throw new Error(message('tool.anchorPathInvalid', { path: anchorRequest }))
+        }
+        const computed = await computeAnchor(anchorRootOf(exec), anchorRequest, Date.now())
+        anchorField = computed ?? null
+        anchorHint = computed === undefined
+          ? message('tool.anchorMissingHint')
+          : message('tool.anchorSavedHint', { path: computed.path })
+      }
       const record = await store.update({
         id: input.id as never,
         scope,
@@ -1440,8 +1511,9 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         content,
         ...(embeddings === undefined ? {} : { embedding: embeddings[0] }),
         ...(imagery === undefined ? {} : { imagery }),
+        ...(anchorField === undefined ? {} : { anchor: anchorField }),
       })
-      return { id: record.id, superseded: input.id }
+      return { id: record.id, superseded: input.id, ...(anchorHint === '' ? {} : { anchorHint }) }
     },
   })
 
@@ -2238,10 +2310,20 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         if (record !== undefined) records.push(record)
       }
       if (records.length === 0) throw new Error(message('tool.examineAllNotFound', { count: tokens.length }))
+      // 文件锚实时复验（schema v16）：与 search 同口径——只对将要渲染的前 8 条各 stat 一次，
+      // 标注只影响展示、不影响排序与状态。
+      const anchorStates = await checkAnchors(
+        records.map(record => ({ id: String(record.id), anchor: record.anchor })),
+        anchorRootOf(exec),
+      )
       const text = records.map((record, index) => {
-        // 详情也标「未确认 / 已过期」：examine 常被拿来核对召回内容，来源分级只出现在 search 里不够。
+        // 详情也标「未确认 / 已过期 / 锚点状态」：examine 常被拿来核对召回内容，
+        // 来源分级只出现在 search 里不够。
         const marks: string[] = []
         if (record.expiresAt !== undefined && record.expiresAt <= Date.now()) marks.push(message('tool.searchExpired'))
+        const anchorState = anchorStates.get(String(record.id))
+        if (anchorState === 'missing') marks.push(message('tool.searchAnchorMissing'))
+        else if (anchorState === 'stale') marks.push(message('tool.searchAnchorStale'))
         if (record.sourceTier === 'tool-output') marks.push(message('tool.searchTierTool'))
         else if (record.sourceTier === 'web-content') marks.push(message('tool.searchTierWeb'))
         return [

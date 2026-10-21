@@ -116,6 +116,22 @@ export interface ReviewSchedule {
   readonly reps: number
 }
 
+/**
+ * 文件锚（schema v16）：记忆指向的源文件指纹。
+ *
+ * 为什么是 mtime+size 的哈希而不是内容哈希：一条「这个配置项在 X 文件里」的记忆
+ * 只需要回答「X 还是不是当初那个 X」；读文件内容会把一条 50MB 日志的写入卡住，
+ * 而 mtime+size 一次 stat 就够（同一 mtime 同一 size 的内容变化在实践中可以忽略）。
+ */
+export interface MemoryAnchor {
+  /** 工作区相对路径（入库时已拒绝绝对路径与 `..` 逃逸；始终用 `/` 分隔）。 */
+  readonly path: string
+  /** 指纹：`sha256(mtimeMs + ':' + size)` 的前 16 位十六进制（不读文件内容）。 */
+  readonly hash: string
+  /** 最后一次计算该指纹的时刻（epoch 毫秒）；渲染期复验不回写，留给后续批量任务用。 */
+  readonly checkedAt: number
+}
+
 /** 一条记忆。来源链：v0.0.1 记 sourceSessionId；v0.2.0 起自动摄取补 sourceRound/sourceSeq。 */
 export interface MemoryRecord {
   readonly id: MemoryId
@@ -155,6 +171,8 @@ export interface MemoryRecord {
   readonly lastRetrievedAt?: number
   /** 最近一次复习/效果回报时刻（schema v15 拆时钟）；缺省回退 lastAccessedAt。 */
   readonly lastReviewedAt?: number
+  /** 文件锚（schema v16）：该记忆描述的源文件指纹；缺省 = 无锚点（不受 stale 标注影响）。 */
+  readonly anchor?: MemoryAnchor
 }
 
 /** 记忆关系边。 */
@@ -296,6 +314,8 @@ export interface WriteInput {
   readonly expiresAt?: number
   /** 来源分级（schema v15）；缺省 = agent-inferred。 */
   readonly sourceTier?: KyzmemSourceTier
+  /** 文件锚（schema v16）：调用方已算好的指纹；缺省 = 不写锚点。 */
+  readonly anchor?: MemoryAnchor
 }
 
 /** 检索请求。 */
@@ -425,6 +445,15 @@ export interface EpisodeTimelineResult {
   readonly around?: { readonly anchor: MemoryRecord; readonly neighbors: readonly MemoryRecord[] }
 }
 
+/** 一条会话摘要（session_summaries 行，schema v9 起）。 */
+export interface SessionSummaryRecord {
+  readonly sessionId: string
+  /** 摄取期 LLM 生成的一句话摘要。 */
+  readonly summary: string
+  /** 最后写入时刻（同会话重跑覆盖）。 */
+  readonly updatedAt: number
+}
+
 /** 更新请求：旧条目转 archived 并建立 supersedes 边（from=新，to=旧）。 */
 export interface UpdateInput {
   readonly id: MemoryId
@@ -436,6 +465,10 @@ export interface UpdateInput {
   readonly embedding?: Float32Array
   /** 意象铭牌替换；缺省继承旧条目。 */
   readonly imagery?: ImageryLabel
+  /** 文件锚（schema v16，`[RESUME]` 之外的 C 项）：显式给 = 按新文件重算；
+   *  null = 明确清空（换了文件而这个路径又不存在）；缺省 = 继承旧条目锚点，
+   *  且**不刷新** checkedAt——复验时刻属于渲染期，写入不该假装复验过。 */
+  readonly anchor?: MemoryAnchor | null
 }
 
 /** 画像 curated block 的单条版本记录（追加式版本链，rollback 数据源）。 */

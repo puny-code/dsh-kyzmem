@@ -283,7 +283,7 @@ describe('KyzmemStore 宫殿与复习调度（schema v6）', () => {
     expect((await migrated.get(asMemoryId('legacy-1')))?.slot).toEqual({ room: 'fact', index: 2 })
     await migrated.close()
     const check = new DatabaseSync(path)
-    expect((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value).toBe('15')
+    expect((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value).toBe('16')
     const indexes = (check.prepare('PRAGMA index_list(nodes)').all() as unknown as { name: string }[]).map(row => row.name)
     expect(indexes).toContain('nodes_slot')
     expect(indexes).toContain('nodes_review_due')
@@ -311,6 +311,6 @@ describe('KyzmemStore 宫殿与复习调度（schema v6）', () => {
     const check = new DatabaseSync(path)
     const version = (check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value
     check.close()
-    expect(version).toBe('15')
+    expect(version).toBe('16')
   })
 })

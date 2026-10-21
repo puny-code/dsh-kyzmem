@@ -92,6 +92,10 @@ export interface KyzmemConfig {
   queryRecallBudget?: number
   /** 首问召回条数上限；缺省 light 3 / full 5。 */
   queryRecallTop?: number
+  /** 会话开场是否注入 `[RESUME]` 恢复简报（上一条会话摘要 + 今日待回忆 + 未完成摄取）；默认 true。 */
+  resumeBriefing?: boolean
+  /** `[RESUME]` 小节整块字符上限（含摘要与两行计数）；默认 200。 */
+  resumeBriefingChars?: number
   /** 检索排序 recency 因子权重（0 关闭）；默认 0.2。 */
   rankRecencyWeight?: number
   /** 检索排序 proof 因子权重（0 关闭）；默认 0.05（实测 access_count 中位 0，旧 0.1 只会放大少数老条目）。 */
@@ -191,6 +195,10 @@ export interface ResolvedKyzmemConfig {
   readonly queryRecallBudget: number
   /** 首问召回条数上限（light 3 / full 5 的缺省已在 resolve 落地）。 */
   readonly queryRecallTop: number
+  /** 会话开场是否注入 `[RESUME]` 恢复简报。 */
+  readonly resumeBriefing: boolean
+  /** `[RESUME]` 小节整块字符上限。 */
+  readonly resumeBriefingChars: number
   readonly rankRecencyWeight: number
   readonly rankProofWeight: number
   readonly queryRewrite: boolean
@@ -216,6 +224,7 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'rankRecencyWeight', 'rankProofWeight', 'queryRewrite',
   'autoSlot', 'reviewScheduling', 'assessReminder',
   'queryRecall', 'queryRecallBudget', 'queryRecallTop',
+  'resumeBriefing', 'resumeBriefingChars',
   'historyBackfillDays', 'historyBackfillMaxTurnsPerSession', 'historyBackfillMaxTotalTurns',
   'historyBackfillIncludeSubagents', 'historyBackfillIncludeSeeded', 'historyBackfillIncludeNoCwd',
   'language', 'redactWords',
@@ -278,6 +287,8 @@ export const Config: z<KyzmemConfig> = z.object({
   queryRecall: z.string() as unknown as z<QueryRecallMode>,
   queryRecallBudget: z.number().step(1).min(240).max(4000),
   queryRecallTop: z.number().step(1).min(1).max(10),
+  resumeBriefing: z.boolean(),
+  resumeBriefingChars: z.number().step(1).min(80).max(600),
   historyBackfillDays: z.number().step(1).min(0).max(3650),
   historyBackfillMaxTurnsPerSession: z.number().step(1).min(1).max(500),
   historyBackfillMaxTotalTurns: z.number().step(1).min(1).max(5000),
@@ -380,6 +391,13 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     && (!Number.isInteger(config.queryRecallTop) || config.queryRecallTop < 1 || config.queryRecallTop > 10)) {
     throw new Error('dsh-kyzmem: queryRecallTop must be an integer in [1, 10]')
   }
+  if (config.resumeBriefing !== undefined && typeof config.resumeBriefing !== 'boolean') {
+    throw new Error('dsh-kyzmem: resumeBriefing must be a boolean')
+  }
+  if (config.resumeBriefingChars !== undefined
+    && (!Number.isInteger(config.resumeBriefingChars) || config.resumeBriefingChars < 80 || config.resumeBriefingChars > 600)) {
+    throw new Error('dsh-kyzmem: resumeBriefingChars must be an integer in [80, 600]')
+  }
   if (config.rankRecencyWeight !== undefined && (config.rankRecencyWeight < 0 || config.rankRecencyWeight > 2)) {
     throw new Error('dsh-kyzmem: rankRecencyWeight must be in [0, 2]')
   }
@@ -447,6 +465,8 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     queryRecall: queryRecallMode,
     queryRecallBudget: resolvedQueryRecallBudget,
     queryRecallTop: config.queryRecallTop ?? (queryRecallMode === 'full' ? 5 : 3),
+    resumeBriefing: config.resumeBriefing ?? true,
+    resumeBriefingChars: config.resumeBriefingChars ?? 200,
     rankRecencyWeight: config.rankRecencyWeight ?? 0.2,
     rankProofWeight: config.rankProofWeight ?? 0.05,
     queryRewrite: config.queryRewrite ?? true,
