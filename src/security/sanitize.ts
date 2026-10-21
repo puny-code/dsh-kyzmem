@@ -3,11 +3,14 @@
  * 当前用户请求包 <current_user_request>；任何记忆正文入库前剥离这些协议标签，
  * 防止历史记忆里伪造的协议块在下次召回时被当作本插件输出二次注入。
  *
- * 两道防线（H1 修复后的关键约定）：
+ * 三道防线（H1 修复后的关键约定）：
+ * 0. Cf 剥离：零宽空格/软连字符/双向控制符这类 Unicode Cf 先把标签拆成「看起来是标签、
+ *    正则不认」的形态，必须最先整体剥离 `\p{Cf}`，且输出基于剥离后的文本。
  * 1. 成对块剥离：合法/伪造的完整协议块整段移除（记忆上下文）或解包保留内部文本（当前请求）。
  * 2. 残留标签中和：剥不掉的孤立开/闭/自闭合标签一律把 `<` 换成全角 `＜`——破坏标签语法
  *    （一个孤立闭标签就能提前结束记忆块、让它之后的文本冒充「包外指令」），但保留可读文本
- *    （直接删除会丢内容）。中和必须覆盖协议标签全集，漏掉任何一个都等于留了一扇逃逸门。
+ *    （直接删除会丢内容）。HTML 实体写法（`&lt;…&gt;`）与真标签同口径中和。
+ *    中和必须覆盖协议标签全集，漏掉任何一个都等于留了一扇逃逸门。
  * @module dsh-kyzmem/security/sanitize
  */
 
@@ -62,21 +65,59 @@ function neutralizeProtocolTags(value: string): string {
   return value.replace(PROTOCOL_TAG_OPEN_PATTERN, NEUTRALIZED_LT)
 }
 
+/**
+ * Unicode Cf（格式字符）匹配：零宽空格 U+200B、软连字符 U+00AD、词连接符 U+2060、
+ * 双向控制符 U+202A-202E、BOM U+FEFF 等全部归这一类。
+ */
+const FORMAT_CHARS_PATTERN = /\p{Cf}/gu
+
+/**
+ * 剥离 Unicode Cf 格式字符。为什么必须做：`</\u200bkyzmem_memory_context>` 对任何按
+ * **可见文本**判读的下游（模型、其它解析器、日志阅读者）都是一个合法的闭标签，而正则匹配
+ * 不认中间那个零宽字符——等于给中和开了一扇旁路。记忆正文没有保留零宽字符的正当理由，
+ * 代价只是多字符 emoji 的 ZWJ 组合会被拆成单字符，可以接受。
+ * 记住：剥离必须发生在所有匹配之前，且**输出也基于剥离后的文本**——否则「匹配时抹掉、
+ * 输出时还原」又会出现两套文本。
+ */
+function stripFormatChars(value: string): string {
+  return value.replace(FORMAT_CHARS_PATTERN, '')
+}
+
+/**
+ * HTML 实体形式的协议标签头：`&lt;/kyzmem_memory_context&gt;`、`&#60;kyzmem_memory_context&#62;`。
+ * 下游只要做一次实体解码就会还原成合法标签，所以必须与真标签同口径中和（把整个实体前缀
+ * 换成全角 `＜`）。只匹配协议标签名——不做全局 `&lt;` 改写，否则代码片段里的
+ * `&lt;div&gt;` 会被误伤；数字实体（`&#60;` / `&#x3c;`）同样只在本表标签名下生效。
+ */
+const PROTOCOL_TAG_ENTITY_PREFIX_PATTERN = new RegExp(
+  `(?:&lt;|&#0*60;|&#x0*3c;)(?=\\s*/?\\s*(?:${PROTOCOL_TAGS.map(escapeRegExp).join('|')})(?![\\w-]))`,
+  'gi',
+)
+
+/** 中和 HTML 实体形式的残留协议标签头（保留可读文本，破坏解码后的标签语法）。 */
+function neutralizeEntityTags(value: string): string {
+  return value.replace(PROTOCOL_TAG_ENTITY_PREFIX_PATTERN, NEUTRALIZED_LT)
+}
+
 /** 记忆包来源标记：turn_start 会话开始注入；tool_* 召回工具输出。 */
 export type MemoryPacketSource = 'turn_start' | 'tool_search' | 'tool_timeline' | 'tool_episode_timeline' | 'tool_review' | 'tool_facts'
 
 /**
- * 清洗记忆正文：先按配对剥离协议块（记忆上下文块整段移除、当前请求块解包保留内部文本、
- * no-palace 块整段移除），再把剥不掉的残留标签中和（`<` → `＜`），最后归一空白。
- * 顺序很重要：成对块必须在中和之前剥——否则中和后的文本里不会再有可配对的标签。
+ * 清洗记忆正文：先剥 Unicode Cf（零宽/软连字符/双向控制符），再按配对剥离协议块
+ * （记忆上下文块整段移除、当前请求块解包保留内部文本、no-palace 块整段移除），
+ * 然后把残留的真标签与 HTML 实体标签中和（`<`/`&lt;` → `＜`），最后归一空白。
+ * 顺序很重要：Cf 必须先剥（否则标签被零宽字符拆开、正则认不出），成对块必须在中和之前剥。
  * @param value - 待清洗的原文（会话文本或模型输出候选）。
- * @returns 可安全入库/复用的正文。
+ * @returns 可安全入库/复用的正文（Cf 已剥离，不会出现「匹配时抹掉、输出还原」的两套文本）。
  */
 export function sanitizeProtocolText(value: string): string {
+  const withoutFormatChars = stripFormatChars(value)
   return normalizeWhitespace(
-    neutralizeProtocolTags(
-      unwrapCurrentUserRequestBlocks(
-        stripMemoryContextBlocks(stripNoPalaceBlocks(value)),
+    neutralizeEntityTags(
+      neutralizeProtocolTags(
+        unwrapCurrentUserRequestBlocks(
+          stripMemoryContextBlocks(stripNoPalaceBlocks(withoutFormatChars)),
+        ),
       ),
     ),
   )

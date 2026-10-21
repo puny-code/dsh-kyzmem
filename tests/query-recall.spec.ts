@@ -85,9 +85,10 @@ describe('shouldQueryRecallText（值不值得查）', () => {
     expect(shouldQueryRecallText('how do I build this?', 'en')).toBe(true)  // 16 个非空白字符
     expect(shouldQueryRecallText('fix the build error', 'en')).toBe(true)   // 16
     expect(shouldQueryRecallText('Как собрать проект?', 'ru')).toBe(true)   // 18
-    // 13 个字符的碎片仍然不查。
-    expect(shouldQueryRecallText('build it now ok?', 'en')).toBe(false)
-    expect(shouldQueryRecallText('where is it', 'en')).toBe(false)
+    // 13 个字符的碎片仍然不查（阈值就是 15，差一档都不放）。
+    expect(shouldQueryRecallText('how to run tests', 'en')).toBe(false)     // 13
+    expect(shouldQueryRecallText('build it now ok?', 'en')).toBe(false)     // 13
+    expect(shouldQueryRecallText('where is it', 'en')).toBe(false)          // 9
   })
 
   it('纯寒暄不查（与写入链路 isPureChitchat 同一数据源）', () => {
@@ -667,6 +668,30 @@ describe('经真实 apply() + agent/pre-step 的集成', () => {
     expect(details.map(detail => detail.outcome)).toContain('no-text')
     // 也没有任何真正的检索（store 的 recall 审计为空）。
     expect(await recentOps('recall')).toHaveLength(0)
+  })
+
+  it('no-text 审计每会话只记一次（压缩后才重置），长问仍能召回', async () => {
+    await boot({ queryRecall: 'light' })
+    // 5 个 turn，每个 turn 的第一步都是短问/寒暄：文本门都不过。
+    for (let turn = 1; turn <= 5; turn += 1) await run(1, '继续', turn)
+    await new Promise(resolve => setTimeout(resolve, 150))
+    const countNoText = async (): Promise<number> =>
+      (await recentOps('query-recall'))
+        .map(row => JSON.parse(row.detail ?? '{}') as { outcome?: string })
+        .filter(detail => detail.outcome === 'no-text')
+        .length
+    // 逐轮落账会把 op_log 刷成噪声：5 轮短问只留 1 条。
+    expect(await countNoText()).toBe(1)
+
+    // 文本门不过不消耗会话机会：后面的长问仍能召回。
+    expect(injectedText(await run(1, QUESTION, 6))).toContain(HEADER)
+
+    // 压缩后召回机会重置，短问可以再记一行（用下一轮的第一步；非 step=1 会先被证据门
+    // 收尾提醒短路，那是既有行为，与本用例无关）。
+    events.push({ type: 'compaction/end', data: {}, seq: events.length + 1, time: Date.now() })
+    injectedText(await run(1, '继续', 7))
+    await new Promise(resolve => setTimeout(resolve, 150))
+    expect(await countNoText()).toBe(2)
   })
 
   it('off 档：零检索、零强化、只留一行 off 审计', async () => {

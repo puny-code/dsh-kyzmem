@@ -385,6 +385,12 @@ async function preStep(
     queryRecallAgent: string | null
     /** 首问召回：上次召回时观察到的压缩计数（压缩后允许再召回一次）。 */
     queryRecallCompactions: number | null
+    /**
+     * 首问召回：已记过 `no-text` 审计的键（`agent#压缩计数`）。
+     * 文本门不消耗会话机会 ⇒ 每个 turn 的第一步都会重判文本，逐轮落账会把 op_log 刷成噪声；
+     * 每会话只记一次，压缩后键变（允许再记一次）。
+     */
+    queryRecallNoTextKey: string | null
     route: LlmRoute | undefined
   },
   logRequest: (data: IngestRequestEventData) => void,
@@ -543,7 +549,13 @@ async function preStep(
     // 文本门先判、且不消耗会话机会：占位句/寒暄/太短不算「已尝试」，机会留给真正的问题
     // （首问是「继续」时下一次注入仍会重判，而不是整个会话静默失效——风险报告 M7）。
     if (!shouldQueryRecallText(requestText, resolved.language)) {
-      auditQueryRecall({ outcome: 'no-text', chars: 0, tookMs: 0, top: resolved.queryRecallTop, ids: [] })
+      // 但审计每会话只记一次：文本门不消耗机会 ⇒ 每个 turn 的第一步都会重判文本，
+      // 逐轮落账会把 op_log 刷成噪声。键带压缩计数：压缩后召回机会重置，允许再记一行。
+      const noTextKey = `${agentId}#${String(compactionCount)}`
+      if (state.queryRecallNoTextKey !== noTextKey) {
+        state.queryRecallNoTextKey = noTextKey
+        auditQueryRecall({ outcome: 'no-text', chars: 0, tookMs: 0, top: resolved.queryRecallTop, ids: [] })
+      }
     } else {
       state.queryRecallAgent = agentId
       state.queryRecallCompactions = compactionCount
@@ -959,6 +971,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     lastRecallBatch: string | null
     queryRecallAgent: string | null
     queryRecallCompactions: number | null
+    queryRecallNoTextKey: string | null
     route: LlmRoute | undefined
   } = {
     pendingReplayed: false,
@@ -969,6 +982,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     lastRecallBatch: null,
     queryRecallAgent: null,
     queryRecallCompactions: null,
+    queryRecallNoTextKey: null,
     route: undefined,
   }
 
