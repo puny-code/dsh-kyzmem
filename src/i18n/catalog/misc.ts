@@ -49,12 +49,6 @@ export const zh = {
   // Исправлено во всех трёх словарях; автору сообщаем — это ошибка разработчика, не замысел.
   'misc.placardImprovementHint': '门牌不合规（宫殿纪律：唯一 · 差异化 · 带日期）：建议用 kyzmem_update 的 placard 参数挂一个 4-30 字、含日期锚点、与同房其他门牌前 6 字不重复的铭牌。',
   // jev/runtime.ts
-  'misc.jevEnabledMustBeBoolean': 'invalid: jev.enabled 必须是布尔值',
-  'misc.jevApiKeyMustBeString': 'invalid: jev.apiKey 必须是字符串',
-  'misc.jevBaseUrlMustBeString': 'invalid: jev.baseUrl 必须是字符串',
-  'misc.jevBaseUrlMustBeHttp': 'invalid: jev.baseUrl 必须是 http(s) URL',
-  'misc.jevModelMustNotBeEmpty': 'invalid: jev.model 不能为空',
-  'misc.jevTimeoutMsMustBeInteger': 'invalid: jev.timeoutMs 必须是 1000-60000 的整数毫秒',
 } as const
 
 /** Английский набор — образец полноты. */
@@ -94,12 +88,6 @@ export const en = {
   // 2026-10-11, A-16: полное пояснение — в китайском блоке выше; наружный параметр называется placard.
   'misc.placardImprovementHint': 'placard does not comply (palace discipline: unique · distinctive · date-anchored): attach a 4-30 character placard with the placard parameter of kyzmem_update, including a date anchor and not repeating the first 6 characters of another placard in the same room.',
   // jev/runtime.ts
-  'misc.jevEnabledMustBeBoolean': 'invalid: jev.enabled must be a boolean',
-  'misc.jevApiKeyMustBeString': 'invalid: jev.apiKey must be a string',
-  'misc.jevBaseUrlMustBeString': 'invalid: jev.baseUrl must be a string',
-  'misc.jevBaseUrlMustBeHttp': 'invalid: jev.baseUrl must be an http(s) URL',
-  'misc.jevModelMustNotBeEmpty': 'invalid: jev.model must not be empty',
-  'misc.jevTimeoutMsMustBeInteger': 'invalid: jev.timeoutMs must be an integer number of milliseconds between 1000 and 60000',
 } as const
 
 /** Русский набор. */
@@ -139,10 +127,4 @@ export const ru = {
   // 2026-10-11, A-16: полное пояснение — в китайском блоке выше; наружный параметр называется placard.
   'misc.placardImprovementHint': 'табличка не соответствует дисциплине дворца (уникальность · различимость · дата): прикрепите параметром placard инструмента kyzmem_update табличку из 4-30 символов с датой, первые 6 символов которой не совпадают с другими табличками той же комнаты.',
   // jev/runtime.ts
-  'misc.jevEnabledMustBeBoolean': 'invalid: jev.enabled должно быть логическим значением',
-  'misc.jevApiKeyMustBeString': 'invalid: jev.apiKey должно быть строкой',
-  'misc.jevBaseUrlMustBeString': 'invalid: jev.baseUrl должно быть строкой',
-  'misc.jevBaseUrlMustBeHttp': 'invalid: jev.baseUrl должно быть URL со схемой http(s)',
-  'misc.jevModelMustNotBeEmpty': 'invalid: jev.model не может быть пустым',
-  'misc.jevTimeoutMsMustBeInteger': 'invalid: jev.timeoutMs должно быть целым числом миллисекунд от 1000 до 60000',
 } as const

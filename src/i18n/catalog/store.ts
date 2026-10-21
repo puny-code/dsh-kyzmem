@@ -50,7 +50,6 @@ export const zh = {
   'store.migrationAlreadyMigrated': '[dsh-kyzmem] 旧库已有迁移记录（{names}）：{pointer}；先前迁移的库可能含有当前目录的记忆。{manual}',
 
   // —— write-disposition.ts ——
-  'store.mergeTargetMissing': 'write-disposition: 并入目标 {id} 不存在',
 
   // —— embedder/local.ts ——
   'store.embedderDownloadFailed': '嵌入模型下载/加载失败；检索已降级为纯关键词模式，可检查网络后重试',
@@ -101,7 +100,6 @@ export const en = {
   'store.migrationAlreadyMigrated': '[dsh-kyzmem] the legacy database already has a migration record ({names}): {pointer}; the database migrated earlier may hold memories of the current directory. {manual}',
 
   // —— write-disposition.ts ——
-  'store.mergeTargetMissing': 'write-disposition: merge target {id} does not exist',
 
   // —— embedder/local.ts ——
   'store.embedderDownloadFailed': 'embedding model download/load failed; retrieval has degraded to keyword-only mode — check the network and retry',
@@ -152,7 +150,6 @@ export const ru = {
   'store.migrationAlreadyMigrated': '[dsh-kyzmem] У старой базы уже есть запись о переносе ({names}): {pointer}; в базе, перенесённой ранее, могут быть воспоминания текущего каталога. {manual}',
 
   // —— write-disposition.ts ——
-  'store.mergeTargetMissing': 'write-disposition: цель слияния {id} не существует',
 
   // —— embedder/local.ts ——
   'store.embedderDownloadFailed': 'Не удалось скачать/загрузить модель эмбеддингов; поиск переведён в режим только по ключевым словам — проверьте сеть и повторите',

@@ -37,6 +37,36 @@ export function routeFromEvents(events: readonly SessionEventLike[]): LlmRoute |
   return undefined
 }
 
+/**
+ * 需要 session 头做路由的 provider：OpenCode Zen/Go 在请求里读 `x-opencode-session`，
+ * 缺失即 400 MissingSessionID。宿主只在 sessionId 非空时才写这个头。
+ */
+const SESSION_ROUTED_PROVIDERS = new Set(['opencode', 'opencode-go'])
+
+/**
+ * 解析真正随请求下发的 sessionId。
+ *
+ * 空串不能原样下发：宿主把它映射成 provider 的会话路由头时要求非空
+ * （`options.sessionId === undefined ? {} : …`），而 OpenCode 系网关缺该头直接 400，
+ * 所以历史回填（拿不到当前会话）会整批失败。这类 provider 退化为按用途固定的
+ * 辅助会话标识（同一进程内稳定，可被网关用于路由），其他 provider 则干脆不带。
+ * @param provider - 路由 provider id。
+ * @param sessionId - 调用方给的归属会话 id（可能为空/缺省）。
+ * @param purpose - 辅助调用用途，用于拼稳定的兜底标识。
+ * @returns 非空会话 id；不该下发时 undefined。
+ */
+export function resolveSessionId(provider: string, sessionId: string | undefined, purpose: string): string | undefined {
+  const trimmed = sessionId?.trim() ?? ''
+  if (trimmed !== '') return trimmed
+  if (!SESSION_ROUTED_PROVIDERS.has(provider) && !provider.startsWith('opencode-')) return undefined
+  const tag = purpose
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  const base = tag === '' ? 'aux' : tag
+  return base.startsWith('kyzmem') ? base : `kyzmem-${base}`
+}
+
 /** 从模型输出提取 JSON 数组：剥 Markdown 代码栅栏后解析；无有效数组返回 undefined。 */
 export function parseJsonArray(text: string): unknown[] | undefined {
   const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text)
@@ -78,7 +108,8 @@ function finishError(finish: FinishReason): Error | undefined {
  * @param params.route - 模型路由（来自日志解析或显式配置）。
  * @param params.system - 系统指令。
  * @param params.userText - 用户侧 JSON 框定输入。
- * @param params.sessionId - 归属会话 id 字符串（调用方来自 agent.session.id，内部转 branded）。
+ * @param params.sessionId - 归属会话 id 字符串（调用方来自 agent.session.id，内部转 branded）；
+ *   空值由 {@link resolveSessionId} 兜底，OpenCode 系 provider 绝不发空 sessionId。
  * @param params.maxTokens - 输出上限。
  * @param params.purpose - 用途标记（宿主 purpose 枚举未开放第三方注册，运行时经 cast 传入，
  *   token-meter 归因由 sessionId/provider/model 承载）。
@@ -91,7 +122,7 @@ export async function streamText(
     route: LlmRoute
     system: string
     userText: string
-    sessionId: string
+    sessionId?: string | undefined
     maxTokens: number
     purpose: string
     signal: AbortSignal
@@ -102,13 +133,14 @@ export async function streamText(
     content: [{ type: 'text', text: params.userText }],
     source: { kind: 'plugin:dsh-kyzmem' },
   })]
+  const sessionId = resolveSessionId(params.route.provider, params.sessionId, params.purpose)
   const options: GenerateOptions = {
     provider: params.route.provider,
     model: params.route.model,
     messages,
     system: params.system,
     maxTokens: params.maxTokens,
-    sessionId: params.sessionId as never as NonNullable<GenerateOptions['sessionId']>,
+    ...sessionId === undefined ? {} : { sessionId: sessionId as never as NonNullable<GenerateOptions['sessionId']> },
     purpose: params.purpose as NonNullable<GenerateOptions['purpose']>,
     signal: params.signal,
   }

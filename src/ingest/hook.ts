@@ -174,8 +174,12 @@ export interface IngestDeps {
   readonly mode: Exclude<IngestMode, 'off'>
   /** 显式路由覆盖（Config provider+model 成对）；缺省从日志解析。 */
   readonly routeOverride: LlmRoute | undefined
-  /** 辅助 LLM 调用（由 index.ts 用 ctx.llm.stream 构造）。 */
-  readonly call: (params: { route: LlmRoute; system: string; userText: string; maxTokens: number; purpose: string; signal: AbortSignal }) => Promise<string>
+  /**
+   * 辅助 LLM 调用（由 index.ts 用 ctx.llm.stream 构造）。
+   * `sessionId` 必须随每次调用下发：OpenCode 系 provider 缺它会被网关 400 拒绝，
+   * 而历史回填没有「当前会话」，只能由这里把被回填会话的 id 带上。
+   */
+  readonly call: (params: { route: LlmRoute; system: string; userText: string; maxTokens: number; purpose: string; signal: AbortSignal; sessionId?: string }) => Promise<string>
   /** 辅助调用请求记入会话日志（model-visible ⟺ logged）。 */
   readonly logRequest: (data: IngestRequestEventData) => void
   /** 取消信号（跟随请求）。 */
@@ -474,6 +478,7 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
     userText,
     maxTokens: INGEST_MAX_TOKENS,
     purpose: 'kyzmem-ingest',
+    sessionId: deps.sessionId,
     signal: deps.signal,
   })
   let parsed = parseJsonArray(raw)
@@ -487,6 +492,7 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
       userText,
       maxTokens: INGEST_MAX_TOKENS,
       purpose: 'kyzmem-ingest',
+      sessionId: deps.sessionId,
       signal: deps.signal,
     })
     parsed = parseJsonArray(raw)
@@ -710,6 +716,7 @@ export async function ensureSessionSummary(deps: SessionSummaryDeps): Promise<vo
       userText,
       maxTokens: SESSION_SUMMARY_MAX_TOKENS,
       purpose: 'kyzmem-session-summary',
+      sessionId: deps.sessionId,
       signal: deps.signal,
     })
     const summary = raw.trim()

@@ -774,9 +774,11 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     mode: resolved.ingest === 'off' ? 'light' : resolved.ingest,
     // 优先用当前可用路由（配置覆盖 > 当前会话在用的模型）——历史日志里的旧 provider/model 可能已不可用。
     routeOverride: resolved.routeOverride ?? preStepState.route,
-    // 辅助调用归属：审计经 logRequest 带会话 id 落 op_log，streamText 只需一个稳定标识。
-    call: callParams => streamText(ctx, { ...callParams, sessionId: '' }),
-    logRequest: logIngestRequest,  })
+    // 辅助调用归属：sessionId 由调用点带上被回填会话的 id（OpenCode 系 provider 缺这个头会被 400 拒绝），
+    // 审计另经 logRequest 落 op_log。
+    call: callParams => streamText(ctx, callParams),
+    logRequest: logIngestRequest,
+  })
 
   /** 回填任务（进程内单例；面板轮询它的进度，工具同步等待自己的那一次运行）。 */
   let backfillJob:
@@ -860,8 +862,9 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     openStore,
     resolveProjectStore,
     embedder,
-    call: callParams => streamText(ctx, { ...callParams, sessionId: callParams.sessionId ?? '' }),
-    routeOverride: resolved.routeOverride,    queryRewrite: resolved.queryRewrite,
+    call: callParams => streamText(ctx, callParams),
+    routeOverride: resolved.routeOverride,
+    queryRewrite: resolved.queryRewrite,
     exportDir: `${resolved.dbDir}/exports`,
     language: resolved.language,
     historyBackfill: { estimate: historyApi.estimate, run: historyApi.run },
@@ -884,7 +887,8 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
       dbDir: resolved.dbDir,
       pluginVersion: VERSION,
       language: resolved.language,
-      embedder,      history: {
+      embedder,
+      history: {
         estimate: historyApi.estimate,
         start: historyApi.start,
         cancel: historyApi.cancel,

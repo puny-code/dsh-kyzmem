@@ -256,6 +256,24 @@ describe('runHistoryBackfill', () => {
     expect((await userStore.topActive('user', 10)).map(record => record.content)).toContain('用户偏好简体中文回复')
   })
 
+  it('回填把被回填会话的 id 传给辅助调用（OpenCode 系 provider 缺这个头会被网关 400 拒绝）', async () => {
+    const source = makeSource([{ id: 'sess-abc', createdAt: NOW - 1000, cwd: '/repo/a', turns: [1] }])
+    const seen: (string | undefined)[] = []
+    const deps = {
+      ...makeDeps(source, { count: 0 }),
+      now: () => NOW,
+      call: async (params: { purpose: string; sessionId?: string }) => {
+        seen.push(params.sessionId)
+        if (params.purpose === 'kyzmem-session-summary') return '一场会话摘要'
+        return JSON.stringify([{ kind: 'fact', content: '提炼事实', importance: 0.6 }])
+      },
+    }
+    await runHistoryBackfill(deps, DEFAULTS, {}, () => undefined, new AbortController().signal)
+    // 提炼与摘要都得带上真实会话 id：空串会让宿主的会话路由头缺失。
+    expect(seen.length).toBe(2)
+    for (const sessionId of seen) expect(sessionId).toBe('sess-abc')
+  })
+
   it('回填的条目不进 SM-2 复习队列（否则一次性回填会淹没今日待回忆）', async () => {
     const source = makeSource([{ id: 'a', createdAt: NOW - 1000, cwd: '/repo/a', turns: [1] }])
     const deps = { ...makeDeps(source, { count: 0 }), now: () => NOW }
