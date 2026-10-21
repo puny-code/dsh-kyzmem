@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 
 import { isKyzmemLanguage, resolveLanguage, type KyzmemLanguage, type LanguageSetting } from './i18n/language.ts'
+import { SOURCE_TIERS, type KyzmemKind, type KyzmemSourceTier } from './types.ts'
 
 /** 旧库迁移策略：默认自动迁移，可选择保留待人工确认。 */
 export type LegacyMigrationPolicy = 'eager' | 'conservative'
@@ -42,6 +43,32 @@ export interface KyzmemConfig {
   model?: string
   /** 衰减：从未被检索命中、且最近访问超过该天数才可能被归档；默认 90。 */
   decayAfterDays?: number
+  /** TTL（schema v15）：各类记忆的有效天数，0 = 永不过期；默认 fact 180 / episode 90 / decision 365 / preference 0 / skill 0。 */
+  ttlFactDays?: number
+  ttlEpisodeDays?: number
+  ttlDecisionDays?: number
+  ttlPreferenceDays?: number
+  ttlSkillDays?: number
+  /** 画像注入参与的来源分级（schema v15 R4）；默认 ['user-confirmed','agent-inferred']。 */
+  injectTiers?: KyzmemSourceTier[]
+  /** kyzmem_search 单条回显正文字符上限（批二）；默认 160。 */
+  recallPerItem?: number
+  /** kyzmem_search 单次返回正文字符总预算（批二）；默认 4800。 */
+  recallTotal?: number
+  /** 后台整理（批三：欠账偿还，不绑钟点）开关；默认 true。 */
+  maintenanceEnabled?: boolean
+  /** 单次后台整理的时间预算（毫秒）；默认 1500。 */
+  maintenanceBudgetMs?: number
+  /** 单次后台整理的条目预算；默认 50。 */
+  maintenanceBudgetItems?: number
+  /** 单次后台整理允许的辅助 LLM 调用次数；默认 1。 */
+  maintenanceBudgetLlmCalls?: number
+  /** 空档期减载：距上次活跃超过该天数进入减载档（预算收紧）；默认 7。 */
+  maintenanceIdleDays?: number
+  /** SM-2 逾期间隔超过该天数后，答对也从 1 天重新开始（relearning）；默认 30。 */
+  reviewRelearnDays?: number
+  /** 摄取 pending 重放失败达到该次数进死信（schema v15 批三）；默认 3。 */
+  ingestDeadLetterAttempts?: number
   /** 画像注入的 token 预算（估算 ceil(len/4)）；默认 1024。 */
   injectTokenBudget?: number
   /** 画像分级递减预算：首条正文字符数；默认 160。 */
@@ -54,7 +81,7 @@ export interface KyzmemConfig {
   assessReminder?: boolean
   /** 检索排序 recency 因子权重（0 关闭）；默认 0.2。 */
   rankRecencyWeight?: number
-  /** 检索排序 proof 因子权重（0 关闭）；默认 0.1。 */
+  /** 检索排序 proof 因子权重（0 关闭）；默认 0.05（实测 access_count 中位 0，旧 0.1 只会放大少数老条目）。 */
   rankProofWeight?: number
   /** kyzmem_search 是否用辅助 LLM 把查询改写为 ≤3 个互补查询再做 RRF 融合；默认 true。改写失败自动降级单查询。 */
   queryRewrite?: boolean
@@ -104,6 +131,15 @@ export interface ResolvedHistoryRules {
   readonly includeNoCwd: boolean
 }
 
+/** 后台整理（批三：欠账偿还状态机）解析后的预算与阈值。 */
+export interface ResolvedMaintenance {
+  readonly enabled: boolean
+  readonly budgetMs: number
+  readonly budgetItems: number
+  readonly budgetLlmCalls: number
+  readonly idleDays: number
+}
+
 /** 解析后的完整配置（显式默认值集中在此一步，实现不再 `?? 默认`）。 */
 export interface ResolvedKyzmemConfig {
   readonly dbDir: string
@@ -117,6 +153,20 @@ export interface ResolvedKyzmemConfig {
   /** 成对校验后的路由覆盖；undefined = 从会话日志解析路由。 */
   readonly routeOverride: { readonly provider: string; readonly model: string } | undefined
   readonly decayAfterDays: number
+  /** 各类记忆的 TTL 天数（0 = 永不过期，schema v15）。 */
+  readonly ttlDaysByKind: Readonly<Record<KyzmemKind, number>>
+  /** 参与画像注入的来源分级（schema v15 R4）。 */
+  readonly injectTiers: readonly KyzmemSourceTier[]
+  /** kyzmem_search 单条正文上限（批二）。 */
+  readonly recallPerItem: number
+  /** kyzmem_search 单次正文总预算（批二）。 */
+  readonly recallTotal: number
+  /** 后台整理（批三）预算与阈值。 */
+  readonly maintenance: ResolvedMaintenance
+  /** SM-2 逾期重学阈值（天）。 */
+  readonly reviewRelearnDays: number
+  /** 摄取 pending 重放失败进死信的次数阈值。 */
+  readonly ingestDeadLetterAttempts: number
   readonly injectTokenBudget: number
   readonly injectItemBudgetStart: number
   readonly injectItemBudgetDecay: number
@@ -139,6 +189,10 @@ export interface ResolvedKyzmemConfig {
 const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'legacyMigration', 'dbDir', 'injectProfile', 'profileTopN', 'modelCacheDir', 'hfEndpoint',
   'ingest', 'reflect', 'provider', 'model', 'decayAfterDays',
+  'ttlFactDays', 'ttlEpisodeDays', 'ttlDecisionDays', 'ttlPreferenceDays', 'ttlSkillDays',
+  'injectTiers', 'recallPerItem', 'recallTotal',
+  'maintenanceEnabled', 'maintenanceBudgetMs', 'maintenanceBudgetItems', 'maintenanceBudgetLlmCalls', 'maintenanceIdleDays',
+  'reviewRelearnDays', 'ingestDeadLetterAttempts',
   'injectTokenBudget', 'injectItemBudgetStart', 'injectItemBudgetDecay', 'injectItemBudgetFloor',
   'rankRecencyWeight', 'rankProofWeight', 'queryRewrite',
   'autoSlot', 'reviewScheduling', 'assessReminder',
@@ -163,6 +217,21 @@ export const Config: z<KyzmemConfig> = z.object({
   provider: z.string(),
   model: z.string(),
   decayAfterDays: z.number().step(1).min(1).max(3650),
+  ttlFactDays: z.number().step(1).min(0).max(3650),
+  ttlEpisodeDays: z.number().step(1).min(0).max(3650),
+  ttlDecisionDays: z.number().step(1).min(0).max(3650),
+  ttlPreferenceDays: z.number().step(1).min(0).max(3650),
+  ttlSkillDays: z.number().step(1).min(0).max(3650),
+  injectTiers: z.array(z.string()),
+  recallPerItem: z.number().step(1).min(40).max(2000),
+  recallTotal: z.number().step(1).min(200).max(20000),
+  maintenanceEnabled: z.boolean(),
+  maintenanceBudgetMs: z.number().step(1).min(200).max(30000),
+  maintenanceBudgetItems: z.number().step(1).min(1).max(500),
+  maintenanceBudgetLlmCalls: z.number().step(1).min(0).max(5),
+  maintenanceIdleDays: z.number().step(1).min(1).max(365),
+  reviewRelearnDays: z.number().step(1).min(1).max(3650),
+  ingestDeadLetterAttempts: z.number().step(1).min(1).max(20),
   injectTokenBudget: z.number().step(1).min(128).max(8192),
   injectItemBudgetStart: z.number().step(1).min(40).max(2000),
   injectItemBudgetDecay: z.number().min(0.5).max(1),
@@ -216,6 +285,33 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
   if (config.decayAfterDays !== undefined && (!Number.isInteger(config.decayAfterDays) || config.decayAfterDays < 1 || config.decayAfterDays > 3650)) {
     throw new Error('dsh-kyzmem: decayAfterDays must be an integer in [1, 3650]')
   }
+  const ttlKeys: readonly (keyof KyzmemConfig)[] = ['ttlFactDays', 'ttlEpisodeDays', 'ttlDecisionDays', 'ttlPreferenceDays', 'ttlSkillDays']
+  for (const key of ttlKeys) {
+    const value = config[key]
+    if (value !== undefined && (!Number.isInteger(value as number) || (value as number) < 0 || (value as number) > 3650)) {
+      throw new Error(`dsh-kyzmem: ${key} must be an integer in [0, 3650] (0 = never expires)`)
+    }
+  }
+  if (config.injectTiers !== undefined) {
+    for (const tier of config.injectTiers) {
+      if (!SOURCE_TIERS.includes(tier)) {
+        throw new Error(`dsh-kyzmem: injectTiers must be a subset of ${SOURCE_TIERS.join('|')}, got "${String(tier)}"`)
+      }
+    }
+  }
+  const intKeys: readonly (keyof KyzmemConfig)[] = [
+    'recallPerItem', 'recallTotal', 'maintenanceBudgetMs', 'maintenanceBudgetItems',
+    'maintenanceBudgetLlmCalls', 'maintenanceIdleDays', 'reviewRelearnDays', 'ingestDeadLetterAttempts',
+  ]
+  for (const key of intKeys) {
+    const value = config[key]
+    if (value !== undefined && (!Number.isInteger(value as number) || (value as number) < 0)) {
+      throw new Error(`dsh-kyzmem: ${key} must be a non-negative integer`)
+    }
+  }
+  if (config.maintenanceEnabled !== undefined && typeof config.maintenanceEnabled !== 'boolean') {
+    throw new Error('dsh-kyzmem: maintenanceEnabled must be a boolean')
+  }
   if (config.injectTokenBudget !== undefined && (!Number.isInteger(config.injectTokenBudget) || config.injectTokenBudget < 128 || config.injectTokenBudget > 8192)) {
     throw new Error('dsh-kyzmem: injectTokenBudget must be an integer in [128, 8192]')
   }
@@ -268,13 +364,32 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     redactWords: config.redactWords ?? [],
     routeOverride: hasProvider && hasModel ? { provider: config.provider!, model: config.model! } : undefined,
     decayAfterDays: config.decayAfterDays ?? 90,
+    ttlDaysByKind: {
+      fact: config.ttlFactDays ?? 180,
+      episode: config.ttlEpisodeDays ?? 90,
+      decision: config.ttlDecisionDays ?? 365,
+      preference: config.ttlPreferenceDays ?? 0,
+      skill: config.ttlSkillDays ?? 0,
+    },
+    injectTiers: config.injectTiers ?? ['user-confirmed', 'agent-inferred'],
+    recallPerItem: config.recallPerItem ?? 160,
+    recallTotal: config.recallTotal ?? 4800,
+    maintenance: {
+      enabled: config.maintenanceEnabled ?? true,
+      budgetMs: config.maintenanceBudgetMs ?? 1500,
+      budgetItems: config.maintenanceBudgetItems ?? 50,
+      budgetLlmCalls: config.maintenanceBudgetLlmCalls ?? 1,
+      idleDays: config.maintenanceIdleDays ?? 7,
+    },
+    reviewRelearnDays: config.reviewRelearnDays ?? 30,
+    ingestDeadLetterAttempts: config.ingestDeadLetterAttempts ?? 3,
     injectTokenBudget: config.injectTokenBudget ?? 1024,
     injectItemBudgetStart: config.injectItemBudgetStart ?? 160,
     injectItemBudgetDecay: config.injectItemBudgetDecay ?? 0.9,
     injectItemBudgetFloor: config.injectItemBudgetFloor ?? 24,
     assessReminder: config.assessReminder ?? true,
     rankRecencyWeight: config.rankRecencyWeight ?? 0.2,
-    rankProofWeight: config.rankProofWeight ?? 0.1,
+    rankProofWeight: config.rankProofWeight ?? 0.05,
     queryRewrite: config.queryRewrite ?? true,
     autoSlot: config.autoSlot ?? true,
     reviewScheduling: config.reviewScheduling ?? true,

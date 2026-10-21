@@ -4,7 +4,7 @@
  * @module dsh-kyzmem/refurb
  */
 
-import type { KyzmemScope, MemoryRecord } from './types.ts'
+import type { ConflictPair, KyzmemScope, MemoryRecord } from './types.ts'
 import type { KyzmemLanguage } from './i18n/language.ts'
 import { roomLabel } from './i18n/rooms.ts'
 import { messageIn } from './i18n/messages.ts'
@@ -46,24 +46,64 @@ export const DEFAULT_REFURB_OPTIONS: RefurbOptions = {
   duplicateTitleWindow: 0,
 }
 
+/** 冲突对超过该天数仍未裁决 → 升级为高优先建议（长期不处理说明两条信念在打架）。 */
+export const CONFLICT_ESCALATE_DAYS = 30
+
+/**
+ * 待裁决冲突 → 高优先「review」建议（合并候选的另一来源：contradicts 边）。
+ * 冲突是检索期就会误导 agent 的硬伤，因此即便库很小（未达 minActive）也要提示。
+ * 30 天未裁决的升级：置信度 0.9（普通冲突 0.75），排在面板列表前列。
+ * @param conflicts - store.listConflicts 返回的冲突对。
+ * @param language - 理由文案语言。
+ * @param now - 当前时间（测试可注入）。
+ */
+export function gatherConflictSuggestions(
+  conflicts: readonly ConflictPair[],
+  language: KyzmemLanguage,
+  now: number = Date.now(),
+): readonly RefurbSuggestion[] {
+  const suggestions: RefurbSuggestion[] = []
+  for (const pair of conflicts) {
+    const days = Math.max(0, Math.floor((now - pair.createdAt) / 86_400_000))
+    const escalated = days >= CONFLICT_ESCALATE_DAYS
+    suggestions.push({
+      action: 'review',
+      primaryId: pair.left.id,
+      candidates: [pair.right.id],
+      // 冲突对跨 scope 时以左条目的 scope 为准（面板按它分流到对应宫殿列表）。
+      scope: pair.left.scope,
+      reason: escalated
+        ? messageIn(language, 'misc.refurbConflictEscalatedReason', { days })
+        : messageIn(language, 'misc.refurbConflictReason', { days }),
+      confidence: escalated ? 0.9 : 0.75,
+    })
+  }
+  return suggestions
+}
+
 /**
  * 扫描一组 active 条目，按规则生成翻新建议。
  * 仅扫描同 scope 内的内容；跨 scope 的相似合并留给上层判定。
  * active 条目少于 `options.minActive` 时返回空列表：小库样本太少，逐条命中噪声大于价值。
+ * 冲突对（contradicts 边）是独立来源：即使小库也给出 review 建议（见 gatherConflictSuggestions）。
  * @param records - 候选条目。
  * @param language - 房间名的显示语言（房间里存的是标识符，不是文本）。
  * @param options - 阈值（缺省用 DEFAULT_REFURB_OPTIONS）。
+ * @param conflicts - 待裁决冲突对（store.listConflicts）；缺省不出冲突建议（向后兼容）。
+ * @param now - 当前时间（测试可注入）。
  */
 export function gatherRefurbSuggestions(
   records: readonly MemoryRecord[],
   language: KyzmemLanguage,
   options: RefurbOptions = DEFAULT_REFURB_OPTIONS,
+  conflicts: readonly ConflictPair[] = [],
+  now: number = Date.now(),
 ): readonly RefurbSuggestion[] {
-  const suggestions: RefurbSuggestion[] = []
-  const now = Date.now()
+  // 冲突建议排最前：它是「检索会答错」的硬伤，优先级高于门牌/拆分等整理项。
+  const suggestions: RefurbSuggestion[] = [...gatherConflictSuggestions(conflicts, language, now)]
   const active = records.filter(r => r.status === 'active')
   // 小库早退：样本太少时（尤其门牌规则）几乎逐条命中，噪声大于价值。
-  if (active.length < options.minActive) return []
+  if (active.length < options.minActive) return suggestions
   const byScope = new Map<KyzmemScope, MemoryRecord[]>()
   for (const record of active) {
     const list = byScope.get(record.scope) ?? []

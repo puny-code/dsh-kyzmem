@@ -14,12 +14,12 @@ import { message } from '../i18n/messages.ts'
 import { chitchatPatterns, noCapturePatterns } from '../i18n/patterns.ts'
 import type { KyzmemEmbedder } from '../embedder/interface.ts'
 import type { KyzmemStore } from '../store/interface.ts'
-import type { KyzmemEntityKind, KyzmemKind, KyzmemScope, EntityMention, FactMention, FactWriteInput, MemoryId } from '../types.ts'
+import type { KyzmemEntityKind, KyzmemKind, KyzmemScope, KyzmemSourceTier, EntityMention, FactMention, FactWriteInput, MemoryId } from '../types.ts'
 import { normalizeEntityName } from '../types.ts'
 import { sanitizeProtocolText } from '../security/sanitize.ts'
 import { redactSecrets } from '../security/redact.ts'
 import { hasRecallToolCalls, omitRecallToolResults } from '../security/recall.ts'
-import { applyMerge, confirmContradictions, decideWrite } from '../write-disposition.ts'
+import { applyMerge, confirmContradictions, decideWrite, resolveWriteExpiresAt } from '../write-disposition.ts'
 import type { MemoryJudge } from '../write-disposition.ts'
 
 /** 摄取档位：off 关闭；light 只读用户消息、每轮上限 2 条；eager 用户+助手消息、上限 5 条。 */
@@ -200,6 +200,12 @@ export interface IngestDeps {
   readonly history?: boolean
   /** Jev 判断器（Config jev.enabled 时注入）；undefined = 纯规则四态，DEFER 落库即建边。 */
   readonly judge?: MemoryJudge
+  /** 各 kind 的 TTL 天数（resolved.ttlDaysByKind）；undefined = 不写 expiresAt（测试/无配置场景）。 */
+  readonly ttlDaysByKind?: Readonly<Record<KyzmemKind, number>>
+  /** pending 死信阈值（resolved.ingestDeadLetterAttempts）；缺省 3。 */
+  readonly ingestDeadLetterAttempts?: number
+  /** 时钟；缺省 Date.now（测试注入固定时钟，TTL 断言才可确定）。 */
+  readonly now?: () => number
 }
 
 /** 写入路由：默认作用域 + 是否逐条采纳模型 scope + 按作用域解析分库。 */
@@ -357,6 +363,62 @@ export function turnSignals(events: readonly SessionEventLike[]): TurnSignals {
   return { userChars, completedTurns, toolResults, toolNames }
 }
 
+/** 工具结果文本的采集上限：只用于「这段字是不是工具吐出来的」的包含判定，不需要全量。 */
+const TOOL_OUTPUT_TEXT_LIMIT = 200_000
+
+/** 递归收集负载里的字符串（工具结果的形状随宿主而变，宽收窄用：只数文本，不信任结构）。 */
+function collectStrings(value: unknown, out: string[], depth: number): void {
+  if (depth > 6) return
+  if (typeof value === 'string') {
+    out.push(value)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out, depth + 1)
+    return
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const item of Object.values(value)) collectStrings(item, out, depth + 1)
+  }
+}
+
+/** 本切片内全部工具结果的文本（来源层级判定的依据）。 */
+export function collectToolOutput(events: readonly SessionEventLike[]): string {
+  const parts: string[] = []
+  for (const event of events) {
+    if (event.type !== 'tool/result') continue
+    collectStrings(event.data, parts, 0)
+  }
+  const joined = parts.join('\n')
+  return joined.length > TOOL_OUTPUT_TEXT_LIMIT ? joined.slice(0, TOOL_OUTPUT_TEXT_LIMIT) : joined
+}
+
+/** shell/命令输出的痕迹：没有工具结果上下文时，正文自带的命令提示符也算工具产物。 */
+const SHELL_TRACE_PATTERN = /(^|\n)\s*(\$ |> |PS [A-Za-z]:\\|[A-Za-z]:\\[^\n]*>|exit code|npm |pnpm |git )/
+
+/**
+ * 摄取候选的来源层级（R2 的信任分级基础）。
+ * 规则：
+ * 1. 候选正文能在本切片工具结果里找到片段 → 来自工具输出；
+ * 2. 其中的「网页抓取」再细分：含 http(s):// 且正文 > 200 字 → web-content（短片段更像检索结果摘要）；
+ * 3. 正文自带 shell 痕迹（命令提示符/退出码/包管理器）→ tool-output；
+ * 4. 其余 → agent-inferred（模型从对话里推断的）。
+ * 为什么强制覆盖：模型自己复述的「工具输出」与用户口述的事实，可信度天差地别，
+ * 靠 TTL 与注入过滤（injectTiers）区分的前提是这里不能把工具产物当推断。
+ */
+export function classifyIngestSourceTier(content: string, toolOutput: string): KyzmemSourceTier {
+  const longFragment = content.slice(0, 80)
+  const shortFragment = content.slice(0, 40)
+  const fromTool = toolOutput !== '' && (
+    (longFragment !== '' && toolOutput.includes(longFragment))
+    || (shortFragment !== longFragment && toolOutput.includes(shortFragment))
+  )
+  if (fromTool) {
+    return content.length > 200 && /https?:\/\//i.test(content) ? 'web-content' : 'tool-output'
+  }
+  return SHELL_TRACE_PATTERN.test(content) ? 'tool-output' : 'agent-inferred'
+}
+
 /**
  * 上一轮自动摄取的节流判定（只作用于 previous 切片；末轮/pending 重放补做不受限）。
  * @returns 跳过原因；null = 允许摄取。
@@ -457,6 +519,10 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
   // 召回占位先行：切片内召回工具的输出替换为占位文本，阻断记忆内容回流成新记忆。
   const scoped = omitRecallToolResults(slice)
   const { texts, minSeq } = collectTexts(scoped, limits.includeAssistant)
+  // 来源层级判定要看「本切片的工具结果原文」，所以用未脱敏前的 scoped；
+  // 时钟与工具文本都提到循环外，避免每个候选重复扫描事件。
+  const toolOutput = collectToolOutput(scoped)
+  const nowMs = (deps.now ?? Date.now)()
   // 入库前协议剥离 + 密钥脱敏；交给提取模型的 userText 同样脱敏。
   const cleaned = texts.map(text => redactSecrets(sanitizeProtocolText(text)))
   if (cleaned.every(text => text === '')) {
@@ -566,6 +632,10 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
         continue
       }
     }
+    // 写入期 TTL：按 kind 的天数算过期时间（0 = 不过期，函数返回 undefined 不写字段）。
+    const expiresAt = deps.ttlDaysByKind === undefined
+      ? undefined
+      : resolveWriteExpiresAt(kind, deps.ttlDaysByKind, nowMs)
     const record = await target.write({
       scope,
       kind,
@@ -574,6 +644,9 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
       confidence: limits.confidence,
       sourceSessionId: deps.sessionId,
       sourceRound: round,
+      // 来源层级：工具/命令产物强制 tool-output，网页正文 web-content（R2 信任分级）。
+      sourceTier: classifyIngestSourceTier(content, toolOutput),
+      ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(minSeq === null ? {} : { sourceSeq: minSeq }),
       ...(vector === undefined ? {} : { embedding: vector }),
       ...(deps.history === true ? { initialReviewAt: null } : {}),
@@ -599,14 +672,129 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
   return { scannedEvents: slice.length, candidates: parsed.length, written, merged, deferred, dropped, skipped: null }
 }
 
+/** pending 键的值：attempts = 已失败次数；firstAt = 首次入队时间（0 = 旧格式没有时间戳）。 */
+export interface PendingIngestValue {
+  readonly key: string
+  readonly attempts: number
+  readonly firstAt: number
+}
+
+/** 死信阈值缺省值（与 config.ts 的 ingestDeadLetterAttempts 默认 3 对齐）。 */
+export const DEFAULT_INGEST_DEAD_LETTER_ATTEMPTS = 3
+/** 会话解析不到（日志被删/持久化后端暂不可用）时的出队窗口：给足 30 天，避免一次误删。 */
+export const SESSION_UNRESOLVABLE_AGE_MS = 30 * 86_400_000
+/** pending 的硬兜底窗口：180 天前的事件补做价值已低于成本，出队。 */
+export const REPLAY_HARD_AGE_MS = 180 * 86_400_000
+/** 「no-such-turn」出队的审计 op（契约未定义专用 op，用这个可检索的通用名）。 */
+const INGEST_PENDING_CLEARED_OP = 'ingest-pending-cleared'
+/** 死信 op（契约 §6）。 */
+const INGEST_DEAD_LETTER_OP = 'ingest-dead-letter'
+
+/** pending 的值编码成 op_log.detail（控制在 OP_LOG_DETAIL_MAX 以内）。 */
+function encodePendingValue(value: PendingIngestValue): string {
+  return JSON.stringify({ key: value.key, attempts: value.attempts, firstAt: value.firstAt })
+}
+
 /**
- * 写入 pending 键（done 或 pending 已存在时不重复写）。仅在末轮摄取失败/超时后调用。
+ * 解析 pending 的 detail：新格式是 JSON `{key,attempts,firstAt}`；
+ * 旧格式（v0.10 及以前）detail 就是纯 turn key，按 attempts=0、firstAt=0（未知）兼容。
+ * @returns undefined = 既不是 JSON 也不是合法 turn key（损坏值，调用方出队）
  */
-export async function markPendingIngest(store: KyzmemStore, sessionId: string, turn: number): Promise<void> {
+export function parsePendingValue(detail: string): PendingIngestValue | undefined {
+  const trimmed = detail.trim()
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as { key?: unknown; attempts?: unknown; firstAt?: unknown }
+      if (typeof parsed.key === 'string' && decodeTurnKey(parsed.key) !== undefined) {
+        return {
+          key: parsed.key,
+          attempts: typeof parsed.attempts === 'number' && Number.isFinite(parsed.attempts) ? Math.max(0, Math.floor(parsed.attempts)) : 0,
+          firstAt: typeof parsed.firstAt === 'number' && Number.isFinite(parsed.firstAt) ? parsed.firstAt : 0,
+        }
+      }
+    } catch {
+      // 坏 JSON：下面按旧格式再试一次（可能是被截断的 detail）。
+    }
+    return undefined
+  }
+  return decodeTurnKey(trimmed) === undefined ? undefined : { key: trimmed, attempts: 0, firstAt: 0 }
+}
+
+/** 找某个 turn key 已存在的 pending（返回原始 detail 以便精确清除）。 */
+async function findPendingDetail(store: KyzmemStore, key: string): Promise<{ detail: string; value: PendingIngestValue } | undefined> {
+  for (const detail of await store.listAuditDetails(INGEST_PENDING_OP)) {
+    const value = parsePendingValue(detail)
+    if (value !== undefined && value.key === key) return { detail, value }
+  }
+  return undefined
+}
+
+/** 记死信：审计失败不阻断（否则一条坏 pending 会让整个队列抛异常）。 */
+async function auditDeadLetter(store: KyzmemStore, value: PendingIngestValue, reason: string): Promise<void> {
+  try {
+    await store.audit(INGEST_DEAD_LETTER_OP, 'BATCH', JSON.stringify({ key: value.key, attempts: value.attempts, reason }))
+  } catch {
+    // 旁路审计。
+  }
+}
+
+/** markPendingIngest / bumpPendingIngest 的可选项。 */
+export interface PendingIngestOptions {
+  /** 死信阈值；缺省 3。 */
+  readonly deadLetterAttempts?: number
+  /** 时钟（毫秒）；缺省 Date.now。
+   * 注意这里用数值而不是函数：markPendingIngest 是一次快照式写入，不需要可重入时钟。 */
+  readonly now?: number
+}
+
+/**
+ * 一次失败后推进 pending 计数：attempts+1，达到阈值转死信。
+ * 调用方负责先清掉旧 detail（本函数只写新状态）。
+ * @returns 'pending' = 还在队列里；'dead-letter' = 已转死信并出队
+ */
+export async function bumpPendingIngest(
+  store: KyzmemStore,
+  sessionId: string,
+  value: PendingIngestValue,
+  options: PendingIngestOptions & { readonly reason?: string } = {},
+): Promise<'pending' | 'dead-letter'> {
+  const now = options.now ?? Date.now()
+  const attempts = value.attempts + 1
+  // 旧格式没有 firstAt：从第一次被 bump 起算（否则这条永远算不出年龄、也永远不出队）。
+  const firstAt = value.firstAt === 0 ? now : value.firstAt
+  const threshold = options.deadLetterAttempts ?? DEFAULT_INGEST_DEAD_LETTER_ATTEMPTS
+  if (attempts >= threshold) {
+    await auditDeadLetter(store, { key: value.key, attempts, firstAt }, options.reason ?? 'max-attempts')
+    console.warn(message('ingest.deadLetter'), value.key, attempts, options.reason ?? 'max-attempts')
+    return 'dead-letter'
+  }
+  await store.audit(INGEST_PENDING_OP, sessionId, encodePendingValue({ key: value.key, attempts, firstAt }))
+  return 'pending'
+}
+
+/**
+ * 写入 pending 键（done 已存在时不写；已 pending 则 attempts+1）。仅在末轮摄取失败/超时后调用。
+ * 为什么每失败一次都要重写 detail：死信阈值与「30 天解析不到会话」都以次数/时间为判据，
+ * 没有计数就只能无限重试——确定性失败会每场会话白付一次辅助调用。
+ */
+export async function markPendingIngest(
+  store: KyzmemStore,
+  sessionId: string,
+  turn: number,
+  options: PendingIngestOptions = {},
+): Promise<'pending' | 'dead-letter' | 'skipped'> {
+  const now = options.now ?? Date.now()
   const key = encodeTurnKey(sessionId, turn)
-  if (await store.hasAudit(INGEST_DONE_OP, key)) return
-  if (await store.hasAudit(INGEST_PENDING_OP, key)) return
-  await store.audit(INGEST_PENDING_OP, sessionId, key)
+  if (await store.hasAudit(INGEST_DONE_OP, key)) return 'skipped'
+  const existing = await findPendingDetail(store, key)
+  if (existing !== undefined) {
+    // 旧值先清，再按明显的新计数值重写（op_log 是追加表，同一键只能保留一条 pending）。
+    await store.clearAudit(INGEST_PENDING_OP, existing.detail)
+  }
+  const current: PendingIngestValue = existing === undefined
+    ? { key, attempts: 0, firstAt: now }
+    : { key, attempts: existing.value.attempts, firstAt: existing.value.firstAt === 0 ? now : existing.value.firstAt }
+  return bumpPendingIngest(store, sessionId, current, options)
 }
 
 /**
@@ -627,7 +815,12 @@ export async function ingestFinalTurn(deps: IngestDeps): Promise<IngestOutcome |
   } catch (error) {
     if (round !== undefined) {
       try {
-        await markPendingIngest(await (deps.openAuditStore ?? deps.openStore)(), deps.sessionId, round)
+        // 失败 +1：本函数只在「这次没写成」时走到这里，计数就是重试次数。
+        const pendingOptions: PendingIngestOptions = {
+          ...(deps.ingestDeadLetterAttempts === undefined ? {} : { deadLetterAttempts: deps.ingestDeadLetterAttempts }),
+          ...(deps.now === undefined ? {} : { now: deps.now() }),
+        }
+        await markPendingIngest(await (deps.openAuditStore ?? deps.openStore)(), deps.sessionId, round, pendingOptions)
       } catch {
         // pending 落库失败：摄取本就尽力而为，不再升级。
       }
@@ -750,6 +943,14 @@ export interface ReplayIngestDeps {
   readonly logRequest: IngestDeps['logRequest']
   /** Jev 判断器（Config jev.enabled 时注入）；undefined = 纯规则四态。 */
   readonly judge?: MemoryJudge
+  /** 各 kind 的 TTL 天数（resolved.ttlDaysByKind）；补做写入同样要带过期时间。 */
+  readonly ttlDaysByKind?: Readonly<Record<KyzmemKind, number>>
+  /** 死信阈值（resolved.ingestDeadLetterAttempts）；缺省 3。 */
+  readonly ingestDeadLetterAttempts?: number
+  /** 时钟；缺省 Date.now。 */
+  readonly now?: () => number
+  /** 单轮最多补做条数（减载档每轮 ≤3）；缺省不限。 */
+  readonly maxItems?: number
   /** 取消信号。 */
   readonly signal: AbortSignal
 }
@@ -758,28 +959,32 @@ export interface ReplayIngestDeps {
 export interface ReplayOutcome {
   /** 成功补做的 pending 键数。 */
   readonly replayed: number
-  /** 事件源不可得而保留的 pending 键数。 */
+  /** 事件源不可得/暂时失败而保留的 pending 键数。 */
   readonly kept: number
 }
 
 /**
- * 重放待补做的末轮摄取（下次会话首次 pre-step 调用）。已有 done 标记或键损坏的
- * pending 直接出队；事件源不可得的保留到下次。
+ * 重放待补做的末轮摄取（下次会话首次 pre-step 调用）。
+ *
+ * 队列语义（为什么不是「失败就留」）：
+ * - 只有确认写入成功（skipped === null）才算出队并 replayed++；
+ * - 已 done / 已无内容 / 该轮已不存在等确定性结果直接出队（重试永远不会变好）；
+ * - 辅助 LLM 已付费但输出不可解析、为空、无路由，或调用抛错 → attempts+1 留在队列里；
+ *   attempts ≥ 阈值转 `ingest-dead-letter` 出队（确定性失败不该每场会话白付一次辅助调用）；
+ * - 会话解析不到时保留，但满 30 天（SESSION_UNRESOLVABLE_AGE_MS）出队；
+ * - 180 天硬兜底（REPLAY_HARD_AGE_MS）：会话事件老到补做价值低于成本，失败即放弃。
+ *
  * 审计 F11：单个键失败不再冲出整个循环（队头阻塞——#1 失败 #2..N 全不试）。
- * 审计 F12/F11②：LLM 已付费但输出不可解析/为空时保留 pending 下次重试（可能是暂时性
- * 截断）；但会话陈旧（末事件早于 REPLAY_ABANDON_AGE_MS）即放弃——确定性失败不应
- * 每个会话白付一次辅助调用、永久卡住队列。
  * 每条 pending 按它自己会话的 cwd 组装写入路由（补做时同样逐条判宫殿）。
  */
+/** 值得重试的暂时性跳过：辅助输出可能只是这次截断/限流，无路由也可能被配置修正。 */
+const RETRYABLE_REPLAY_SKIPS: ReadonlySet<string> = new Set(['unparseable-output', 'empty-answer', 'no-route-in-log'])
 
-/** pending 重放的放弃窗口：会话末事件早于该时长视为陈旧，失败即出队。 */
-const REPLAY_ABANDON_AGE_MS = 14 * 86_400_000
-
-/** 会话末事件早于放弃窗口即为陈旧（事件缺 time 无法判定时视作非陈旧，保守保留）。 */
-function replayStale(session: { events: readonly SessionEventLike[] }): boolean {
+/** 会话末事件早于硬兜底窗口即为陈旧（事件缺 time 无法判定时视作非陈旧，保守保留）。 */
+function replayStale(session: { events: readonly SessionEventLike[] }, now: number): boolean {
   for (let i = session.events.length - 1; i >= 0; i -= 1) {
     const time = session.events[i]?.time
-    if (time !== undefined) return Date.now() - time > REPLAY_ABANDON_AGE_MS
+    if (time !== undefined) return now - time > REPLAY_HARD_AGE_MS
   }
   return false
 }
@@ -787,20 +992,56 @@ function replayStale(session: { events: readonly SessionEventLike[] }): boolean 
 export async function replayPendingIngests(deps: ReplayIngestDeps): Promise<ReplayOutcome> {
   const store = await deps.openStore()
   const pendings = await store.listAuditDetails(INGEST_PENDING_OP)
+  const now = deps.now === undefined ? Date.now() : deps.now()
+  const limit = deps.maxItems ?? Number.POSITIVE_INFINITY
+  const pendingOptions: PendingIngestOptions = {
+    ...(deps.ingestDeadLetterAttempts === undefined ? {} : { deadLetterAttempts: deps.ingestDeadLetterAttempts }),
+    now,
+  }
   let replayed = 0
   let kept = 0
+  let attempted = 0
   for (const detail of pendings) {
-    const key = decodeTurnKey(detail)
-    if (key === undefined || (await store.hasAudit(INGEST_DONE_OP, detail))) {
+    // 减载档：本轮只尝试前 N 条，剩余留给下一轮（不丢队列，也不阻塞会话启动）。
+    if (attempted >= limit) break
+    const value = parsePendingValue(detail)
+    if (value === undefined) {
+      // 损坏 detail：永远解析不出 turn key，留着只会每轮空转——出队并记死信。
+      await store.clearAudit(INGEST_PENDING_OP, detail)
+      await auditDeadLetter(store, { key: detail.slice(0, 120), attempts: 0, firstAt: now }, 'unparseable-pending')
+      continue
+    }
+    if (await store.hasAudit(INGEST_DONE_OP, value.key)) {
+      await store.clearAudit(INGEST_PENDING_OP, detail)
+      continue
+    }
+    const key = decodeTurnKey(value.key)
+    if (key === undefined) {
+      // parsePendingValue 已校验过，这里只是类型收窄兜底。
       await store.clearAudit(INGEST_PENDING_OP, detail)
       continue
     }
     const session = await deps.resolveSession(key.sessionId)
     if (session === undefined) {
-      kept += 1
+      // 解析不到会话：日志可能只是暂时不可用。旧格式没有 firstAt，先把「首次见到」记下来，
+      // 否则这条永远算不出年龄、永远不出队。
+      if (value.firstAt === 0) {
+        await store.clearAudit(INGEST_PENDING_OP, detail)
+        await store.audit(INGEST_PENDING_OP, key.sessionId, encodePendingValue({ ...value, firstAt: now }))
+        kept += 1
+        continue
+      }
+      if (now - value.firstAt >= SESSION_UNRESOLVABLE_AGE_MS) {
+        await store.clearAudit(INGEST_PENDING_OP, detail)
+        await auditDeadLetter(store, value, 'session-unresolvable')
+        console.warn(message('ingest.deadLetter'), value.key, value.attempts, 'session-unresolvable')
+      } else {
+        kept += 1
+      }
       continue
     }
-    const stale = replayStale(session)
+    attempted += 1
+    const stale = replayStale(session, now)
     try {
       const outcome = await ingestPreviousTurn({
         events: session.events,
@@ -816,26 +1057,45 @@ export async function replayPendingIngests(deps: ReplayIngestDeps): Promise<Repl
         call: deps.call,
         logRequest: deps.logRequest,
         ...(deps.judge === undefined ? {} : { judge: deps.judge }),
+        ...(deps.ttlDaysByKind === undefined ? {} : { ttlDaysByKind: deps.ttlDaysByKind }),
+        now: () => now,
         signal: deps.signal,
       })
-      if (outcome.skipped === 'unparseable-output' || outcome.skipped === 'empty-answer') {
-        kept += 1
-        if (stale) {
-          await store.clearAudit(INGEST_PENDING_OP, detail)
-          console.warn(message('ingest.replayAbandoned'), key.sessionId, key.turn, outcome.skipped)
+      if (outcome.skipped === 'no-such-turn') {
+        // 会话日志里已经没有这一轮（被截断/重排）：重试永远不会变好，记 op_log 后出队。
+        try {
+          await store.audit(INGEST_PENDING_CLEARED_OP, 'BATCH', JSON.stringify({ key: value.key, reason: 'no-such-turn' }))
+        } catch {
+          // 旁路审计失败不影响出队。
         }
+        await store.clearAudit(INGEST_PENDING_OP, detail)
+        continue
+      }
+      if (outcome.skipped !== null && !RETRYABLE_REPLAY_SKIPS.has(outcome.skipped)) {
+        // 其余确定性跳过（已摄取/该轮没内容/被节流/无路由）：没有可补做的内容，出队。
+        await store.clearAudit(INGEST_PENDING_OP, detail)
+        continue
+      }
+      if (outcome.skipped !== null) {
+        // 暂时性失败（输出不可解析/为空）：保留并计数；陈旧或达阈值才出队。
+        await store.clearAudit(INGEST_PENDING_OP, detail)
+        if (stale) {
+          console.warn(message('ingest.replayAbandoned'), key.sessionId, key.turn, outcome.skipped)
+          continue
+        }
+        if (await bumpPendingIngest(store, key.sessionId, value, pendingOptions) === 'pending') kept += 1
         continue
       }
       await store.clearAudit(INGEST_PENDING_OP, detail)
       replayed += 1
     } catch (error) {
-      kept += 1
+      await store.clearAudit(INGEST_PENDING_OP, detail)
       if (stale) {
-        await store.clearAudit(INGEST_PENDING_OP, detail)
         console.warn(message('ingest.replayAbandoned'), key.sessionId, key.turn, error instanceof Error ? error.message : error)
-      } else {
-        console.warn(message('ingest.replayKeyFailed'), key.sessionId, key.turn, error)
+        continue
       }
+      console.warn(message('ingest.replayKeyFailed'), key.sessionId, key.turn, error)
+      if (await bumpPendingIngest(store, key.sessionId, value, { ...pendingOptions, reason: 'exception' }) === 'pending') kept += 1
     }
   }
   return { replayed, kept }

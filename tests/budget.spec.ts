@@ -1,21 +1,47 @@
 import { describe, expect, it } from 'vitest'
-import { RECALL_PER_ITEM_CHARS, RECALL_TOTAL_CHARS, enforceBudget, truncateItem } from '../src/retrieve/budget.ts'
+import {
+  RECALL_PER_ITEM_CHARS,
+  RECALL_TOTAL_CHARS,
+  RENDER_PER_ITEM_CHARS,
+  enforceBudget,
+  fitWithinBudget,
+  truncateItem,
+  truncateRecallItem,
+} from '../src/retrieve/budget.ts'
 
 describe('truncateItem 单条截断', () => {
   it('短文本原样返回', () => {
     expect(truncateItem('短条目')).toBe('短条目')
-    expect(truncateItem('a'.repeat(RECALL_PER_ITEM_CHARS))).toBe('a'.repeat(RECALL_PER_ITEM_CHARS))
+    expect(truncateItem('a'.repeat(RENDER_PER_ITEM_CHARS))).toBe('a'.repeat(RENDER_PER_ITEM_CHARS))
   })
 
-  it('超长截断并加省略号', () => {
-    const text = '长'.repeat(RECALL_PER_ITEM_CHARS + 100)
+  it('超长截断并加省略号（缺省走非召回的 1200 字宽上限）', () => {
+    const text = '长'.repeat(RENDER_PER_ITEM_CHARS + 100)
     const out = truncateItem(text)
-    expect(out).toHaveLength(RECALL_PER_ITEM_CHARS + 1)
+    expect(out).toHaveLength(RENDER_PER_ITEM_CHARS + 1)
     expect(out.endsWith('…')).toBe(true)
   })
 
   it('自定义上限生效', () => {
     expect(truncateItem('abcdef', 3)).toBe('abc…')
+  })
+})
+
+describe('truncateRecallItem 召回单条截断（跟配置 recallPerItem）', () => {
+  it('缺省上限是 160 字', () => {
+    expect(RECALL_PER_ITEM_CHARS).toBe(160)
+    const text = '召'.repeat(200)
+    expect(truncateRecallItem(text)).toHaveLength(161)
+  })
+
+  it('配置值覆盖缺省', () => {
+    expect(truncateRecallItem('abcdef', 3)).toBe('abc…')
+    expect(truncateRecallItem('abc', 3)).toBe('abc')
+  })
+
+  it('非召回路径不受召回收紧影响（1200 仍保留）', () => {
+    const text = 'a'.repeat(RECALL_PER_ITEM_CHARS + 50)
+    expect(truncateItem(text)).toBe(text)
   })
 })
 
@@ -43,6 +69,13 @@ describe('enforceBudget 总量装填', () => {
 
   it('默认预算为协议内定值', () => {
     expect(RECALL_TOTAL_CHARS).toBe(4800)
-    expect(RECALL_PER_ITEM_CHARS).toBe(1200)
+    expect(RECALL_PER_ITEM_CHARS).toBe(160)
+    expect(RENDER_PER_ITEM_CHARS).toBe(1200)
+  })
+
+  it('fitWithinBudget 是 enforceBudget 的基元：只报丢弃数，不追加提示行', () => {
+    const { kept, dropped } = fitWithinBudget(['aa', 'bb', 'cc'], item => item.length, 4)
+    expect(kept).toEqual(['aa', 'bb'])
+    expect(dropped).toBe(1)
   })
 })

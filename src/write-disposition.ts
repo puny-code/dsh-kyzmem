@@ -10,7 +10,7 @@
  * @module dsh-kyzmem/write-disposition
  */
 
-import type { KyzmemKind, MemoryRecord } from './types.ts'
+import type { KyzmemKind, MemoryRecord, WriteInput } from './types.ts'
 import type { KyzmemStore } from './store/interface.ts'
 import { chitchatPatterns } from './i18n/patterns.ts'
 
@@ -21,9 +21,16 @@ export type WriteDisposition = 'accept' | 'merge' | 'drop' | 'defer'
 export const MERGE_COSINE = 0.92
 /** 待定阈值：余弦 ≥ 该值且不满足 MERGE（相似度不足或跨 kind）视为疑似矛盾/修正，落库但建 contradicts 边待裁决。 */
 export const DEFER_COSINE = 0.88
+/**
+ * 近重复阈值：同 kind 且余弦 ≥ 该值 → 直接 drop。
+ * 为什么在 MERGE 之上再设一档：0.92~0.98 是「同一事实的另一种说法」，并入还能保信息；
+ * ≥0.98 基本是逐字改写（标点/顺序微调），并入只会把既有正文搅浑，不如留一条干净的。
+ * 必须落 op_log，否则面板看不出「判过我拦下了什么」。
+ */
+export const NEAR_DUPLICATE_COSINE = 0.98
 
 /** DROP 的原因（写进 op_log，面板可见）。 */
-export type DropReason = 'chitchat' | 'exact-duplicate'
+export type DropReason = 'chitchat' | 'exact-duplicate' | 'near-duplicate'
 
 /** 处置判定结果。 */
 export type WriteDecision =
@@ -103,14 +110,17 @@ async function resolveBand(
 
 /**
  * 判定一条新内容的处置。
- * 规则顺序（先廉价后昂贵）：
+ * 规则顺序（先廉价后昂贵；MERGE 优先于近重复否定，见下）：
  * 1. 正文是纯寒暄 → DROP（chitchat）；
  * 2. 与最近邻逐字相同 → DROP（exact-duplicate）；
  * 3. 嵌入不可用 / 库内无向量条目 / 最近邻低于 DEFER_COSINE → ACCEPT；
- * 4. 最近邻同 kind 且 ≥ MERGE_COSINE → MERGE；
- * 5. 其余达到 DEFER_COSINE → 注入 judge 时裁决，否则 DEFER。
+ * 4. 最近邻同 kind 且 ≥ MERGE_COSINE → MERGE（强化既有条目，而不是再写一条）；
+ * 5. 否则最近邻 ≥ NEAR_DUPLICATE_COSINE → DROP（near-duplicate，兜住跨 kind 的近重复）；
+ * 6. 其余达到 DEFER_COSINE → 注入 judge 时裁决，否则 DEFER。
+ * 为什么 MERGE 在前：0.98+ 的近重复若先判 drop，会把「同一事实的再次陈述」当成噪声丢掉，
+ * 失去 access_count/confidence 的强化信号；drop 只该拦「换了个 kind 的同文近重复」。
  * @param store - 目标分库
- * @param kind - 新内容的记忆种类（MERGE 要求同 kind，跨 kind 高度相似按 defer 处理）
+ * @param kind - 新内容的记忆种类（MERGE 要求同 kind，跨 kind 高度相似按 drop/defer 处理）
  * @param embedding - 新内容的向量；undefined = 嵌入不可用，直接 accept
  * @param options - 可选 judge 注入与原文
  */
@@ -134,8 +144,14 @@ export async function decideWrite(
     return { disposition: 'drop', reason: 'exact-duplicate' }
   }
   if (nearest.similarity < DEFER_COSINE) return { disposition: 'accept' }
+  // MERGE 优先：同 kind 的高度相似就是「同一事实的再陈述」，应强化既有条目。
   if (nearest.similarity >= MERGE_COSINE && nearest.record.kind === kind) {
     return { disposition: 'merge', into: nearest.record, similarity: nearest.similarity }
+  }
+  // 第四态：跨 kind 的近乎同文（≥0.98）没有独立信息量，写入只会污染检索。
+  if (nearest.similarity >= NEAR_DUPLICATE_COSINE) {
+    await auditDrop(store, 'near-duplicate', kind, normalized?.length ?? content?.length ?? 0, nearest.similarity)
+    return { disposition: 'drop', reason: 'near-duplicate' }
   }
   if (judge !== undefined && content !== undefined) {
     const verdict = await resolveBand(judge, nearest.record, nearest.similarity, kind, content)
@@ -151,12 +167,60 @@ function isPureChitchat(text: string): boolean {
 
 /**
  * DROP 落 op_log：面板的「我拦了什么」数据源。审计失败不影响判定结果。
+ * @param cosine - 近重复判定的余弦；其余原因不需要
  */
-async function auditDrop(store: KyzmemStore, reason: DropReason, kind: KyzmemKind, chars: number): Promise<void> {
+async function auditDrop(
+  store: KyzmemStore,
+  reason: DropReason,
+  kind: KyzmemKind,
+  chars: number,
+  cosine?: number,
+): Promise<void> {
   try {
-    await store.audit('drop', 'AUX', JSON.stringify({ reason, kind, chars }))
+    const detail = cosine === undefined
+      ? { reason, kind, chars }
+      : { reason, kind, chars, cosine: Number(cosine.toFixed(4)) }
+    await store.audit('drop', 'AUX', JSON.stringify(detail))
   } catch {
     // 审计是旁路，失败不阻断写入链路。
+  }
+}
+
+/** 一天毫秒数（写入期 TTL 计算与维护调度共用）。 */
+export const DAY_MS = 86_400_000
+
+/**
+ * 按 kind 的 TTL 算出写入期过期时间。
+ * 为什么返回 undefined 而不是 0：0 表示「永不写 expires_at」，写 0 会被检索层判成「已过期」。
+ * ttlDays 非法（负/NaN）同样按不过期处理，宁缺毋滥。
+ */
+export function resolveWriteExpiresAt(
+  kind: KyzmemKind,
+  ttlDaysByKind: Readonly<Record<KyzmemKind, number>>,
+  now: number,
+): number | undefined {
+  const days = ttlDaysByKind[kind]
+  if (!Number.isFinite(days) || days <= 0) return undefined
+  return now + Math.floor(days) * DAY_MS
+}
+
+/**
+ * 补齐写入缺省值：expiresAt 按 kind 的 TTL 计算，sourceTier 缺省 agent-inferred。
+ * 为什么集中在这里：save / 批量 / 摄取 / import 四条写入路径必须用同一套 TTL 语义，
+ * 分散实现迟早出现「工具写入不过期、摄取写入会过期」的不一致。
+ * 显式传了 expiresAt/sourceTier 的调用方优先（摄取强制 tool-output 即走显式覆盖）。
+ */
+export function applyWriteDefaults(
+  input: WriteInput,
+  ttlDaysByKind: Readonly<Record<KyzmemKind, number>>,
+  now: number,
+): WriteInput {
+  const expiresAt = input.expiresAt ?? resolveWriteExpiresAt(input.kind, ttlDaysByKind, now)
+  const sourceTier = input.sourceTier ?? 'agent-inferred'
+  return {
+    ...input,
+    sourceTier,
+    ...(expiresAt === undefined ? {} : { expiresAt }),
   }
 }
 

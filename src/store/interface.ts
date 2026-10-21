@@ -5,9 +5,9 @@
  */
 
 import type {
-  DecayOptions, KyzmemEdgeType, KyzmemScope, EntityDetail, EntityId, EntityListFilter,
-  EntityListResult, EntityMention, EntityRecord, EpisodeTimelineQuery, EpisodeTimelineResult, ExportData,
-  FactListFilter, FactListResult, FactRecord, FactWriteInput,
+  ConflictAction, ConflictListResult, DecayOptions, KyzmemEdgeType, KyzmemScope, EntityDetail, EntityId,
+  EntityListFilter, EntityListResult, EntityMention, EntityRecord, EpisodeTimelineQuery, EpisodeTimelineResult,
+  ExportData, FactListFilter, FactListResult, FactRecord, FactWriteInput,
   ForgettingTombstone, ForgottenAuditRow, ImportOptions, ImportPreview, ImportResult, ListFilter, ListResult,
   MemoryId, MemoryOutcome, MemoryRecord, ObservationId, ObservationListFilter, ObservationRecord,
   ObservationWriteInput, OperationLogRow, ProfileBlock, ProfileBlockVersion,
@@ -145,12 +145,28 @@ export interface KyzmemStore {
    * 只更新已存在行；返回实际更新条数。
    */
   attachEmbeddings(entries: readonly { readonly id: MemoryId; readonly embedding: Float32Array }[]): Promise<number>
+  /**
+   * 批量读已有向量（维护/整理复用）：只回 embedding 非空的条目，调用方对缺口再算。
+   * 没有这个方法时整理会退化成整批重算——成本差几十倍。
+   */
+  embeddingsFor(ids: readonly string[]): Promise<ReadonlyMap<string, Float32Array>>
   /** 衰减：满足条件的 active 条目转 archived，返回归档数量。 */
   decay(options: DecayOptions): Promise<number>
   /** 矛盾候选：与给定向量余弦 ≥ 0.88 的同库 active 条目（调用方裁决后用 linkEdge 建边）。 */
   findContradictions(embedding: Float32Array, limit?: number): Promise<MemoryRecord[]>
   /** 建立一条关系边（幂等）。 */
   linkEdge(from: MemoryId, to: MemoryId, type: KyzmemEdgeType): Promise<void>
+  /**
+   * 待裁决冲突列表（schema v15 批一）：contradicts 边两端记录，两端任为 active/archived 均可
+   * （归档条目可能正是上一轮裁决留下的输家，仍要给面板看）。created_at 倒序，total 为过滤后总数。
+   */
+  listConflicts(scopes: readonly KyzmemScope[], limit: number): Promise<ConflictListResult>
+  /**
+   * 裁决一对冲突：删掉两端之间的 contradicts 边（双向）；keep-left/keep-right 额外把另一端
+   * 置 archived，drop-both 两端都 archived，keep-both 只解除冲突标记。写一条 op_log
+   * 'conflict-resolve'（target=BATCH，detail={left,right,action}）供面板回看裁决历史。
+   */
+  resolveConflict(left: MemoryId, right: MemoryId, action: ConflictAction): Promise<void>
   /** 最近邻：同库 active（user/project 行）中与给定向量余弦最高的条目及相似度；空库或无向量条目返回 undefined。 */
   nearestNeighbor(embedding: Float32Array): Promise<{ record: MemoryRecord; similarity: number } | undefined>
   /**
@@ -159,6 +175,12 @@ export interface KyzmemStore {
    * @returns 强化后的条目；id 不存在返回 undefined。
    */
   reinforce(id: MemoryId, note: string): Promise<MemoryRecord | undefined>
+  /**
+   * 证据引用强化（schema v15）：被下游当作证据引用过的条目，confidence 提升 delta（缺省 0.02）。
+   * 只动 confidence——access_count/last_retrieved_at 属于「被检索命中」的语义，混入会让
+   * proof 因子与衰减判据同时失真。id 不存在时静默（引用可能来自并发删除）。
+   */
+  reinforceCitation(id: MemoryId, delta?: number): Promise<void>
   /** 蒸馏写入原语：单事务内写新条目、归档全部旧条目并逐条建立 supersedes 边。 */
   supersedeMany(input: WriteInput, oldIds: readonly MemoryId[]): Promise<MemoryRecord>
   /**
@@ -216,7 +238,20 @@ export interface KyzmemStore {
   listAuditDetails(op: string): Promise<string[]>
   /** 清除指定 op+detail 的全部记录（pending 队列出队）。 */
   clearAudit(op: string, detail: string): Promise<void>
-  /** 物理清除本库全部数据（节点、边、FTS、操作日志）。 */
+  /** 统计某 op 在 since（epoch 毫秒，含）之后的条数（schema v15 减载档的欠账计量）。 */
+  countAudit(op: string, since: number): Promise<number>
+  /** 某 op 的最近记录（时间倒序至多 limit 条）；targetId 给定时只取该目标的记录。 */
+  recentAudit(op: string, limit: number, targetId?: string): Promise<OperationLogRow[]>
+  /** 某 op 最近一次写入时刻（epoch 毫秒）；从未写过返回 undefined（欠账「上次跑过没」）。 */
+  lastAuditAt(op: string): Promise<number | undefined>
+  /**
+   * 单条硬删（schema v15 面板「彻底删除」）：nodes + nodes_fts + nodes_revisions + 全部边
+   * （两个方向）+ 实体关联 + 巡游路线站点，单事务内完成；删前写一条 op_log 'tombstone'
+   * （只记 kind/scope/chars，不记正文——硬删的语义就是连内容都不留）。
+   * @returns 该 id 原本存在并被删除返回 true；不存在返回 false。
+   */
+  purgeOne(id: MemoryId): Promise<boolean>
+  /** 物理清除本库全部数据（节点、边、FTS、修订、操作日志）。 */
   purge(): Promise<void>
   /** 关闭数据库句柄。 */
   close(): Promise<void>

@@ -11,7 +11,7 @@ import { isAbsolute, join, relative } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 // Type-only: merges the ctx.webServer service declaration.
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type { KyzmemEntityKind, KyzmemKind, KyzmemScope, KyzmemStatus, ExportData, ListFilter, MemoryRecord, ObservationStatus, ReviewGrade } from './types.ts'
+import type { ConflictListResult, KyzmemEntityKind, KyzmemKind, KyzmemScope, KyzmemStatus, ExportData, ListFilter, MaintenanceDebt, MemoryRecord, ObservationStatus, ReviewGrade } from './types.ts'
 import { asMemoryId } from './types.ts'
 import type { KyzmemStore } from './store/interface.ts'
 import { embedImportedRecords, parseImportData, parseMarkdownExport } from './store/import.ts'
@@ -24,7 +24,8 @@ import type { KyzmemLanguage } from './i18n/language.ts'
 import { messageIn } from './i18n/messages.ts'
 import { createBackup, restoreBackup, BACKUP_SCHEMA_VERSION } from './backup/tar.ts'
 import { runConsolidation } from './consolidation/run.ts'
-import { aggregateTelemetry } from './telemetry/aggregate.ts'
+import { aggregateTelemetry, collectMetrics } from './telemetry/aggregate.ts'
+import { resolveDefaultScope } from './scope.ts'
 import { buildTourProposal } from './tour-proposal.ts'
 import { gatherRefurbSuggestions, DEFAULT_REFURB_OPTIONS } from './refurb.ts'
 
@@ -221,6 +222,38 @@ export interface RouteDeps {
 }
 
 /**
+ * 后台整理调度器（`src/maintenance/scheduler.ts`）的可选能力面。
+ * 该模块由后台整理任务并行落地，可能在本文件之后才出现：这里只约定两个入口的形状，
+ * 缺哪个就跳过哪个能力（面板欠账卡片退化为 stats 已知项之和）。
+ */
+interface MaintenanceModule {
+  readonly kickMaintenance?: () => unknown
+  readonly computeDebt?: (store: KyzmemStore, now: number) => Promise<MaintenanceDebt>
+}
+
+/**
+ * 惰性加载维护调度器。为什么用非字面量说明符：模块尚未落地时静态 import 会让整个
+ * routes.ts 编译失败，而健康检查/面板不该被并行任务的进度绑架。缺失即返回 undefined。
+ */
+async function loadMaintenanceModule(): Promise<MaintenanceModule | undefined> {
+  try {
+    const specifier = './maintenance/scheduler.ts'
+    const loaded: unknown = await import(specifier)
+    if (loaded === null || typeof loaded !== 'object') return undefined
+    const candidate = loaded as Record<string, unknown>
+    const kick = candidate['kickMaintenance']
+    const compute = candidate['computeDebt']
+    if (typeof kick !== 'function' && typeof compute !== 'function') return undefined
+    return {
+      ...(typeof kick === 'function' ? { kickMaintenance: kick as () => unknown } : {}),
+      ...(typeof compute === 'function' ? { computeDebt: compute as (store: KyzmemStore, now: number) => Promise<MaintenanceDebt> } : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * 注册 /kyzmem 页面与 /api/kyzmem/* 接口（effect 由调用方持有，disposer 可逆）。
  * @param ctx - 携带 webServer 服务的宿主上下文。
  */
@@ -235,6 +268,12 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
         const route = url.pathname.slice('/api/kyzmem/'.length)
         // 项目宫殿选择器：GET 从 query 取，POST 在读 body 后覆盖（body.project）。
         const selectorRef: { value: string | undefined } = { value: url.searchParams.get('project') ?? undefined }
+        /**
+         * 面板默认作用域的单一来源：与 tools 层同一条规则（有 cwd/项目选择器 → project，否则 user）。
+         * 收敛到 src/scope.ts，避免每个路由各写一份默认值——两处默认值一旦漂移，
+         * 面板看到的库和 agent 写入的库就不是同一个。
+         */
+        const defaultScope = (): KyzmemScope => resolveDefaultScope(selectorRef.value !== undefined)
         /** 按作用域取分库：project 走选择器解析，未知选择器抛错 → catch 统一 404。 */
         const storeFor = async (scope: KyzmemScope): Promise<KyzmemStore> => {
           if (scope !== 'project') return deps.openStore(scope)
@@ -265,15 +304,21 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             // parts 缺 shared 分部而永远显示 0——一行修复前它是真实的幽灵 scope。
             const scopes: KyzmemScope[] = ['user', 'project', 'shared']
             const parts = await Promise.all(scopes.map(async (scope) => ({ scope, stats: await (await storeFor(scope)).stats() })))
-            json(res, 200, { parts })
+            // §8 十二项指标：与面板复用同一个纯函数聚合（stats + op_log 一起读；单库缺失只是跳过，
+            // 不能因为某个库没建就让整个速览 500——面板首屏必须出得来）。
+            const gathering = await collectMetrics(scope => storeFor(scope), scopes)
+            json(res, 200, { parts, metrics: gathering.metrics, channels: gathering.channels, windowDays: 7 })
             return
           }
-          if (req.method === 'GET' && route === 'list') {
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+          if (req.method === 'GET' && (route === 'list' || route === 'memories')) {
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const status = url.searchParams.get('status')
             const kind = url.searchParams.get('kind')
             const q = url.searchParams.get('q')
             const redacted = url.searchParams.get('redacted')
+            // confirmedOnly=1：只看用户确认过的条目（sourceTier=user-confirmed）。
+            // memories 是面板「记忆」页的语义化别名，list 保留给旧面板/脚本。
+            const confirmedOnly = url.searchParams.get('confirmedOnly')
             const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
             const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0) || 0)
             const filter: ListFilter = {
@@ -282,6 +327,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
               ...(kind !== null && kind !== '' && kind !== 'all' ? { kind: kind as KyzmemKind } : {}),
               ...(q !== null && q !== '' ? { q } : {}),
               ...(redacted === 'true' || redacted === 'false' ? { redacted: redacted === 'true' } : {}),
+              ...(confirmedOnly === '1' || confirmedOnly === 'true' ? { confirmedOnly: true } : {}),
               // 巡游路线排序：面板「按巡游路线」开关；缺省 created_at 倒序。
               ...(url.searchParams.get('sort') === 'tour' ? { sort: 'tour' as const } : {}),
               limit,
@@ -290,16 +336,65 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             json(res, 200, await (await storeFor(scope)).list(filter))
             return
           }
-          if (req.method === 'GET' && route === 'search-test') {
+          if (req.method === 'GET' && route === 'conflicts') {
+            // 冲突待裁决列表（§8）：contradicts 边的两端记录，面板「冲突」页逐对裁决。
+            // scope=all 跨库合并：各库先各取前 limit，合并按 createdAt 倒序再截断（避免一边把另一边挤没）。
+            const rawScope = url.searchParams.get('scope')
+            const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 50) || 50))
+            const scopes: KyzmemScope[] = rawScope === 'all'
+              ? ['user', 'project', 'shared']
+              : [scopeOf(rawScope, defaultScope())]
+            const lists = await Promise.all(scopes.map(async scope => (await storeFor(scope)).listConflicts([scope], limit)))
+            const items = lists
+              .flatMap(list => list.items)
+              .sort((a, b) => b.createdAt - a.createdAt)
+              .slice(0, limit)
+            const total = lists.reduce((sum, list) => sum + list.total, 0)
+            const result: ConflictListResult = { items, total }
+            json(res, 200, result)
+            return
+          }
+          if (req.method === 'POST' && route === 'conflicts/resolve') {
+            // 冲突裁决（§8）：body = { left, right, action }，action ∈ keep-left/keep-right/keep-both/drop-both。
+            // 写路径，必须过 guardWrite（Origin + Content-Type 校验）；审计由 store.resolveConflict 侧落地。
+            if (!guardWrite(req, res)) return
+            const body = await readJsonBody(req)
+            const bodyObj = typeof body === 'object' && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {}
+            adoptBodySelector(bodyObj)
+            const left = bodyObj['left']
+            const right = bodyObj['right']
+            const action = bodyObj['action']
+            if (typeof left !== 'string' || left === '' || typeof right !== 'string' || right === '') {
+              json(res, 400, { error: 'left and right are required' })
+              return
+            }
+            if (action !== 'keep-left' && action !== 'keep-right' && action !== 'keep-both' && action !== 'drop-both') {
+              json(res, 400, { error: 'action must be keep-left | keep-right | keep-both | drop-both' })
+              return
+            }
+            const scope = scopeOf(typeof bodyObj['scope'] === 'string' ? bodyObj['scope'] : null, defaultScope())
+            await (await storeFor(scope)).resolveConflict(asMemoryId(left), asMemoryId(right), action)
+            json(res, 200, { ok: true })
+            return
+          }
+          if (route === 'search-test' && (req.method === 'GET' || req.method === 'POST')) {
             // 召回测试台：跑真实检索（含命中强化），供面板核对召回质量与命中原委。
-            const q = url.searchParams.get('q')
+            // GET 与 POST 同源：参数少时用 GET 便于直开调试，POST 便于带项目选择器。
+            const body = req.method === 'POST' ? await readJsonBody(req) : null
+            if (body !== null) adoptBodySelector(body)
+            const param = (name: string): string | null => {
+              if (req.method === 'GET') return url.searchParams.get(name)
+              const value = body?.[name]
+              return value === undefined || value === null ? null : String(value)
+            }
+            const q = param('q')
             if (q === null || q.trim() === '') { json(res, 400, { error: 'q required' }); return }
-            const scopeParam = url.searchParams.get('scope')
+            const scopeParam = param('scope')
             const scopes: KyzmemScope[] = scopeParam === 'all' || scopeParam === null || scopeParam === ''
               ? ['user', 'project']
-              : [scopeOf(scopeParam, 'user')]
-            const kind = url.searchParams.get('kind')
-            const limit = Math.min(20, Math.max(1, Number(url.searchParams.get('limit') ?? 10) || 10))
+              : [scopeOf(scopeParam, defaultScope())]
+            const kind = param('kind')
+            const limit = Math.min(20, Math.max(1, Number(param('limit') ?? 10) || 10))
             const embedder = deps.embedder === undefined ? undefined : await deps.embedder
             const vector = embedder === undefined ? undefined : (await embedder.embed([q.trim()]))[0]
             const results = await Promise.all(scopes.map(async scope => {
@@ -307,15 +402,32 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
               return store.search({ text: q, scopes: [scope], limit }, vector)
             }))
             const degraded = results.some(result => result.degraded)
+            // channels：各检索通道（fts/vector/graph）耗时与命中数，跨 scope 相加后回给面板。
+            const channelTotals = new Map<string, { channel: string; tookMs: number; hits: number; degraded: boolean }>()
+            for (const result of results) {
+              for (const channel of result.channels ?? []) {
+                const current = channelTotals.get(channel.channel)
+                channelTotals.set(channel.channel, {
+                  channel: channel.channel,
+                  tookMs: (current?.tookMs ?? 0) + channel.tookMs,
+                  hits: (current?.hits ?? 0) + channel.hits,
+                  degraded: channel.degraded || (current?.degraded ?? false),
+                })
+              }
+            }
             let hits = results.flatMap(result => result.hits)
             if (kind !== null && kind !== '' && kind !== 'all') hits = hits.filter(hit => hit.record.kind === kind)
             json(res, 200, {
               degraded,
+              channels: Array.from(channelTotals.values()),
               hits: hits.map(hit => ({
                 id: hit.record.id,
                 score: hit.score,
                 via: hit.via,
                 ...(hit.viaEdge === undefined ? {} : { viaEdge: hit.viaEdge }),
+                ...(hit.expired === true ? { expired: true } : {}),
+                ...(hit.record.sourceTier === undefined ? {} : { sourceTier: hit.record.sourceTier }),
+                ...(hit.cues?.contradicts === undefined || hit.cues.contradicts.length === 0 ? {} : { contradicts: hit.cues.contradicts }),
                 scope: hit.record.scope,
                 kind: hit.record.kind,
                 status: hit.record.status,
@@ -327,7 +439,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'observations') {
             // 巩固信念列表：面板信念页。status 缺省全部；按证据数降序（store 默认排序）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const status = url.searchParams.get('status')
             const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 100) || 100))
             const items = await (await storeFor(scope)).listObservations({
@@ -339,7 +451,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'observation-evidence') {
             // 信念证据链回查：sourceIds → 原始记忆行（只读，含已归档——证据链必须可回溯到任何历史状态）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const ids = (url.searchParams.get('ids') ?? '')
               .split(',').map(part => part.trim()).filter(part => part !== '').slice(0, 50)
             if (ids.length === 0) { json(res, 400, { error: 'ids required' }); return }
@@ -349,7 +461,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'entities') {
             // 实体词典：面板实体页列表（含每实体关联记忆数）；实体跟随来源记忆所在 scope 分库。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const kind = url.searchParams.get('kind')
             const q = url.searchParams.get('q')
             const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 50) || 50))
@@ -365,7 +477,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'entity') {
             // 实体详情：实体记录 + 最近关联记忆（面板实体页点开单个实体时）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const id = url.searchParams.get('id')
             if (id === null || id === '') { json(res, 400, { error: 'id required' }); return }
             const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
@@ -376,7 +488,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'facts') {
             // 实体事实链：按实体查时序事实（asOf 时点回看 / includeInvalid 展开全链），面板实体页详情卡用。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const id = url.searchParams.get('entityId')
             if (id === null || id === '') { json(res, 400, { error: 'entityId required' }); return }
             const asOf = toNumber(url.searchParams.get('asOf'))
@@ -396,7 +508,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           if (req.method === 'GET' && route === 'episode-timeline') {
             // 情景时间线：单库按日期范围/来源会话分组浏览（组头带摄取期生成的会话摘要）；
             // around 非空时切换为邻近扩展（锚点 ± windowMinutes 窗口）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const since = toNumber(url.searchParams.get('since'))
             const until = toNumber(url.searchParams.get('until'))
             const sessionId = url.searchParams.get('sessionId') ?? undefined
@@ -443,7 +555,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             // 通用时间线（v0.9.x · Memory Spiral 视图专用）：返回当前 scope 的全部活跃记忆，
             // 上限放宽到 500（list 路由的上限 100 在大规模库下不够画螺旋）。
             // 字段对客户端足够：id/kind/content/importance/confidence/accessCount/createdAt/slot。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const since = toNumber(url.searchParams.get('since'))
             const until = toNumber(url.searchParams.get('until'))
             const limit = Math.min(500, Math.max(1, toNumber(url.searchParams.get('limit')) ?? 500))
@@ -483,7 +595,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'review-due') {
             // 今日待回忆（检索练习）：只给线索（坐标/门牌/逾期天数），不给正文——正文由面板「揭示」走 review 路由拉取。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
             const now = Date.now()
             const due = await (await storeFor(scope)).dueReviews(now, limit)
@@ -513,7 +625,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
               : null
             if (grade === null) { json(res, 400, { error: 'grade must be an integer 0-5' }); return }
             adoptBodySelector(body)
-            const scope = scopeOf(typeof body.scope === 'string' ? body.scope : null, 'user')
+            const scope = scopeOf(typeof body.scope === 'string' ? body.scope : null, defaultScope())
             const store = await storeFor(scope)
             const record = await store.scheduleReview(body.id as never, grade)
             if (record === undefined) { json(res, 404, { error: messageIn(deps.language, 'misc.recordNotFound', { id: body.id }) }); return }
@@ -521,7 +633,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             return
           }
           if (req.method === 'GET' && route === 'review') {
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const id = url.searchParams.get('id')
             if (id === null || id === '') { json(res, 400, { error: 'id required' }); return }
             const store = await storeFor(scope)
@@ -532,7 +644,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           }
           if (req.method === 'GET' && route === 'review-due') {
             // 今日待回忆队列：只给坐标与门牌线索，不给正文（检索练习——先主动回忆再由面板揭示核对）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
             const now = Date.now()
             const due = await (await storeFor(scope)).dueReviews(now, limit)
@@ -564,14 +676,14 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             const grade = Number(body.grade)
             if (!Number.isInteger(grade) || grade < 0 || grade > 5) { json(res, 400, { error: 'grade must be an integer 0-5' }); return }
             adoptBodySelector(body)
-            const scope = scopeOf(typeof body.scope === 'string' ? body.scope : null, 'user')
+            const scope = scopeOf(typeof body.scope === 'string' ? body.scope : null, defaultScope())
             const record = await (await storeFor(scope)).scheduleReview(body.id as never, grade as ReviewGrade)
             if (record === undefined) { json(res, 404, { error: messageIn(deps.language, 'misc.recordNotFound', { id: body.id }) }); return }
             json(res, 200, { record })
             return
           }
           if (req.method === 'GET' && route === 'export') {
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const format = url.searchParams.get('format') === 'json' ? 'json' : 'markdown'
             const data = await (await storeFor(scope)).exportAll()
             const stamp = new Date().toISOString().replaceAll(':', '-')
@@ -606,7 +718,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             if (!guardWrite(req, res)) return
             const body = await readJsonBody(req)
             const bodyObj = typeof body === 'object' && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {}
-            const scope = scopeOf(typeof bodyObj.scope === 'string' ? bodyObj.scope : null, 'user')
+            const scope = scopeOf(typeof bodyObj.scope === 'string' ? bodyObj.scope : null, defaultScope())
             let data: ExportData
             let redacted = false
             if (bodyObj.format === 'markdown') {
@@ -648,7 +760,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           if (req.method === 'GET' && route === 'mirror') {
             // 镜像导出：与 kyzmem_export format=markdown-mirror 同语义，HTTP 路由版（面板「导出镜像」按钮 fetch 调用）。
             // attachment 头兜底：即使被当 URL 直开也走下载而不是 webview 顶层导航（实机报告导航会把面板带崩）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const data = await (await storeFor(scope)).exportAll()
             const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19)
             const mirrorRoot = join(deps.mirrorDir, scope, stamp)
@@ -700,16 +812,58 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
                 + redactedPenalty * 10
                 + decayCoverage * 10,
               )
-              return { scope, score: Math.min(100, Math.max(0, score)), signal, activeRatio, edgeCount, redacted: s.redacted, archivedRatio }
+              return { scope, score: Math.min(100, Math.max(0, score)), signal, activeRatio, edgeCount, redacted: s.redacted, archivedRatio, openConflicts: s.openConflicts ?? 0, dueCount: s.dueCount ?? 0 }
             }))
             const overall = Math.round(parts.reduce((sum, part) => sum + part.score, 0) / parts.length)
-            json(res, 200, { overall, parts, evaluatedAt: Date.now() })
+            // 触发后台整理（契约 §8：健康检查顺带 kick）。fire-and-forget——调度器抛错/模块缺失
+            // 都不能影响健康检查本身的返回（面板首屏依赖它）。
+            const maintenance = await loadMaintenanceModule()
+            if (maintenance?.kickMaintenance !== undefined) {
+              try {
+                void Promise.resolve(maintenance.kickMaintenance()).catch(() => undefined)
+              } catch {
+                /* 调度器内部异常不外溢到 HTTP 层 */
+              }
+            }
+            // 后台欠账：调度器口径优先（computeDebt 逐库求和），未就绪时用 stats 已知项退化，
+            // 保证面板「后台欠账」卡片在调度器落地前后都有数。
+            let debt: MaintenanceDebt | undefined
+            const computeDebt = maintenance?.computeDebt
+            if (computeDebt !== undefined) {
+              const perScope = await Promise.all(scopes.map(async scope => {
+                try {
+                  return await computeDebt(await storeFor(scope), Date.now())
+                } catch {
+                  return undefined
+                }
+              }))
+              const known = perScope.filter((item): item is MaintenanceDebt => item !== undefined)
+              if (known.length > 0) {
+                debt = known.reduce<MaintenanceDebt>((acc, item) => ({
+                  activeGrowth: acc.activeGrowth + item.activeGrowth,
+                  openConflicts: acc.openConflicts + item.openConflicts,
+                  dueReviews: acc.dueReviews + item.dueReviews,
+                  pendingIngests: acc.pendingIngests + item.pendingIngests,
+                  missingSummaries: acc.missingSummaries + item.missingSummaries,
+                }), { activeGrowth: 0, openConflicts: 0, dueReviews: 0, pendingIngests: 0, missingSummaries: 0 })
+              }
+            }
+            if (debt === undefined) {
+              debt = {
+                activeGrowth: 0,
+                openConflicts: parts.reduce((sum, part) => sum + part.openConflicts, 0),
+                dueReviews: parts.reduce((sum, part) => sum + part.dueCount, 0),
+                pendingIngests: 0,
+                missingSummaries: 0,
+              }
+            }
+            json(res, 200, { overall, parts, evaluatedAt: Date.now(), debt })
             return
           }
           if (req.method === 'GET' && route === 'corridor') {
             // 走廊图：节点 = 记忆（按房间分簇），边 = related/supersedes/contradicts/refines/supports。
             // 同一作用域只读一份；面板组件默认只画 active 记忆的子图，避免闭馆节点遮蔽。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const includeStatuses = new Set(['active'])
             const rawStatus = url.searchParams.get('status')
             if (rawStatus !== null && rawStatus !== '' && rawStatus !== 'all') {
@@ -823,7 +977,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           if (req.method === 'GET' && route === 'profile-block') {
             // 画像 curated block 审计视图：当前态 + 版本历史（新→旧，最多 20 条）。
             // 面板 diff 审计用；编辑走 kyzmem_profile_edit 工具（乐观锁在存储层）。
-            const scope = scopeOf(url.searchParams.get('scope'), 'user')
+            const scope = scopeOf(url.searchParams.get('scope'), defaultScope())
             const store = await storeFor(scope)
             const block = await store.getProfileBlock(scope)
             const versions = await store.listProfileBlockVersions(scope, 20)
@@ -912,7 +1066,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             const body = await readJsonBody(req)
             if (body === null || typeof body.id !== 'string' || body.id === '') { json(res, 400, { error: 'id required' }); return }
             adoptBodySelector(body)
-            const scope = scopeOf(typeof body.scope === 'string' ? body.scope : null, 'user')
+            const scope = scopeOf(typeof body.scope === 'string' ? body.scope : null, defaultScope())
             const store = await storeFor(scope)
             if (route === 'update') {
               if (typeof body.content !== 'string' || body.content.trim() === '') { json(res, 400, { error: 'content required' }); return }

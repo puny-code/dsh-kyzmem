@@ -16,7 +16,7 @@ describe('resolveConfig', () => {
     expect(resolved.decayAfterDays).toBe(90)
     expect(resolved.injectTokenBudget).toBe(1024)
     expect(resolved.rankRecencyWeight).toBe(0.2)
-    expect(resolved.rankProofWeight).toBe(0.1)
+    expect(resolved.rankProofWeight).toBe(0.05)
     expect(resolved.queryRewrite).toBe(true)
     expect(resolved.injectItemBudgetStart).toBe(160)
     expect(resolved.injectItemBudgetDecay).toBe(0.9)

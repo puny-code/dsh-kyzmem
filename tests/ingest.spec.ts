@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   ACTIVITY_THRESHOLD, INGEST_DONE_OP, INGEST_PENDING_OP, activityScore, encodeTurnKey, ensureSessionSummary, ingestFinalTurn,
   ingestPreviousTurn, ingestWriteRouting, isChitchat, forbidsCapture, lastTurnNumber, lastTurnSlice, markPendingIngest,
-  parseEntityMentions, parseFactMentions, previousTurnSlice, replayPendingIngests, throttleDecision,
+  parseEntityMentions, parseFactMentions, parsePendingValue, previousTurnSlice, replayPendingIngests, throttleDecision,
   turnSlice, turnSignals,
 } from '../src/ingest/hook.ts'
 import type { IngestRequestEventData } from '../src/ingest/hook.ts'
@@ -440,10 +440,13 @@ describe('ingestFinalTurn', () => {
       signal: AbortSignal.timeout(50),
     }))
     expect(outcome).toBeNull()
-    expect(await store.hasAudit(INGEST_PENDING_OP, encodeTurnKey('sess-ingest-1', 2))).toBe(true)
-    // 重复失败不重复落 pending。
+    const pending = (await store.listAuditDetails(INGEST_PENDING_OP)).map(parsePendingValue)
+    expect(pending.some(value => value?.key === encodeTurnKey('sess-ingest-1', 2))).toBe(true)
+    // 重复失败不重复落 pending，只累加 attempts（死信计数依据）。
     await markPendingIngest(store, 'sess-ingest-1', 2)
-    expect((await store.listAuditDetails(INGEST_PENDING_OP)).length).toBe(1)
+    const after = (await store.listAuditDetails(INGEST_PENDING_OP)).map(parsePendingValue)
+    expect(after.length).toBe(1)
+    expect(after[0]?.attempts).toBe(2)
   })
 
   it('无 turn/start 时不摄取也不落 pending', async () => {

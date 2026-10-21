@@ -23,7 +23,8 @@ import type {
   ImportEntryClass, ImportOptions, ImportPreview, ImportResult,
   ListFilter, ListResult, MemoryEdge, MemoryId, MemoryOutcome,
   MemoryRecord, ObservationId, ObservationListFilter, ObservationRecord, ObservationWriteInput,
-  ProfileBlock, ProfileBlockVersion, ReviewGrade, ReviewView, SearchHit, SearchResult, Slot, StoreStats,
+  ProfileBlock, ProfileBlockVersion, ReviewGrade, ReviewView, SearchHit, SearchResult, SearchChannelStat,
+  Slot, StoreStats, ConflictAction, ConflictListResult, ConflictPair, KyzmemSourceTier, OperationLogRow,
   TimelineQuery, UpdateInput, WriteInput,
   EpisodeTimelineQuery, EpisodeTimelineResult,
 } from '../types.ts'
@@ -31,7 +32,7 @@ import type { KyzmemStore, RoomState } from './interface.ts'
 
 /** 当前 schema 版本；结构性变更必须 +1。可空列与伴随表走增量迁移（见 openKyzmemStore 的迁移段）。
  *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。 */
-const SCHEMA_VERSION = 14
+const SCHEMA_VERSION = 15
 /** 增量迁移表：key 为起始版本，value 为升到下一版本的 SQL（可多语句）。
  *  v2 → v3：nodes 补可空列 outcome（使用效果回报）。
  *  v3 → v4：新增 nodes_revisions 修订表（update 归档旧条目时的内容快照）。
@@ -117,14 +118,37 @@ const MIGRATIONS: Readonly<Record<string, string>> = {
   // 且被 pending 重放 N+1 调用 → 启动随使用时长单调变慢。补两条：查重与按时间清理。
   '13': `CREATE INDEX IF NOT EXISTS op_log_op_detail ON op_log (op, detail);
     CREATE INDEX IF NOT EXISTS op_log_at ON op_log (at);`,
+  // v14 → v15（批四「时点记忆 + 来源分级 + TTL」）：五列全部可空/带默认值，存量条目零搬运。
+  // invalid_at：被 update/supersedeMany 取代时打点，检索默认只搜 invalid_at IS NULL；asOf 时点
+  //   检索用 created_at <= asOf AND (invalid_at IS NULL OR invalid_at > asOf) 还原「当时」的库。
+  // expires_at：TTL 过期时刻（缺省 NULL = 永不过期），命中时降权 0.5 不硬过滤。
+  // source_tier：来源分级（缺省 agent-inferred——存量条目都是模型推断的，缺省即真实情况）。
+  // last_retrieved_at / last_reviewed_at：把「被检索命中」与「被复习/回报」拆成两个时钟——
+  //   旧实现两者共用 last_accessed_at，衰减判据因此无法区分「常被检索」与「刚复习过」。
+  // 两条 UPDATE 回填存量：检索时钟回填 created_at，复习时钟回填 last_accessed_at（旧语义的值）。
+  // 索引：invalid_at 是检索的默认过滤列、expires_at 是 TTL 扫描列，全表扫会成为新热点。
+  '14': `ALTER TABLE nodes ADD COLUMN invalid_at INTEGER;
+    ALTER TABLE nodes ADD COLUMN expires_at INTEGER;
+    ALTER TABLE nodes ADD COLUMN source_tier TEXT NOT NULL DEFAULT 'agent-inferred';
+    ALTER TABLE nodes ADD COLUMN last_retrieved_at INTEGER;
+    ALTER TABLE nodes ADD COLUMN last_reviewed_at INTEGER;
+    UPDATE nodes SET last_retrieved_at = created_at WHERE last_retrieved_at IS NULL;
+    UPDATE nodes SET last_reviewed_at = last_accessed_at WHERE last_reviewed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS nodes_invalid ON nodes (invalid_at);
+    CREATE INDEX IF NOT EXISTS nodes_expires ON nodes (expires_at);`,
 }
 /** RRF 融合常数：score = Σ 1/(K + rank)。 */
 const RRF_K = 60
-/** 向量道的语义门槛：低于该余弦的条目不参与排序。 */
-const MIN_COSINE = 0.2
+/** 向量道的语义门槛：低于该余弦的条目不参与排序。
+ *  v15 起由 0.2 抬到 0.35——向量道不再对全池算余弦、只在 FTS 候选内重排，
+ *  门槛太低时 embedding 的普遍基线相似度（中文短句常有 0.2-0.3）会把无关条目顶进候选。 */
+const MIN_COSINE = 0.35
 /** 矛盾候选门槛：近邻余弦达到该值即报告（由模型/用户裁决）。 */
 const CONTRADICTION_COSINE = 0.88
-/** 每道参与融合的候选上限。 */
+/** FTS 道候选池上限（v15）：原先把每道候选都截到 64，而中文 2-gram 的 OR 匹配面很宽，
+ *  64 条经常把真正相关的条目挤在门外；256 条的 bm25 排序开销可忽略（一次查询 + 至多 256 行）。 */
+const MAX_CANDIDATES = 256
+/** 向量道参与融合的候选上限：v15 起只在 FTS 候选内截断到该值（保留既有 RRF 名次语义）。 */
 const RANK_POOL = 64
 /** 一跳扩展引入的邻居上限。 */
 const EXPANSION_LIMIT = 32
@@ -139,6 +163,15 @@ const REVIEW_LOG_LIMIT = 20
 const OP_LOG_DETAIL_MAX = 512
 /** 已排期条目的复习保护期（天）：复习逾期超过该天数才允许被衰减归档。 */
 const DECAY_REVIEW_GRACE_DAYS = 30
+/** 复习重学窗口默认值（天）：逾期超过该天数后答对，按「遗忘重学」处理（reps 清零、间隔回 1 天）。 */
+const DEFAULT_RELEARN_DAYS = 30
+
+/** op_log.detail 的长度截断（写入端曾把整段请求体塞进来：实测平均 15.1KB、峰值 142KB）。
+ *  统一在这里收口，任何新增的审计写入点都不会再把 op_log 撑大。 */
+function capDetail(detail: string | null): string | null {
+  if (detail === null || detail.length <= OP_LOG_DETAIL_MAX) return detail
+  return `${detail.slice(0, OP_LOG_DETAIL_MAX)}…`
+}
 
 /** 节点表的行结构（snake_case 对应列名）。 */
 interface NodeRow {
@@ -165,6 +198,11 @@ interface NodeRow {
   ease_factor: number | null
   interval_days: number | null
   review_reps: number | null
+  invalid_at: number | null
+  expires_at: number | null
+  source_tier: string
+  last_retrieved_at: number | null
+  last_reviewed_at: number | null
 }
 
 /** 把意象铭牌序列化为 JSON（缺省序列化为 null，落库）。 */
@@ -223,6 +261,13 @@ function rowToRecord(row: NodeRow): MemoryRecord {
         reps: row.review_reps ?? 0,
       },
     } : {}),
+    // v15 五列：可空列缺省不写对象键（exactOptionalPropertyTypes 下「有键但 undefined」
+    // 与「无键」是两种类型）。source_tier 是 NOT NULL DEFAULT，迁移后恒有值，直接映射。
+    ...(row.invalid_at === null ? {} : { invalidAt: row.invalid_at }),
+    ...(row.expires_at === null ? {} : { expiresAt: row.expires_at }),
+    sourceTier: row.source_tier as KyzmemSourceTier,
+    ...(row.last_retrieved_at === null ? {} : { lastRetrievedAt: row.last_retrieved_at }),
+    ...(row.last_reviewed_at === null ? {} : { lastReviewedAt: row.last_reviewed_at }),
   }
 }
 
@@ -356,7 +401,7 @@ export function ftsMatchExpression(text: string): string | undefined {
 
 /** 检索排序乘性 boost 参数（RRF 融合分之上逐条乘因子；权重 0 即该因子恒 1）。 */
 export interface RankBoostOptions {
-  /** recency 因子权重：`1 + w * max(0, 1 - daysSince(lastAccessedAt) / decayAfterDays)`。 */
+  /** recency 因子权重：`1 + w * max(0, 1 - daysSince(createdAt) / decayAfterDays)`。 */
   readonly recencyWeight: number
   /** proof 因子权重：`1 + w * log2(1 + accessCount)`。 */
   readonly proofWeight: number
@@ -373,6 +418,13 @@ export interface StoreAutomation {
   readonly autoSlot: boolean
   /** 新记忆自动进入 SM-2 复习调度（初始 1 天后到期）；缺省 true。 */
   readonly reviewScheduling: boolean
+  /** 复习重学窗口（天）：逾期超过该天数后答对，按「遗忘重学」处理（reps 清零、间隔回 1 天）。
+   *  缺省 30（config.reviewRelearnDays 的默认值）。纯函数 nextSchedule 本身不认识配置，
+   *  由 store 在调用时把该值传进去。 */
+  readonly reviewRelearnDays?: number
+  /** 按 kind 的 TTL（天，0 = 不过期）：WriteInput 未显式给 expiresAt 时由写入期自动折算。
+   *  缺省不设置 = 不自动过期（保持旧库/脚本直开库的既有行为）。 */
+  readonly ttlDaysByKind?: Readonly<Record<string, number>>
 }
 /** 缺省全开（config 的默认值也在此处对齐）。 */
 const DEFAULT_AUTOMATION: StoreAutomation = { autoSlot: true, reviewScheduling: true }
@@ -416,7 +468,10 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       imagery_json TEXT,
       slot_room TEXT, slot_index INTEGER, imagery_score REAL,
       next_review_at INTEGER, ease_factor REAL, interval_days REAL,
-      review_reps INTEGER DEFAULT 0);
+      review_reps INTEGER DEFAULT 0,
+      invalid_at INTEGER, expires_at INTEGER,
+      source_tier TEXT NOT NULL DEFAULT 'agent-inferred',
+      last_retrieved_at INTEGER, last_reviewed_at INTEGER);
     CREATE TABLE IF NOT EXISTS edges (
       from_id TEXT NOT NULL, to_id TEXT NOT NULL, type TEXT NOT NULL, created_at INTEGER NOT NULL,
       PRIMARY KEY (from_id, to_id, type));
@@ -462,12 +517,15 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     CREATE INDEX IF NOT EXISTS op_log_op_detail ON op_log (op, detail);
     CREATE INDEX IF NOT EXISTS op_log_at ON op_log (at);
   `)
-  // v6 索引不在此处建：旧库此刻还没有 slot_room / next_review_at 列（迁移在后面才跑），
-  // 对已存在的表建这两个索引会抛 no such column。新建库走下方补建，旧库由 MIGRATIONS['5'] 建。
+  // v6/v15 索引不在此处建：旧库此刻还没有 slot_room / next_review_at / invalid_at 等列
+  // （迁移在后面才跑），对已存在的表建这些索引会抛 no such column。
+  // 新建库走下方补建，旧库由 MIGRATIONS['5'] / MIGRATIONS['14'] 建。
   const versionRow = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string } | undefined
   if (versionRow === undefined) {
     db.exec(`CREATE INDEX IF NOT EXISTS nodes_slot ON nodes (slot_room, slot_index);
-      CREATE INDEX IF NOT EXISTS nodes_review_due ON nodes (next_review_at);`)
+      CREATE INDEX IF NOT EXISTS nodes_review_due ON nodes (next_review_at);
+      CREATE INDEX IF NOT EXISTS nodes_invalid ON nodes (invalid_at);
+      CREATE INDEX IF NOT EXISTS nodes_expires ON nodes (expires_at);`)
     db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION))
   } else {
     // 顺序增量迁移：按 MIGRATIONS 逐版升到当前版本（保数据）；更高版本或断链（缺迁移）拒绝加载。
@@ -517,20 +575,40 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   const sqlInsert = db.prepare(`INSERT INTO nodes
     (id, scope, kind, content, importance, confidence, status, created_at, last_accessed_at, access_count,
      source_session_id, source_round, source_seq, embedding, imagery_json,
-     slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days)
-    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+     slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days,
+     expires_at, source_tier, last_retrieved_at, last_reviewed_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   const sqlFtsInsert = db.prepare('INSERT INTO nodes_fts (node_id, content) VALUES (?, ?)')
-  const sqlSetStatus = db.prepare('UPDATE nodes SET status = ?, last_accessed_at = ? WHERE id = ?')
+  // v15：状态流转不再伪装成「访问」。旧实现把 last_accessed_at 当万能时间戳，forget/restore/
+  // archive 都刷新它，于是「久未访问」这个衰减判据被自己的维护动作写坏（永远新鲜）。
+  const sqlSetStatus = db.prepare('UPDATE nodes SET status = ? WHERE id = ?')
+  // 恢复 = 重新有效：除 status 外还要清掉 invalid_at——否则 restore 回来的条目仍被检索的
+  // 默认过滤（invalid_at IS NULL）挡在门外，恢复动作形同虚设。时间戳一律不动。
+  const sqlRestore = db.prepare("UPDATE nodes SET status = 'active', invalid_at = NULL WHERE id = ?")
+  // 失效标记（update/supersedeMany 的内部原语）：取代式失效 = 置 archived 并打 invalid_at
+  // （时点检索靠它还原「当时有效」的库）。COALESCE 保证只记第一次失效时刻——重复 update
+  // 不会把历史失效点往后推。
+  const sqlMarkInvalid = db.prepare(`UPDATE nodes SET status = 'archived',
+    invalid_at = COALESCE(invalid_at, ?) WHERE id = ?`)
   const sqlSetOutcome = db.prepare(`UPDATE nodes
     SET outcome = ?,
         confidence = CASE WHEN ? = 'success' THEN min(1.0, confidence + ${CONFIDENCE_BUMP}) ELSE max(0.0, confidence - ${OUTCOME_PENALTY}) END
     WHERE id = ?`)
-  const sqlTouch = db.prepare(`UPDATE nodes SET access_count = access_count + 1, last_accessed_at = ?,
-    confidence = MIN(1, confidence + ${CONFIDENCE_BUMP}) WHERE id = ?`)
+  // v15：检索命中只推进「检索时钟」——last_accessed_at 保留为旧语义字段（可选字段的缺省回退源），
+  // 不再被检索写脏；proof 因子读 access_count，衰减判据读 last_reviewed_at。
+  // 批量形态（json_each）：一次检索命中几十条也只发一条 UPDATE，避免 N 次 prepare/step。
+  const sqlTouch = db.prepare(`UPDATE nodes SET access_count = access_count + 1, last_retrieved_at = ?,
+    confidence = MIN(1, confidence + ${CONFIDENCE_BUMP}) WHERE id IN (SELECT value FROM json_each(?))`)
   const sqlLog = db.prepare('INSERT INTO op_log (at, op, target_id, detail) VALUES (?, ?, ?, ?)')
   const sqlHasAudit = db.prepare('SELECT 1 AS x FROM op_log WHERE op = ? AND detail = ? LIMIT 1')
   const sqlListAudit = db.prepare('SELECT detail FROM op_log WHERE op = ? AND detail IS NOT NULL ORDER BY seq')
   const sqlClearAudit = db.prepare('DELETE FROM op_log WHERE op = ? AND detail = ?')
+  // R1 采用率 / 维护调度用的聚合读：countAudit 供「近 7 天 drop 数」这类比例指标；
+  // lastAuditAt 供「距上次维护多久」判断；recentAudit 供「上一轮 recall 批次」回读。
+  const sqlCountAudit = db.prepare('SELECT COUNT(*) AS n FROM op_log WHERE op = ? AND at >= ?')
+  const sqlAuditLastAt = db.prepare('SELECT MAX(at) AS at FROM op_log WHERE op = ?')
+  const sqlAuditRecent = db.prepare('SELECT at, op, target_id, detail FROM op_log WHERE op = ? ORDER BY seq DESC LIMIT ?')
+  const sqlAuditRecentByTarget = db.prepare('SELECT at, op, target_id, detail FROM op_log WHERE op = ? AND target_id = ? ORDER BY seq DESC LIMIT ?')
   const sqlOpLogById = db.prepare('SELECT at, op, target_id, detail FROM op_log WHERE target_id = ? ORDER BY seq DESC LIMIT ?')
   const sqlGetManyByIds = db.prepare('SELECT * FROM nodes WHERE id IN (SELECT value FROM json_each(?))')
   const sqlNeighborsBounded = db.prepare(`SELECT * FROM nodes WHERE id IN (
@@ -554,11 +632,38 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     WHERE from_id IN (SELECT value FROM json_each(?))
     AND type IN ('supports','refines','related','supersedes') LIMIT ?`)
   const sqlEdgesTouching = db.prepare('SELECT from_id, to_id, type FROM edges WHERE from_id = ? OR to_id = ?')
+  // 冲突裁决（批二）：contradicts 边 + 两端记录。任一端 active/archived 都要能进待裁决列表——
+  // 裁决前用户可能已手动归档了一端。scope 过滤要求两端都在查询 scope 集合内：跨 scope 冲突
+  // （user ↔ project）不属于单库面板的默认视图。
+  const sqlConflictEdges = db.prepare(`SELECT e.from_id, e.to_id, e.created_at FROM edges e
+    JOIN nodes l ON l.id = e.from_id JOIN nodes r ON r.id = e.to_id
+    WHERE e.type = 'contradicts'
+      AND l.scope IN (SELECT value FROM json_each(?)) AND r.scope IN (SELECT value FROM json_each(?))
+    ORDER BY e.created_at DESC LIMIT ?`)
+  const sqlConflictCount = db.prepare(`SELECT COUNT(*) AS n FROM edges e
+    JOIN nodes l ON l.id = e.from_id JOIN nodes r ON r.id = e.to_id
+    WHERE e.type = 'contradicts'
+      AND l.scope IN (SELECT value FROM json_each(?)) AND r.scope IN (SELECT value FROM json_each(?))`)
+  const sqlDeleteConflictEdge = db.prepare(`DELETE FROM edges WHERE type = 'contradicts'
+    AND ((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?))`)
+  // 命中详情里的 contradicts 提示（只进 cues 不计分）：只对最终 top-N 命中逐条查，
+  // N ≤ limit（通常 8），比每次检索都做一次全边 join 划算。
+  const sqlContradictsByNode = db.prepare(`SELECT from_id, to_id FROM edges
+    WHERE type = 'contradicts' AND (from_id = ? OR to_id = ?)`)
   const sqlCountBy = db.prepare('SELECT status, COUNT(*) AS n FROM nodes GROUP BY status')
   const sqlCountKind = db.prepare('SELECT kind, COUNT(*) AS n FROM nodes GROUP BY kind')
   const sqlCountEdges = db.prepare('SELECT COUNT(*) AS n FROM edges')
   const sqlCountOpLog = db.prepare('SELECT COUNT(*) AS n FROM op_log')
   const sqlCountRedacted = db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE content LIKE '%[REDACTED:%'")
+  // v15 指标（面板 12 指标表的直接数据源）：过期命中面、已失效存量、来源分级占比、
+  // 待裁决冲突、今日到期量。全部走各自新索引，避免面板轮询把全表扫成热点。
+  const sqlCountExpired = db.prepare(`SELECT COUNT(*) AS n FROM nodes
+    WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?`)
+  const sqlCountInvalidated = db.prepare('SELECT COUNT(*) AS n FROM nodes WHERE invalid_at IS NOT NULL')
+  const sqlCountByTier = db.prepare('SELECT source_tier AS tier, COUNT(*) AS n FROM nodes GROUP BY source_tier')
+  const sqlCountConflicts = db.prepare("SELECT COUNT(*) AS n FROM edges WHERE type = 'contradicts'")
+  const sqlCountDue = db.prepare(`SELECT COUNT(*) AS n FROM nodes
+    WHERE status = 'active' AND next_review_at IS NOT NULL AND next_review_at <= ?`)
   const sqlAllNodes = db.prepare('SELECT * FROM nodes ORDER BY created_at')
   const sqlAllEdges = db.prepare('SELECT * FROM edges')
   // 导入路径：全字段插入（不经 write 的写入期自动化——导入条目保留导出侧的桩位/复习调度/时间戳），
@@ -566,19 +671,30 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   const sqlImportInsert = db.prepare(`INSERT INTO nodes
     (id, scope, kind, content, importance, confidence, status, created_at, last_accessed_at, access_count,
      source_session_id, source_round, source_seq, embedding, outcome, imagery_json,
-     slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days, review_reps)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+     slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days, review_reps,
+     invalid_at, expires_at, source_tier, last_retrieved_at, last_reviewed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   const sqlImportContentMatch = db.prepare('SELECT id FROM nodes WHERE content = ? LIMIT 1')
   const sqlImportAttachEmbedding = db.prepare('UPDATE nodes SET embedding = ? WHERE id = ?')
+  // 已有向量的批量读取（维护/整理复用）：只回 embedding 非空的条目，调用方对缺口再算。
+  const sqlEmbeddingsFor = db.prepare(
+    'SELECT id, embedding FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND embedding IS NOT NULL',
+  )
   const sqlImportEntityAliases = db.prepare('UPDATE entities SET aliases_json = ?, updated_at = ? WHERE id = ?')
-  // 衰减（批零 0.3 重写）：旧判据是双死门——importance 实测中位 0.7–0.8 恒不 < 0.3，
-  // 且写入默认排复习（next_review_at 永非空）→ 命中数恒为 0，等于从没衰减过。
-  // 新判据按「真的没人用过」判：从未被检索命中 + 久未访问 + 复习也早逾期（或本就未排期）。
-  const sqlDecay = db.prepare(`UPDATE nodes SET status = 'archived'
-    WHERE status = 'active' AND access_count = 0 AND last_accessed_at < ?
-      AND (next_review_at IS NULL OR next_review_at < ?)`)
+  // 衰减（v15 再修）：判据从 last_accessed_at 改 last_reviewed_at——前者在 v15 被拆成
+  // 「检索时钟」（last_retrieved_at），继续读它会让「常被命中但从不复习」的条目永不衰减。
+  // 缺省回退 last_accessed_at：老库或未走新写入路径的行仍有该值，COALESCE 保证判据可用。
+  // 两层查询（先取候选、再 json_each 批量归档）是为了支持维护预算的 limit——单条
+  // UPDATE ... LIMIT 需要 SQLite 编译开关，这种写法不依赖它且归档集合精确可控。
+  const sqlDecayCandidates = db.prepare(`SELECT id FROM nodes
+    WHERE status = 'active' AND access_count = 0
+      AND COALESCE(last_reviewed_at, last_accessed_at) < ?
+      AND (next_review_at IS NULL OR next_review_at < ?)
+    LIMIT ?`)
+  const sqlArchiveIds = db.prepare("UPDATE nodes SET status = 'archived' WHERE id IN (SELECT value FROM json_each(?))")
+  // 复习答题：推进「复习时钟」（衰减的新判据），不碰检索时钟。
   const sqlScheduleReview = db.prepare(`UPDATE nodes
-    SET next_review_at = ?, ease_factor = ?, interval_days = ?, review_reps = ?, last_accessed_at = ?
+    SET next_review_at = ?, ease_factor = ?, interval_days = ?, review_reps = ?, last_reviewed_at = ?
     WHERE id = ?`)
   const sqlDueReviews = db.prepare(`SELECT * FROM nodes
     WHERE status = 'active' AND next_review_at IS NOT NULL AND next_review_at <= ?
@@ -648,26 +764,58 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   const sqlObservationRefute = db.prepare('UPDATE observations SET status = \'refuted\', updated_at = ? WHERE id = ?')
   const sqlObservationActiveVectors = db.prepare('SELECT * FROM observations WHERE status != \'refuted\' AND embedding IS NOT NULL')
   const sqlPurgeObservations = db.prepare('DELETE FROM observations')
+  // 批零遗留 bug：purge 漏了修订表——purge 后 nodes_revisions 里仍留着被取代条目的正文，
+  // 「清空」之后还能从修订历史读出内容。补齐。
+  const sqlPurgeRevisions = db.prepare('DELETE FROM nodes_revisions')
+  // 单条硬删（purgeOne）：nodes / fts / 修订 / 全部边 / 实体关联 / 巡游路线 一次清干净。
+  // 与 forget 的区别：不留 tombstone 行（forget 是软删可恢复），只在 op_log 留审计记录。
+  const sqlPurgeOneNode = db.prepare('DELETE FROM nodes WHERE id = ?')
+  const sqlPurgeOneFts = db.prepare('DELETE FROM nodes_fts WHERE node_id = ?')
+  const sqlPurgeOneRevisions = db.prepare('DELETE FROM nodes_revisions WHERE node_id = ?')
+  const sqlPurgeOneEdges = db.prepare('DELETE FROM edges WHERE from_id = ? OR to_id = ?')
+  const sqlPurgeOneNodeEntities = db.prepare('DELETE FROM node_entities WHERE node_id = ?')
+  const sqlPurgeOneRoute = db.prepare('DELETE FROM tour_routes WHERE node_id = ?')
+  // 引用强化（kyzmem_assess 的 sufficient 证据）：只提 confidence，不动访问计数与时间戳——
+  // 「被当作证据引用」与「被检索命中」是两种信号，混用会把 proof 因子与衰减判据一起弄脏。
+  const sqlReinforceCitation = db.prepare('UPDATE nodes SET confidence = MIN(1, confidence + ?) WHERE id = ?')
 
-  /** FTS 道：按 scope 集合检索（占位符动态生成，scope 集合由调用方去重）；rooms 非空时只查指定房间。 */
-  const ftsSearch = (match: string, scopes: readonly KyzmemScope[], rooms: readonly string[] | undefined): NodeRow[] => {
+  /** 时点/失效过滤（v15）：默认只认「当前有效」的行；asOf 给定时还原该时刻的库快照。
+   *  注意 asOf 下不能再用 `status = 'active'` 做过滤：status 是「现在」的状态，被 update/
+   *  supersede 归档的条目在 asOf 时刻恰恰是有效的；判断那时是否有效只能靠 created_at/invalid_at。
+   *  forgotten 例外——闭馆是用户的删除意图（且不打 invalid_at），时点视图也不该把它翻出来。
+   *  prefix 是列前缀（'n.' 或 ''）。 */
+  const validityCond = (asOf: number | undefined, prefix: string): { cond: string; params: number[] } => {
+    if (asOf === undefined) return { cond: ` AND ${prefix}status = 'active' AND ${prefix}invalid_at IS NULL`, params: [] }
+    return {
+      cond: ` AND ${prefix}status != 'forgotten' AND ${prefix}created_at <= ? AND (${prefix}invalid_at IS NULL OR ${prefix}invalid_at > ?)`,
+      params: [asOf, asOf],
+    }
+  }
+
+  /** FTS 道：按 scope 集合检索（占位符动态生成，scope 集合由调用方去重）；rooms 非空时只查指定房间。
+   *  v15：候选上限抬到 MAX_CANDIDATES（bm25 排序保留），并把 validity（默认 invalid_at IS NULL）下沉到 SQL——
+   *  在候选截断之前过滤，才不会出现「前 256 条全是已失效条目」导致真正有效的条目进不了向量道。 */
+  const ftsSearch = (match: string, scopes: readonly KyzmemScope[], rooms: readonly string[] | undefined, asOf: number | undefined): NodeRow[] => {
     const placeholders = scopes.map(() => '?').join(',')
     const roomCond = rooms === undefined || rooms.length === 0
       ? ''
       : ` AND n.slot_room IN (${rooms.map(() => '?').join(',')})`
+    const validity = validityCond(asOf, 'n.')
     return db.prepare(`SELECT n.* FROM nodes_fts f JOIN nodes n ON n.id = f.node_id
-      WHERE nodes_fts MATCH ? AND n.status = 'active' AND n.scope IN (${placeholders})${roomCond}
-      ORDER BY bm25(nodes_fts) LIMIT ${RANK_POOL}`).all(match, ...scopes, ...(rooms ?? [])) as unknown as NodeRow[]
+      WHERE nodes_fts MATCH ? AND n.scope IN (${placeholders})${roomCond}${validity.cond}
+      ORDER BY bm25(nodes_fts) LIMIT ${MAX_CANDIDATES}`).all(match, ...scopes, ...(rooms ?? []), ...validity.params) as unknown as NodeRow[]
   }
 
-  /** 向量候选池：active 且带向量的条目，按 scope 集合过滤（占位符动态生成）；rooms 非空时只查指定房间。 */
-  const vectorPool = (scopes: readonly KyzmemScope[], rooms: readonly string[] | undefined): NodeRow[] => {
+  /** 向量候选池：active 且带向量的条目，按 scope 集合过滤（占位符动态生成）；rooms 非空时只查指定房间。
+   *  v15 起只在 FTS 零命中时作为回退（否则向量道只在 FTS 候选内重排，见 search）。 */
+  const vectorPool = (scopes: readonly KyzmemScope[], rooms: readonly string[] | undefined, asOf: number | undefined): NodeRow[] => {
     const placeholders = scopes.map(() => '?').join(',')
     const roomCond = rooms === undefined || rooms.length === 0
       ? ''
       : ` AND slot_room IN (${rooms.map(() => '?').join(',')})`
-    return db.prepare(`SELECT * FROM nodes WHERE status = 'active' AND embedding IS NOT NULL AND scope IN (${placeholders})${roomCond}`)
-      .all(...scopes, ...(rooms ?? [])) as unknown as NodeRow[]
+    const validity = validityCond(asOf, '')
+    return db.prepare(`SELECT * FROM nodes WHERE embedding IS NOT NULL AND scope IN (${placeholders})${roomCond}${validity.cond}`)
+      .all(...scopes, ...(rooms ?? []), ...validity.params) as unknown as NodeRow[]
   }
 
   const getRow = (id: string): NodeRow | undefined => sqlGet.get(id) as unknown as NodeRow | undefined
@@ -688,12 +836,19 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       : embedding instanceof Float32Array ? vecToBlob(embedding) : embedding
     // 初始排期：进入复习调度的条目 ease 从 SM-2 默认 2.5、间隔 0（等首次答题推进）起。
     const initialReview = input.initialReviewAt ?? null
+    // TTL（v15）：显式 expiresAt 优先；否则按 kind 的天数折算（0 天 = 不过期，列留 NULL）。
+    // 折算放在插入公共体里，保证 save/批量/摄取/蒸馏四条写入路径口径一致（调用方不必各自算）。
+    const ttlDays = automation.ttlDaysByKind?.[input.kind] ?? 0
+    const expiresAt = input.expiresAt ?? (ttlDays > 0 ? at + ttlDays * 86_400_000 : null)
+    // 两个时间戳时钟起点都是写入时刻：检索时钟给 recency/衰减一个确定起点，
+    // 复习时钟让「新写入的条目」不会在当天就满足「久未复习」的衰减条件。
     sqlInsert.run(
       id, input.scope, input.kind, content, importance, confidence, at, at,
       sourceSessionId, input.sourceRound ?? null, input.sourceSeq ?? null, stored,
       imageryToJson(imagery),
       input.slot?.room ?? null, input.slot?.index ?? null, input.imageryScore ?? null,
       initialReview, initialReview === null ? null : 2.5, initialReview === null ? null : 0,
+      expiresAt, input.sourceTier ?? 'agent-inferred', at, at,
     )
     sqlFtsInsert.run(id, tokenizeForFts(content))
     sqlLog.run(at, op, id, JSON.stringify({ kind: input.kind, scope: input.scope }))
@@ -835,27 +990,40 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
 
     async search(query, queryVector): Promise<SearchResult> {
       const limit = query.limit ?? 8
+      const asOf = query.asOf
       type Scored = { score: number; via: SearchHit['via'] }
       const scores = new Map<string, Scored>()
+      const channels: SearchChannelStat[] = []
+      const now = Date.now()
 
-      // 道 1：FTS5 关键词（2-gram OR）。
+      // 道 1：FTS5 关键词（2-gram OR），候选上限 MAX_CANDIDATES。
+      // 键错误/空查询时 match 为 undefined——仍上报一条 0 命中的通道统计，面板才能区分
+      // 「这道没跑」与「这道跑了没结果」。
+      const ftsStarted = performance.now()
       const match = ftsMatchExpression(query.text)
-      if (match !== undefined) {
-        ftsSearch(match, query.scopes, query.rooms).forEach((row, index) => {
-          scores.set(row.id, { score: 1 / (RRF_K + index + 1), via: 'fts' })
-        })
-      }
+      const ftsRows = match === undefined ? [] : ftsSearch(match, query.scopes, query.rooms, asOf)
+      ftsRows.forEach((row, index) => {
+        scores.set(row.id, { score: 1 / (RRF_K + index + 1), via: 'fts' })
+      })
+      channels.push({ channel: 'fts', tookMs: Math.round(performance.now() - ftsStarted), hits: ftsRows.length, degraded: false })
 
-      // 道 2：向量余弦（active 且带向量的条目全量参与）。
-      let degraded = true
+      // 道 2：向量余弦。v15 起只在 FTS 候选内重排——同一批候选上算余弦，语义道只负责
+      // 「在关键词命中里挑更相关的」，不再用全池向量把大量弱相关条目顶进融合。
+      // FTS 零命中时回退全池：纯语义查询（措辞完全不同的同义表述）没有关键词交集，
+      // 若也走候选内，向量道就永远救不回来，这违背了保留向量道的初衷。
+      const vectorStarted = performance.now()
+      let vectorHits = 0
+      let degraded = queryVector === undefined
       if (queryVector !== undefined) {
-        degraded = false
-        const pool = vectorPool(query.scopes, query.rooms)
-        const ranked = pool
+        const candidates = ftsRows.length > 0
+          ? ftsRows.filter(row => row.embedding !== null)
+          : vectorPool(query.scopes, query.rooms, asOf)
+        const ranked = candidates
           .map(row => ({ row, sim: cosine(queryVector, blobToVec(row.embedding!)) }))
           .filter(entry => entry.sim >= MIN_COSINE)
           .sort((a, b) => b.sim - a.sim)
           .slice(0, RANK_POOL)
+        vectorHits = ranked.length
         ranked.forEach((entry, index) => {
           const add = 1 / (RRF_K + index + 1)
           const existing = scores.get(entry.row.id)
@@ -866,39 +1034,65 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
           }
         })
       }
+      channels.push({ channel: 'vector', tookMs: Math.round(performance.now() - vectorStarted), hits: vectorHits, degraded })
 
       // 排序 boost：RRF 融合分之上乘 recency 与 proof 因子（权重 0 时因子恒 1，退化为纯 RRF）。
+      // v15：recency 基准从 last_accessed_at 改 created_at——前者在旧实现里被 forget/restore/
+      // scheduleReview 反复刷新，早已不代表「新近程度」；created_at 不可变，语义唯一。
+      // proof 仍读 access_count（「被用过几次」的代理指标）。
       if (rankBoost.recencyWeight !== 0 || rankBoost.proofWeight !== 0) {
-        const now = Date.now()
         for (const [id, info] of scores) {
           const row = getRow(id)
           if (row === undefined) continue
-          const daysSince = Math.max(0, (now - row.last_accessed_at) / 86_400_000)
+          const daysSince = Math.max(0, (now - row.created_at) / 86_400_000)
           const recency = 1 + rankBoost.recencyWeight * Math.max(0, 1 - daysSince / rankBoost.decayAfterDays)
           const proof = 1 + rankBoost.proofWeight * Math.log2(1 + row.access_count)
           info.score *= recency * proof
         }
       }
 
-      // 关系一跳扩展：top 结果的 supports/refines/related 邻居，若 active 且未入结果则低权重引入。
+      // TTL 降权（v15）：过期条目不硬过滤（历史事实仍有价值，用户可能正好在回忆旧状态），
+      // 命中时分数 ×0.5 并在命中上标 expired，由渲染侧标 [已过期] 让模型自己决定信不信。
+      const expiredIds = new Set<string>()
+      for (const [id, info] of scores) {
+        const row = getRow(id)
+        if (row === undefined || row.expires_at === null || row.expires_at > now) continue
+        info.score *= 0.5
+        expiredIds.add(id)
+      }
+
+      // 关系一跳扩展：top 结果的 supports/refines/related/supersedes 邻居低权重（0.5*父分）引入。
+      // contradicts 不入分（只进 cues.contradicts）：冲突是「需要裁决」的提示，不是相关性证据，
+      // 计分会把互相矛盾的条目一起顶进注入结果——那正是最该避免的「记忆自相矛盾」场景。
       const topIds = [...scores.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, limit).map(([id]) => id)
       const viaEdgeOf = new Map<string, { from: MemoryId; type: MemoryEdge['type'] }>()
+      const graphStarted = performance.now()
+      let graphHits = 0
       if (topIds.length > 0) {
         const edges = sqlNeighbors.all(JSON.stringify(topIds), EXPANSION_LIMIT) as unknown as MemoryEdge[]
         for (const edge of edges) {
           if (scores.has(edge.to) || !topIds.includes(edge.from)) continue
           const row = getRow(edge.to)
-          if (row === undefined || row.status !== 'active' || !query.scopes.includes(row.scope as KyzmemScope)) continue
+          if (row === undefined) continue
+          // 时点检索下 status 是「现在」的状态，不能拿它当判据（见 validityCond 的注释）；
+          // 默认视图仍只扩展 active 邻居。
+          if (asOf === undefined ? row.status !== 'active' : row.status === 'forgotten') continue
+          if (!query.scopes.includes(row.scope as KyzmemScope)) continue
+          // 时点检索下不得引入「当时还不存在 / 当时已失效」的邻居。
+          if (asOf !== undefined && (row.created_at > asOf || (row.invalid_at !== null && row.invalid_at <= asOf))) continue
           const baseScore = scores.get(edge.from)?.score
           if (baseScore === undefined) continue
           scores.set(edge.to, { score: baseScore * 0.5, via: 'graph' })
           viaEdgeOf.set(edge.to, { from: asMemoryId(edge.from), type: edge.type })
+          graphHits++
         }
       }
+      channels.push({ channel: 'graph', tookMs: Math.round(performance.now() - graphStarted), hits: graphHits, degraded: false })
 
-      // 排序截断 + 命中强化（accessCount、confidence）。
+      // 排序截断 + 命中详情（线索/实体/冲突提示）。
       const finalRows = [...scores.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, limit)
       const hits: SearchHit[] = []
+      const touchedIds: string[] = []
       for (const [id, info] of finalRows) {
         const row = getRow(id)
         if (row === undefined) continue
@@ -908,6 +1102,10 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
           ? (sqlSlotNeighbors.all(row.slot_room, row.slot_index - 1, row.slot_index + 1, id) as unknown as { id: string }[])
               .map(neighbor => asMemoryId(neighbor.id))
           : []
+        // 冲突线索（v15）：只提示不计分（见上方一跳扩展的注释）。
+        const conflictRows = sqlContradictsByNode.all(id, id) as unknown as { from_id: string; to_id: string }[]
+        const contradicts = conflictRows.map(edge => asMemoryId(edge.from_id === id ? edge.to_id : edge.from_id))
+        const hasCues = cueNeighbors.length > 0 || contradicts.length > 0
         // 实体标签（schema v10）：命中的记忆附上关联实体（id + 规范名），提取路径可沿实体展开。
         const entityRows = sqlEntityByNode.all(id) as unknown as EntityRow[]
         hits.push({
@@ -915,14 +1113,27 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
           score: info.score,
           via: info.via,
           ...(viaEdge === undefined ? {} : { viaEdge }),
-          ...(cueNeighbors.length === 0 ? {} : { cues: { neighbors: cueNeighbors } }),
+          ...(hasCues
+            ? { cues: { neighbors: cueNeighbors, ...(contradicts.length === 0 ? {} : { contradicts }) } }
+            : {}),
           ...(entityRows.length === 0
             ? {}
             : { entities: entityRows.map(r => ({ id: asEntityId(r.id), name: r.name })) }),
+          ...(expiredIds.has(id) ? { expired: true } : {}),
         })
-        sqlTouch.run(Date.now(), id)
+        touchedIds.push(id)
       }
-      return { hits, degraded }
+      // 命中强化：截断、定稿后一次批量 UPDATE（access_count+1 / confidence+BUMP / last_retrieved_at）。
+      // 旧实现逐条 sqlTouch.run——一次检索 8 条就是 8 次写；批量后写放大降到 1 次。
+      // last_accessed_at 不再动：它在 v15 只是可选字段的缺省回退源，不是检索时钟。
+      if (touchedIds.length > 0) {
+        withTransaction(() => {
+          sqlTouch.run(now, JSON.stringify(touchedIds))
+          // 召回审计（契约 §6）：ids/query/mode 一并记，供「检索采用率」与问题回放。
+          sqlLog.run(now, 'recall', 'BATCH', capDetail(JSON.stringify({ ids: touchedIds, query: query.text, mode: 'search' })))
+        })
+      }
+      return { hits, degraded, channels }
     },
 
     async timeline(query: TimelineQuery) {
@@ -1030,7 +1241,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       withTransaction(() => {
         // 修订历史先行：归档旧条目前快照其内容（内容不变性审计，schema v4）。
         sqlRevisionInsert.run(input.id, old.content, old.kind, old.importance, at)
-        sqlSetStatus.run('archived', at, input.id)
+        // v15：旧条目同时打 invalid_at——时点检索靠它还原「当时还是旧值」的库。
+        sqlMarkInvalid.run(at, input.id)
         sqlLog.run(at, 'superseded', input.id, JSON.stringify({ supersededBy: id }))
         // 新条目是新物品：重新排桩/评分/排期（宫殿里修正一件物品 = 在新桩位放新版）。
         const imagery = input.imagery ?? jsonToImagery(old.imagery_json)
@@ -1056,7 +1268,7 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     async forget(id: MemoryId) {
       const row = getRow(id)
       if (row === undefined) throw new KyzmemError('NOT_FOUND', message('store.entryNotFound', { id }))
-      sqlSetStatus.run('forgotten', Date.now(), id)
+      sqlSetStatus.run('forgotten', id)
       sqlLog.run(Date.now(), 'forget', id, null)
       return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
     },
@@ -1071,7 +1283,7 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         affects: tombstone.affects.trim().slice(0, 200),
         stillUseful: tombstone.stillUseful.trim().slice(0, 200),
       }
-      sqlSetStatus.run('forgotten', at, id)
+      sqlSetStatus.run('forgotten', id)
       sqlLog.run(at, 'forget', id, JSON.stringify({ tombstone: cleaned }))
       return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
     },
@@ -1133,7 +1345,9 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       const current = rowToRecord(row).review ?? {
         nextReviewAt: null, easeFactor: 2.5, intervalDays: 0, reps: row.review_reps ?? 0,
       }
-      const next = nextSchedule(grade, current, now)
+      // 重学窗口由调用方（插件层 resolved.reviewRelearnDays）注入，函数本身保持纯：
+      // 逾期超过该天数后答对，按「遗忘重学」处理（reps 清零、间隔回到 1 天）。
+      const next = nextSchedule(grade, current, now, automation.reviewRelearnDays ?? DEFAULT_RELEARN_DAYS)
       sqlScheduleReview.run(next.nextReviewAt, next.easeFactor, next.intervalDays, next.reps, now, id)
       sqlLog.run(now, 'review-answer', id, JSON.stringify({ grade, nextIntervalDays: next.intervalDays }))
       return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
@@ -1254,7 +1468,9 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     async restore(id: MemoryId) {
       const row = getRow(id)
       if (row === undefined) throw new KyzmemError('NOT_FOUND', message('store.entryNotFound', { id }))
-      sqlSetStatus.run('active', Date.now(), id)
+      // 只回状态、不碰时间戳：restore 不是「访问」，也不是「复习」——旧实现把它当最后一次访问，
+      // 直接让衰减判据（久未复习）失效。
+      sqlRestore.run(id)
       sqlLog.run(Date.now(), 'restore', id, null)
       return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
     },
@@ -1269,6 +1485,12 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       const params: (string | number)[] = [filter.scope]
       if (filter.status !== undefined) { conds.push('status = ?'); params.push(filter.status) }
       if (filter.kind !== undefined) { conds.push('kind = ?'); params.push(filter.kind) }
+      // 来源分级过滤（v15）：confirmedOnly 是「显式确认」的严格口径——只有用户亲手确认过的条目
+      // （kyzmem_save / kyzmem_facts 等显式保存路径写入 sourceTier='user-confirmed'）才进这个视图。
+      // 注意与 isTrustedTier / injectTiers 区分：那两个管「注入上下文时信不信这条」，范围更宽
+      // （user-confirmed + agent-inferred）；这里管「用户是否点名确认过」，两者不是一回事，
+      // 混用会让面板「仅看已确认」chip 恒空（没有任何路径写 user-confirmed 之外的差异）。
+      if (filter.confirmedOnly === true) conds.push("source_tier = 'user-confirmed'")
       if (filter.q !== undefined && filter.q !== '') { conds.push('instr(content, ?) > 0'); params.push(filter.q) }
       // 脱敏标记过滤：标记格式由 redact.ts 固定（[REDACTED:<类型>]），LIKE 字面匹配。
       if (filter.redacted !== undefined) {
@@ -1317,6 +1539,11 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       const archived = byStatus['archived'] ?? 0
       const forgotten = byStatus['forgotten'] ?? 0
       const total = active + archived + forgotten
+      // v15 扩展指标：过期命中面（TTL）、已失效存量（被取代）、来源分级占比、待裁决冲突、
+      // 当前到期量。全部是面板 12 指标表的直接数据源，调用方不必各自拼 SQL。
+      const now = Date.now()
+      const byTier: Record<string, number> = {}
+      for (const row of sqlCountByTier.all() as unknown as { tier: string; n: number }[]) byTier[row.tier] = row.n
       return {
         total,
         active,
@@ -1327,6 +1554,11 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         edges: edgeCount,
         opLogCount: opCount,
         signalRatio: total === 0 ? 0 : active / total,
+        expired: (sqlCountExpired.get(now) as unknown as { n: number }).n,
+        invalidated: (sqlCountInvalidated.get() as unknown as { n: number }).n,
+        byTier,
+        openConflicts: (sqlCountConflicts.get() as unknown as { n: number }).n,
+        dueCount: (sqlCountDue.get(now) as unknown as { n: number }).n,
       }
     },
 
@@ -1402,6 +1634,10 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
             null, r.outcome ?? null, imageryToJson(r.imagery),
             r.slot?.room ?? null, r.slot?.index ?? null, r.imageryScore ?? null,
             review?.nextReviewAt ?? null, review?.easeFactor ?? null, review?.intervalDays ?? null, review?.reps ?? null,
+            // v15 五列：导入保留导出侧的时间线（含失效点与 TTL）；老备份没有这些字段时
+            // 用 createdAt/lastAccessedAt 兜底，保证 recency 与衰减判据仍有值可读。
+            r.invalidAt ?? null, r.expiresAt ?? null, r.sourceTier ?? 'agent-inferred',
+            r.lastRetrievedAt ?? r.createdAt, r.lastReviewedAt ?? r.lastAccessedAt,
           )
           sqlFtsInsert.run(r.id, tokenizeForFts(c.content))
         }
@@ -1454,14 +1690,33 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       return attached
     },
 
+    async embeddingsFor(ids: readonly string[]): Promise<ReadonlyMap<string, Float32Array>> {
+      const found = new Map<string, Float32Array>()
+      if (ids.length === 0) return found
+      const rows = sqlEmbeddingsFor.all(JSON.stringify(ids)) as unknown as { id: string; embedding: Uint8Array }[]
+      for (const row of rows) found.set(row.id, blobToVec(row.embedding))
+      return found
+    },
+
     async decay(options: DecayOptions) {
       const now = Date.now()
+      // 判据（v15）：零访问 + 久未「复习/回报」+ 复习已逾期（或本就未排期）。
+      // 读 last_reviewed_at 而不是 last_accessed_at：后者在 v15 已拆成检索时钟，
+      // 「常被检索命中」不该阻止衰减——那正是 access_count 要表达的信号。
+      // COALESCE 回退 last_accessed_at：同一构造的旧库行（迁移前写入）仍有该值。
       const cutoff = now - options.olderThanDays * 86_400_000
       const reviewCutoff = now - (options.reviewGraceDays ?? DECAY_REVIEW_GRACE_DAYS) * 86_400_000
-      const result = sqlDecay.run(cutoff, reviewCutoff)
-      const changed = Number(result.changes)
-      if (changed > 0) sqlLog.run(now, 'decay', 'BATCH', JSON.stringify({ archived: changed }))
-      return changed
+      // limit 缺省 = 全量（LIMIT -1 在 SQLite 表示不限制）。
+      const limit = options.limit === undefined ? -1 : Math.max(1, Math.floor(options.limit))
+      const candidates = sqlDecayCandidates.all(cutoff, reviewCutoff, limit) as unknown as { id: string }[]
+      if (candidates.length === 0) return 0
+      const ids = candidates.map(row => row.id)
+      withTransaction(() => {
+        sqlArchiveIds.run(JSON.stringify(ids))
+        // 统一记一条 BATCH：逐条写 op_log 会让每日维护把日志灌爆（旧实现已是这个口径）。
+        sqlLog.run(now, 'decay', 'BATCH', JSON.stringify({ archived: ids.length }))
+      })
+      return ids.length
     },
 
     async findContradictions(embedding: Float32Array, limit = 3) {
@@ -1472,6 +1727,39 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         .sort((a, b) => b.sim - a.sim)
         .slice(0, limit)
         .map(entry => rowToRecord(entry.row))
+    },
+
+    async listConflicts(scopes: readonly KyzmemScope[], limit: number): Promise<ConflictListResult> {
+      const boundedLimit = Math.max(1, Math.floor(limit))
+      // scope 集合以 JSON 数组传进 two json_each：动态占位符在这里没用，两端各要一次 IN 子查询。
+      const scopeJson = JSON.stringify([...scopes])
+      const total = (sqlConflictCount.get(scopeJson, scopeJson) as unknown as { n: number }).n
+      const rows = sqlConflictEdges.all(scopeJson, scopeJson, boundedLimit) as unknown as
+        { from_id: string; to_id: string; created_at: number }[]
+      const items: ConflictPair[] = []
+      for (const row of rows) {
+        const leftRow = getRow(row.from_id)
+        const rightRow = getRow(row.to_id)
+        // 任一端缺失（手工删过节点/导入残留边）的冲突无从裁决，跳过而不是报错——
+        // 面板轮询不该因为一条脏边整页失败。
+        if (leftRow === undefined || rightRow === undefined) continue
+        items.push({ left: rowToRecord(leftRow), right: rowToRecord(rightRow), createdAt: row.created_at })
+      }
+      return { items, total }
+    },
+
+    async resolveConflict(left: MemoryId, right: MemoryId, action: ConflictAction): Promise<void> {
+      const at = Date.now()
+      withTransaction(() => {
+        // 两个方向都删：contradicts 语义上无向，写入侧可能任一方向建过边。
+        sqlDeleteConflictEdge.run(String(left), String(right), String(right), String(left))
+        // keep-*：输家归档（保留可审计）；drop-both：两端都归档；keep-both：只解除冲突标记。
+        // 注意这里只置 status，不打 invalid_at——裁决不是「被取代」，历史条目在 asOf 视图中仍应可见。
+        if (action === 'keep-left' || action === 'drop-both') sqlSetStatus.run('archived', String(right))
+        if (action === 'keep-right' || action === 'drop-both') sqlSetStatus.run('archived', String(left))
+        // 契约 §6：target=BATCH、detail={left,right,action}——面板「冲突裁决历史」的数据源。
+        sqlLog.run(at, 'conflict-resolve', 'BATCH', JSON.stringify({ left: String(left), right: String(right), action }))
+      })
     },
 
     async linkEdge(from: MemoryId, to: MemoryId, type: KyzmemEdgeType) {
@@ -1491,9 +1779,16 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
 
     async reinforce(id: MemoryId, note: string) {
       if (sqlGet.get(id) === undefined) return undefined
-      sqlTouch.run(Date.now(), id)
+      sqlTouch.run(Date.now(), JSON.stringify([String(id)]))
       sqlLog.run(Date.now(), 'write-merge', id, note)
       return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
+    },
+
+    async reinforceCitation(id: MemoryId, delta = 0.02): Promise<void> {
+      // 证据引用强化：被 kyzmem_assess 当作 sufficient 证据引用过的条目，置信度小幅提升。
+      // 只动 confidence——access_count/last_retrieved_at 是「被检索命中」的计数，
+      // 把引用混进去会让 proof 因子与 recency 同时失真。id 缺失时静默（可能被并发删除）。
+      sqlReinforceCitation.run(delta, id)
     },
 
     async supersedeMany(input: WriteInput, oldIds: readonly MemoryId[]) {
@@ -1507,7 +1802,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         const automationFields = applyWriteAutomation(input, id, at, input.imagery)
         insertRecord(id, { ...input, ...automationFields }, content, input.importance ?? 0.5, input.confidence ?? 0.5, at, input.sourceSessionId ?? null, input.embedding ?? null, input.imagery, 'distill')
         for (const oldId of oldIds) {
-          sqlSetStatus.run('archived', at, oldId)
+          // 蒸馏取代也是「失效」：置 archived + 打 invalid_at，时点检索才能还原蒸馏前的碎片态。
+          sqlMarkInvalid.run(at, oldId)
           sqlEdgeUpsert.run(id, oldId, 'supersedes', at)
         }
       })
@@ -1755,11 +2051,7 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
     },
 
     async audit(op: string, targetId: string, detail: string | null) {
-      // detail 一律截断到 512 字符：调用方可能塞入整段提示词，而 op_log 是常读常扫的表。
-      const capped = detail === null || detail.length <= OP_LOG_DETAIL_MAX
-        ? detail
-        : `${detail.slice(0, OP_LOG_DETAIL_MAX)}…`
-      sqlLog.run(Date.now(), op, targetId, capped)
+      sqlLog.run(Date.now(), op, targetId, capDetail(detail))
     },
 
     async hasAudit(op: string, detail: string) {
@@ -1772,6 +2064,43 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
 
     async clearAudit(op: string, detail: string) {
       sqlClearAudit.run(op, detail)
+    },
+
+    async countAudit(op: string, since: number): Promise<number> {
+      return (sqlCountAudit.get(op, since) as unknown as { n: number }).n
+    },
+
+    async recentAudit(op: string, limit: number, targetId?: string): Promise<OperationLogRow[]> {
+      const boundedLimit = Math.max(1, Math.floor(limit))
+      const rows = (targetId === undefined
+        ? sqlAuditRecent.all(op, boundedLimit)
+        : sqlAuditRecentByTarget.all(op, targetId, boundedLimit)) as unknown as
+        { at: number; op: string; target_id: string; detail: string | null }[]
+      return rows.map(row => ({ at: row.at, op: row.op, targetId: row.target_id, detail: row.detail }))
+    },
+
+    async lastAuditAt(op: string): Promise<number | undefined> {
+      const row = sqlAuditLastAt.get(op) as unknown as { at: number | null } | undefined
+      // MAX(at) 对空集合返回「一行 NULL」而不是「无行」，两种形态都要当成「没有记录」。
+      return row === undefined || row.at === null ? undefined : row.at
+    },
+
+    async purgeOne(id: MemoryId): Promise<boolean> {
+      const row = getRow(id)
+      if (row === undefined) return false
+      const at = Date.now()
+      withTransaction(() => {
+        // 先留审计再删行：op_log 不引用 nodes（无外键），删完仍可追溯「删过什么」。
+        // 只记元信息不记正文——硬删的语义就是连内容都不留（与 forget 的 tombstone 相反）。
+        sqlLog.run(at, 'tombstone', String(id), JSON.stringify({ kind: row.kind, scope: row.scope, chars: row.content.length }))
+        sqlPurgeOneEdges.run(String(id), String(id))
+        sqlPurgeOneNodeEntities.run(String(id))
+        sqlPurgeOneRoute.run(String(id))
+        sqlPurgeOneRevisions.run(String(id))
+        sqlPurgeOneFts.run(String(id))
+        sqlPurgeOneNode.run(String(id))
+      })
+      return true
     },
 
     async purge() {
@@ -1788,6 +2117,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         sqlPurgeEntities.run()
         sqlPurgeFacts.run()
         sqlPurgeObservations.run()
+        // 批零遗留漏项：修订表不清会让「清空后仍能从修订历史读出正文」。
+        sqlPurgeRevisions.run()
       })
     },
 

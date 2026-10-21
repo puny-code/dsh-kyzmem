@@ -38,7 +38,9 @@ import type {
   HistoryBackfillDeps, HistoryBackfillRules, HistoryEstimate, HistoryLogSource, HistoryRunProgress, HistoryRunResult,
   HistorySessionHeader,
 } from './ingest/history.ts'
-import { runConsolidation } from './consolidation/run.ts'
+import { consolidateDatabases } from './consolidation/run.ts'
+import { configureMaintenance, isIdle, kickMaintenance, recordActiveDay } from './maintenance/scheduler.ts'
+import type { KickMaintenanceOptions } from './maintenance/scheduler.ts'
 import { reflectObservations } from './consolidation/reflect.ts'
 import type { IngestRequestEventData } from './ingest/hook.ts'
 import { parseJsonArray, routeFromEvents, streamText } from './llm/client.ts'
@@ -108,12 +110,14 @@ export function renderProfileDetailed(
   tokenBudget: number,
   language: KyzmemLanguage,
   itemBudget: GraduatedItemBudget = DEFAULT_ITEM_BUDGET,
+  /** 是否把固定的「怎么用工具」footnote 计入文本；注入路径把它移到协议标签外包（控制面外移）。 */
+  includeFooter = true,
 ): ProfileRender {
   const estimate = estimateTokens
   // 主厅：常驻核心记忆层（每次会话都在场），行内带宫殿坐标（房间 #桩位）让 agent 有位置感。
   const header = messageIn(language, 'core.profileHeader')
   const footer = messageIn(language, 'core.profileFooter')
-  let remaining = Math.max(0, tokenBudget - estimate(header) - estimate(footer))
+  let remaining = Math.max(0, tokenBudget - estimate(header) - (includeFooter ? estimate(footer) : 0))
   const lines: string[] = []
   const overflow: { id: string; kind: string; content: string }[] = []
   records.forEach((record, index) => {
@@ -145,7 +149,10 @@ export function renderProfileDetailed(
     }
   }
   if (more > 0 && remaining >= 0) lines.push(`+${more} more; use kyzmem_search`)
-  return { text: [header, ...lines, footer].join('\n'), overflow }
+  // footer 是控制面提示（「去调用工具」），注入路径要求放在 <memory_context> 标签之外，
+  // 由调用方拼到协议包外；纯渲染接口默认保留，供面板/测试复用。
+  const parts = includeFooter ? [header, ...lines, footer] : [header, ...lines]
+  return { text: parts.join('\n'), overflow }
 }
 
 /**
@@ -189,10 +196,12 @@ export function renderProfileWithCurated(
   tokenBudget: number,
   language: KyzmemLanguage,
   itemBudget: GraduatedItemBudget = DEFAULT_ITEM_BUDGET,
+  /** 是否保留 footnote（注入路径传 false，把控制面提示移到协议标签之外）。 */
+  includeFooter = true,
 ): ProfileRender {
-  if (curated === undefined) return renderProfileDetailed(records, tokenBudget, language, itemBudget)
+  if (curated === undefined) return renderProfileDetailed(records, tokenBudget, language, itemBudget, includeFooter)
   const curatedSection = `${messageIn(language, 'core.curatedHeader')}\n${curated.content}`
-  const detailed = renderProfileDetailed(records, Math.max(0, tokenBudget - estimateTokens(curatedSection)), language, itemBudget)
+  const detailed = renderProfileDetailed(records, Math.max(0, tokenBudget - estimateTokens(curatedSection)), language, itemBudget, includeFooter)
   return { text: `${curatedSection}\n${detailed.text}`, overflow: detailed.overflow }
 }
 
@@ -206,6 +215,81 @@ const OBSERVATION_INJECT_LIMIT = 3
 const OBSERVATION_INJECT_ITEM_CHARS = 120
 /** 信念区块总字符上限（独立于画像 token 预算，避免与画像互相挤压）。 */
 const OBSERVATION_INJECT_BLOCK_CHARS = 480
+/** 今日待回忆计数上限：超过该值只显示 N+（避免大库把提示行撑长）。 */
+const DUE_REVIEW_DISPLAY_CAP = 50
+/** 减载档（久未活跃）下重放 pending 摄取的条数上限。 */
+const IDLE_REPLAY_MAX_ITEMS = 3
+/** 采用率观测：这些工具被调用即视为 agent 回查过记忆证据。 */
+const RECALL_EVIDENCE_TOOLS = new Set(['kyzmem_assess', 'kyzmem_examine'])
+/** recall op_log detail 里 ids 数组的信任上限（detail 有 512 字截断，防御性封顶）。 */
+const MAX_RECALL_IDS = 64
+
+/** 从 recall 审计 detail 里取命中 id；格式漂移时返回空数组（退化为只按工具调用判定）。 */
+function parseRecallIds(detail: string | null): string[] {
+  if (detail === null) return []
+  try {
+    const parsed = JSON.parse(detail) as { ids?: unknown }
+    if (!Array.isArray(parsed.ids)) return []
+    return parsed.ids.filter((id): id is string => typeof id === 'string' && id !== '').slice(0, MAX_RECALL_IDS)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 上一轮是否用到了召回证据：recall 之后的 assistant 文本含任一命中 id，或调用了回查类工具。
+ * 这是「召回有没有被用上」唯一可得的信号——不追求精确归因，只做 used/ignored 二值统计。
+ */
+function recallWasUsed(events: readonly SessionEventLike[], ids: readonly string[], since: number): boolean {
+  for (const event of events) {
+    // recall 之前的历史轮次不算：只看这批证据之后产生的输出。
+    if (event.time !== undefined && event.time < since) continue
+    if (event.type === 'tool/call') {
+      const name = (event.data as { name?: unknown } | null)?.name
+      if (typeof name === 'string' && RECALL_EVIDENCE_TOOLS.has(name)) return true
+      continue
+    }
+    if (event.type !== 'assistant/message') continue
+    const content = (event.data as { content?: { type?: unknown; text?: unknown }[] } | null)?.content
+    for (const block of content ?? []) {
+      if (block?.type !== 'text') continue
+      const text = block.text
+      if (typeof text !== 'string') continue
+      if (ids.some(id => text.includes(id))) return true
+    }
+  }
+  return false
+}
+
+/**
+ * R1 采用率：step>1 开答前读最近一条 recall 审计，检查上一轮是否用上了那批证据，
+ * 写 op_log recall-used / recall-ignored（同一次 recall 只记一条，靠 state.lastRecallBatch 去重）。
+ * 为什么在 pre-step 而不是工具层：只有下一轮开始时才可能知道模型有没有引用证据。
+ */
+async function auditRecallAdoption(
+  openStore: (scope: KyzmemScope) => Promise<KyzmemStore>,
+  openStoreForProjectCwd: (cwd: string) => Promise<KyzmemStore>,
+  agent: Agent,
+  state: { lastRecallBatch: string | null },
+): Promise<void> {
+  const events = agent.session.snapshotEvents() as unknown as readonly SessionEventLike[]
+  const cwd = sessionCwd(agent.session)
+  // recall 写在检索实际落到的库里：私人库永远查；有 cwd 时再查当前项目库（少开会话不用的库）。
+  const stores: KyzmemStore[] = [await openStore('user')]
+  if (cwd !== undefined) stores.push(await openStoreForProjectCwd(cwd))
+  let latest: { store: KyzmemStore; at: number; ids: string[] } | undefined
+  for (const store of stores) {
+    const [row] = await store.recentAudit('recall', 1, 'BATCH')
+    if (row === undefined) continue
+    if (latest === undefined || row.at > latest.at) latest = { store, at: row.at, ids: parseRecallIds(row.detail) }
+  }
+  if (latest === undefined) return
+  const batch = `${String(latest.at)}#${latest.ids.join(',')}`
+  if (state.lastRecallBatch === batch) return
+  state.lastRecallBatch = batch
+  const used = recallWasUsed(events, latest.ids, latest.at)
+  await latest.store.audit(used ? 'recall-used' : 'recall-ignored', 'BATCH', JSON.stringify({ batch, ids: latest.ids }))
+}
 
 /**
  * 画像超预算的辅助压缩：把装不下的条目交给辅助 LLM 压短，返回 id → 压缩文本。
@@ -264,7 +348,17 @@ async function preStep(
   openStoreForProjectCwd: (cwd: string) => Promise<KyzmemStore>,
   resolved: ResolvedKyzmemConfig,
   embedder: Promise<KyzmemEmbedder | undefined>,
-  state: { pendingReplayed: boolean; lastProfileAgent: string | null; lastProfileHash: string | null; lastProfileCompactions: number | null; lastAssessReminder: string | null; route: LlmRoute | undefined },
+  state: {
+    pendingReplayed: boolean
+    lastProfileAgent: string | null
+    lastProfileHash: string | null
+    lastProfileCompactions: number | null
+    /** 上次注入的评估提醒去重键 = 最近批次 id + pending 批次数。 */
+    lastAssessReminder: string | null
+    /** 上次统计过采用率的 recall 批次（at + ids），避免同一批证据重复记账。 */
+    lastRecallBatch: string | null
+    route: LlmRoute | undefined
+  },
   logRequest: (data: IngestRequestEventData) => void,
   { agent, step, turn, signal }: { agent: Agent; step: number; turn: number; signal: AbortSignal },
   next: () => Promise<PreStepDecision>,
@@ -280,6 +374,20 @@ async function preStep(
   const mode = resolved.ingest
   // 写入路由：本会话有 cwd 时默认进项目宫殿、逐条采纳模型的 scope 判定；无 cwd 只能进私人宫殿。
   const routing = ingestWriteRouting(sessionCwd(agent.session), openStoreForProjectCwd, openStore)
+  // 活跃日 + 后台整理：apply 完成后、会话处置、每轮第一步三处触发（健康路由是第四处）。
+  // 先判 idle 再记活跃日——顺序反了，刚写下的今天会让「久未活跃」永远为假。
+  let idle = false
+  if (step === 1) {
+    try {
+      const activeStore = await openStore('user')
+      idle = await isIdle(activeStore, resolved.maintenance.idleDays)
+      await recordActiveDay(activeStore)
+    } catch (error) {
+      console.warn(message('core.warnMaintenanceFailed'), error)
+    }
+    // 幂等 + fire-and-forget：scheduler 内部按欠账阈值与频率下限决定是否真跑，绝不阻塞本步。
+    kickMaintenance()
+  }
   if (step === 1 && mode !== 'off') {
     // 重放待补做的末轮摄取（上次会话 disposed 失败/超时的 pending 键）。
     if (!state.pendingReplayed) {
@@ -294,6 +402,10 @@ async function preStep(
         call: params => streamText(ctx, { ...params, sessionId: agent.session.id }),
         logRequest,
         signal,
+        ttlDaysByKind: resolved.ttlDaysByKind,
+        ingestDeadLetterAttempts: resolved.ingestDeadLetterAttempts,
+        // 减载档：久未活跃时只补最近的几条 pending，别在用户回来第一轮就补一堆。
+        ...(idle ? { maxItems: IDLE_REPLAY_MAX_ITEMS } : {}),
       }).catch((error: unknown) => {
         console.warn(message('core.warnReplayPendingFailed'), error)
       })
@@ -313,19 +425,33 @@ async function preStep(
         call: params => streamText(ctx, { ...params, sessionId: agent.session.id }),
         logRequest,
         signal,
+        ttlDaysByKind: resolved.ttlDaysByKind,
       }).catch((error: unknown) => {
         console.warn(message('core.warnIngestPreviousFailed'), error)
       })
     }
   }
+  // R1 采用率：step>1 时检查上一轮 recall 之后模型有没有用那批证据（失败不影响对话）。
+  if (step > 1) {
+    try {
+      await auditRecallAdoption(openStore, openStoreForProjectCwd, agent, state)
+    } catch (error) {
+      // 统计是旁路观测：宿主 fail-loud，必须就地吞掉。
+      console.warn(message('core.warnRecallAuditFailed'), error)
+    }
+  }
   if (step !== 1 && resolved.assessReminder) {
     // 证据门收尾提醒：本会话存在未判定批次时在下一步开始前提醒（插件层注入，
-    // 不动 agent-loop）；同一文本不重复注入，判定完成或批次清空后自然停发。
+    // 不动 agent-loop）；去重键 = 最近批次 id + pending 批次数——批次一变就重新提醒，
+    // 批次判定完（pending 变少/清空）自然停发。文本比较会让「同文案新批次」漏提醒。
     const sessionId = String(agent.session.id)
-    const pending = evidenceBatches.pendingBatches(sessionId).length
+    const pendingBatches = evidenceBatches.pendingBatches(sessionId)
+    const pending = pendingBatches.length
+    const latestBatchId = pendingBatches[pending - 1]?.batchId ?? '-'
+    const reminderKey = `${latestBatchId}#${String(pending)}`
     const reminder = buildAssessReminder(pending, evidenceBatches.insufficientStreak(sessionId))
-    if (reminder !== undefined && reminder !== state.lastAssessReminder) {
-      state.lastAssessReminder = reminder
+    if (reminder !== undefined && reminderKey !== state.lastAssessReminder) {
+      state.lastAssessReminder = reminderKey
       return {
         ...decision,
         messages: [
@@ -352,7 +478,15 @@ async function preStep(
   const store = await openStore('user')
   // curated block：kyzmem_profile_edit 维护的画像段，优先于自动派生画像注入。
   const curated = await store.getProfileBlock('user')
-  const top = await store.topActive('user', resolved.profileTopN)
+  // 注入候选过滤：过期条目（expires_at ≤ now）与不可信 tier（不在 resolved.injectTiers）不进常驻画像。
+  // 为什么在入口过滤而不是改 SQL：injectTiers 是运行期配置，topActive 还要被面板与工具复用；
+  // 多取 3 倍候选再截断，避免过滤后画像空掉（高排名条目可能恰好全是过期/不可信）。
+  const now = Date.now()
+  const injectTiers = new Set<string>(resolved.injectTiers)
+  const top = (await store.topActive('user', Math.max(resolved.profileTopN * 3, resolved.profileTopN)))
+    .filter(record => (record.expiresAt === undefined || record.expiresAt > now)
+      && injectTiers.has(record.sourceTier ?? 'agent-inferred'))
+    .slice(0, resolved.profileTopN)
   if (top.length === 0 && curated === undefined) return decision
   // 今日待回忆提示（检索练习调度）：有到期条目时在画像末尾附一行，引导 agent 主动自测。
   // user + project 两库合并计数；50 为计数上限（超过显示 50+）。
@@ -366,6 +500,8 @@ async function preStep(
     resolved.injectTokenBudget,
     resolved.language,
     { start: resolved.injectItemBudgetStart, decay: resolved.injectItemBudgetDecay, floor: resolved.injectItemBudgetFloor },
+    // 控制面外移：footnote 不进 <memory_context>，在下面拼到协议包之后。
+    false,
   )
   let text = detailed.text
   // 超预算压缩：装不下的条目交给辅助 LLM 压短后重渲染；失败保持索引行降级不变。
@@ -383,36 +519,49 @@ async function preStep(
         resolved.injectTokenBudget,
         resolved.language,
         { start: resolved.injectItemBudgetStart, decay: resolved.injectItemBudgetDecay, floor: resolved.injectItemBudgetFloor },
+        false,
       ).text
     }
   }
   // 巩固信念区块：active 信念按证据数/新近度取前 N，拼入同一份画像包；
   // stale/refuted 不注入。区块独立于画像预算（固定硬上限），信念更新后画像 hash 变化自然触发重注。
-  const observations = await store.listObservations({ status: 'active', limit: OBSERVATION_INJECT_LIMIT })
+  const observations = (await store.listObservations({ status: 'active', limit: OBSERVATION_INJECT_LIMIT }))
+    .slice(0, OBSERVATION_INJECT_LIMIT)
   if (observations.length > 0) {
-    const block = [
+    const lines = [
       message('core.observationsHeader'),
       ...observations.map(observation =>
         message('core.observationItem', {
           belief: observation.belief.slice(0, OBSERVATION_INJECT_ITEM_CHARS),
           count: observation.proofCount,
         })),
-    ].join('\n').slice(0, OBSERVATION_INJECT_BLOCK_CHARS)
+    ]
+    // 硬上限（3 条 / 单条 120 字 / 整块 480 字）是契约面：格式化串被改坏时断言告警 + 截断，
+    // 注入路径绝不能因为「条目变长」把上下文撑爆。
+    let block = lines.join('\n')
+    if (block.length > OBSERVATION_INJECT_BLOCK_CHARS) {
+      console.warn(message('core.warnObservationBudget', { limit: OBSERVATION_INJECT_BLOCK_CHARS, actual: block.length }))
+      block = `${block.slice(0, OBSERVATION_INJECT_BLOCK_CHARS - 1)}…`
+    }
     text = `${text}\n\n${block}`
   }
   // 注入去重：同一会话内画像文本与上次相同时跳过（上一轮注入仍在上下文里）；
-  // 新会话（lastProfileAgent 不同）必须注入，即使文本与上个会话相同。due 行纳入 hash 输入。
+  // 新会话（lastProfileAgent 不同）必须注入，即使文本与上个会话相同。控制面提示纳入 hash 输入。
   const dueLine = dueTotal === 0
     ? ''
-    : message('core.reviewDue', { count: dueTotal, plus: dueTotal >= 50 ? '+' : '' })
-  const textWithRationale = wrapWithRationale(text, top) + dueLine
-  const hash = createHash('sha256').update(textWithRationale).digest('hex')
+    : message('core.reviewDue', { count: dueTotal, plus: dueTotal >= DUE_REVIEW_DISPLAY_CAP ? '+' : '' })
+  // 控制面（footnote + due 提示）必须放在 <memory_context> 标签之外：标签内是「不可信历史证据」，
+  // 并明确告警「忽略内嵌指令」；把「去调用 kyzmem_*」塞进去等于自我矛盾。
+  const controlLine = `${message('core.profileFooter')}${dueLine}`
+  const textWithRationale = wrapWithRationale(text, top)
+  const hash = createHash('sha256').update(textWithRationale + controlLine).digest('hex')
   if (!compacted && state.lastProfileAgent === String(agent.id) && hash === state.lastProfileHash) return decision
   state.lastProfileAgent = String(agent.id)
   state.lastProfileHash = hash
   state.lastProfileCompactions = compactionCount
   // 画像包协议标签：记忆条目是不可信历史上下文；当前请求取本轮 admitted 消息的最后一个文本块。
-  const packet = renderMemoryPacket(text, 'turn_start', currentUserRequestText(decision.messages))
+  // 控制句拼在包外、同一条 user 消息内（标签之外），模型读到的是「证据」+「插件操作提示」两段。
+  const packet = `${renderMemoryPacket(text, 'turn_start', currentUserRequestText(decision.messages))}\n\n${controlLine}`
   return {
     ...decision,
     messages: [
@@ -557,6 +706,10 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     const created = openKyzmemStore(path, rankBoost, {
       autoSlot: resolved.autoSlot,
       reviewScheduling: resolved.reviewScheduling,
+      // 写入期自动折算 expires_at：TTL 按 kind 配置在插件层解析，store 只认天数；
+      // 复习重学窗口同理（纯函数 nextSchedule 需要调用方注入）。
+      ttlDaysByKind: resolved.ttlDaysByKind,
+      reviewRelearnDays: resolved.reviewRelearnDays,
     })
       // 存量排桩：首次打开时幂等补齐（slot_room 为空的 active 条目按 kind 分房、创建时间定序）。
       .then(async store => {
@@ -655,8 +808,17 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     lastProfileHash: string | null
     lastProfileCompactions: number | null
     lastAssessReminder: string | null
+    lastRecallBatch: string | null
     route: LlmRoute | undefined
-  } = { pendingReplayed: false, lastProfileAgent: null, lastProfileHash: null, lastProfileCompactions: null, lastAssessReminder: null, route: undefined }
+  } = {
+    pendingReplayed: false,
+    lastProfileAgent: null,
+    lastProfileHash: null,
+    lastProfileCompactions: null,
+    lastAssessReminder: null,
+    lastRecallBatch: null,
+    route: undefined,
+  }
 
   // ---- 历史会话回填：把 dsh 持久化的历史会话逐轮摄取进宫殿（面板「历史回填」tab / kyzmem_ingest_history）----
   /** 会话持久化服务（可选；缺席时历史回填不可用）。 */
@@ -867,6 +1029,9 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     queryRewrite: resolved.queryRewrite,
     exportDir: `${resolved.dbDir}/exports`,
     language: resolved.language,
+    // 召回输出预算：配置面在插件层解析（单条上限 / 总字符预算），工具层只接收数值。
+    recallPerItem: resolved.recallPerItem,
+    recallTotal: resolved.recallTotal,
     historyBackfill: { estimate: historyApi.estimate, run: historyApi.run },
   })) {
     ctx.tools.register(tool)
@@ -1018,62 +1183,56 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     })
   }
 
-  // 衰减调度：启动即跑一次，此后每 24 小时一次；低重要性且长期未访问的条目归档（可恢复）。
-  const runDecay = async (): Promise<void> => {
-    const targets: { label: string; open: () => Promise<KyzmemStore> }[] = [
-      { label: 'user', open: () => openStore('user') },
-    ]
-    // 项目宫殿可能不止一个（每个工作区一个）：只处理库文件已存在的，避免为工作区建空库。
-    for (const palace of await projectPalaces()) {
-      if (!existsSync(join(resolved.dbDir, palace.dbName))) continue
-      targets.push({ label: message('core.decayTargetProject', { title: palace.title }), open: () => openDb(palace.dbName) })
-    }
-    for (const target of targets) {
-      const archived = await (await target.open()).decay({
-        olderThanDays: resolved.decayAfterDays,
-      })
-      if (archived > 0) console.warn(message('core.warnDecayArchived', { label: target.label, count: archived }))
-    }
-  }
-  void runDecay().catch((error: unknown) => {
-    console.warn(message('core.warnDecayStartupFailed'), error)
-  })
-  ctx.effect(
-    () => {
-      const timer = setInterval(() => {
-        void runDecay().catch((error: unknown) => {
-          console.warn(message('core.warnDecayPeriodicFailed'), error)
-        })
-      }, 24 * 60 * 60 * 1000)
-      return () => { clearInterval(timer) }
+  // ---- 后台整理调度（替代原先两个 24 小时 setInterval）----
+  // 为什么删定时器：长驻进程 + 多次装载/恢复会叠加多个定时器（同一任务被重复跑），
+  // 而且固定节拍不看欠账（没东西可做也照跑）。改为「事件驱动 + 欠账判定 + 任务轮转」：
+  // 每次 kick 先算欠账，只跑确实欠账的任务的一个小轮，并受「≥1 天频率下限」与
+  // 「5 分钟单飞租约」约束；久未活跃时自动进入减载档（更小的条目预算）。
+  const maintenanceOptions: KickMaintenanceOptions = {
+    openStore,
+    budget: {
+      ms: resolved.maintenance.budgetMs,
+      items: resolved.maintenance.budgetItems,
+      llmCalls: resolved.maintenance.budgetLlmCalls,
     },
-    'dsh-kyzmem: decay timer',
-  )
-
-  // 闭馆整理调度：启动一次 + 每日一次；嵌入不可用时仅归档 + 启发式去重，整理结果写 op_log 'consolidation'。
-  const runConsolidateOnce = async (): Promise<void> => {
-    try {
-      const store = await openStore('user')
-      const report = await runConsolidation(store, embedder, {
-        olderThanDays: resolved.decayAfterDays,
-        importanceBelow: 0.3,
+    idleDays: resolved.maintenance.idleDays,
+    enabled: resolved.maintenance.enabled,
+    olderThanDays: resolved.decayAfterDays,
+    language: resolved.language,
+    embedder,
+    // 合并任务要覆盖「本机上所有宫殿」：user.db + 全部 project-*.db。
+    // 只整理 user.db 会让项目宫殿的重复记忆永远不被合并（多库逐个整理由 consolidation 层负责）。
+    consolidate: async (_store, maxItems, deadline) => {
+      const report = await consolidateDatabases({
+        dbDir: resolved.dbDir,
+        open: dbName => openDb(dbName),
+        embedder,
+        options: {
+          olderThanDays: resolved.decayAfterDays,
+          importanceBelow: 0.3,
+          maxRecords: maxItems,
+          deadline,
+        },
       })
-      console.log(message('core.logConsolidationDone', {
-        archived: report.archived,
-        merged: report.merged,
-        skipped: report.skipped,
-        ms: report.tookMs,
-      }))
-    } catch (error) {
-      console.warn(message('core.warnConsolidationFailed'), error)
-    }
-  }
-  void runConsolidateOnce()
-  ctx.effect(
-    () => {
-      const timer = setInterval(() => { void runConsolidateOnce() }, 24 * 60 * 60 * 1000)
-      return () => { clearInterval(timer) }
+      if (report.failures.length > 0) {
+        console.warn(message('core.warnConsolidationFailed'), report.failures.join(', '))
+      }
+      if (report.databases > 0) {
+        console.log(message('core.logConsolidationDone', {
+          archived: report.archived,
+          merged: report.merged,
+          skipped: report.skipped,
+          ms: report.tookMs,
+        }))
+      }
+      return report.merged
     },
-    'dsh-kyzmem: consolidation timer',
-  )
+  }
+  // 模块级配置：路由（health 面板 /api/kyzmem/maintenance/kick）与 pre-step 都是零参调用，
+  // 依赖面在这里一次性注入；重复 apply（测试/热重载）时以最后一次为准。
+  configureMaintenance(maintenanceOptions)
+  // 触发点一：装载完成后的下一个 tick（不阻塞 apply 返回；kick 内部幂等且自吞异常）。
+  setImmediate(() => { kickMaintenance() })
+  // 触发点二：会话关闭——末轮摄取/反思之后的自然整理时机（同样幂等）。
+  ctx.on('session/disposed', () => { kickMaintenance() })
 }

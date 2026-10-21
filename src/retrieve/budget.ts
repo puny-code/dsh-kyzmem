@@ -1,23 +1,31 @@
 /**
- * 召回输出的字符预算：单条与总量双重截断，控制记忆正文占用的模型上下文
- * （协议内定值，对齐同类记忆插件的单轮召回配额，非部署可变项）。
+ * 召回输出的字符预算：单条与总量双重截断，控制记忆正文占用的模型上下文。
+ *
+ * 为什么分成两档上限：v0.11.0 起「召回类」输出（索引/时间线/全文检索）的单条上限
+ * 由部署配置 `recallPerItem` 下发（缺省 160 字：索引视图本来就不该带整段正文），
+ * 而复习历史、巡游摘要这类「给人看的过程记录」不受该配置约束，继续用较宽的
+ * RENDER_PER_ITEM_CHARS。两者混用一个常量会让调小召回预算的人意外截断面板文案。
+ *
  * @module dsh-kyzmem/retrieve/budget
  */
 
 import { message } from '../i18n/messages.ts'
 
-/** 单条召回行最大字符数（超长截断加省略号）。 */
-export const RECALL_PER_ITEM_CHARS = 1200
+/** 召回类输出单条内容的最大字符数（配置 `recallPerItem` 的缺省值，160）。 */
+export const RECALL_PER_ITEM_CHARS = 160
 
-/** 单次召回输出正文的总字符预算（含 id 与元信息行）。 */
+/** 单次召回输出正文的总字符预算（配置 `recallTotal` 的缺省值，4800）。 */
 export const RECALL_TOTAL_CHARS = 4800
+
+/** 非召回类（复习历史、巡游摘要等）渲染的单条上限；不跟随部署配置，保持旧行为。 */
+export const RENDER_PER_ITEM_CHARS = 1200
 
 /**
  * 截断单条文本到 maxChars（超长加省略号）。
  * @param text - 原文。
- * @param maxChars - 上限，默认 RECALL_PER_ITEM_CHARS。
+ * @param maxChars - 上限；缺省 RENDER_PER_ITEM_CHARS（非召回类旧行为）。
  */
-export function truncateItem(text: string, maxChars: number = RECALL_PER_ITEM_CHARS): string {
+export function truncateItem(text: string, maxChars: number = RENDER_PER_ITEM_CHARS): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}…`
 }
 
@@ -59,4 +67,13 @@ export function enforceBudget(lines: readonly string[], totalBudget: number = RE
   const { kept, dropped } = fitWithinBudget(lines, line => line.length, totalBudget)
   if (dropped > 0) kept.push(message('store.budgetDropped', { count: dropped }))
   return kept
+}
+
+/**
+ * 召回类输出的单条截断（走部署配置的 `recallPerItem`）。
+ * @param text - 原文。
+ * @param recallPerItem - 配置值；缺省 RECALL_PER_ITEM_CHARS。
+ */
+export function truncateRecallItem(text: string, recallPerItem: number = RECALL_PER_ITEM_CHARS): string {
+  return truncateItem(text, recallPerItem)
 }

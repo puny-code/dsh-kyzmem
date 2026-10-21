@@ -53,6 +53,21 @@ export type KyzmemKind = 'fact' | 'preference' | 'decision' | 'episode' | 'skill
 /** 条目状态：active 参与检索；archived（衰减/被取代）不参与检索、可恢复；forgotten 软删、可恢复。 */
 export type KyzmemStatus = 'active' | 'archived' | 'forgotten'
 
+/**
+ * 来源分级（schema v15，R4）：谁说的这条记忆。
+ * user-confirmed = 用户明确确认（面板/工具显式确认）；agent-inferred = 模型从对话推断；
+ * tool-output = 从工具输出/命令结果抄来的（易被伪造，默认不进画像）；web-content = 网页抓取（同前）。
+ */
+export type KyzmemSourceTier = 'user-confirmed' | 'agent-inferred' | 'tool-output' | 'web-content'
+
+/** 全部合法来源分级（配置校验/面板过滤用）。 */
+export const SOURCE_TIERS: readonly KyzmemSourceTier[] = ['user-confirmed', 'agent-inferred', 'tool-output', 'web-content']
+
+/** 是否为默认参与画像注入的分级（用户确认 + 模型推断；工具输出/网页内容须显式确认）。 */
+export function isTrustedTier(tier: KyzmemSourceTier | undefined): boolean {
+  return tier === undefined || tier === 'user-confirmed' || tier === 'agent-inferred'
+}
+
 /** 关系边类型。supersedes 语义：from 取代 to。 */
 export type KyzmemEdgeType = 'supports' | 'contradicts' | 'refines' | 'related' | 'supersedes'
 
@@ -130,6 +145,16 @@ export interface MemoryRecord {
   readonly imageryScore?: number
   /** 间隔重复调度（schema v6 起；未进入调度时缺省）。 */
   readonly review?: ReviewSchedule
+  /** 失效时刻（schema v15 起）：被取代/更新时打点，检索默认过滤；缺省 = 仍有效。 */
+  readonly invalidAt?: number
+  /** 过期时刻（schema v15 起，TTL）：缺省 = 永不过期；过期条目降权不硬过滤。 */
+  readonly expiresAt?: number
+  /** 来源分级（schema v15 起）；缺省视为 agent-inferred。 */
+  readonly sourceTier?: KyzmemSourceTier
+  /** 最近一次被检索命中时刻（schema v15 拆时钟）；缺省回退 lastAccessedAt。 */
+  readonly lastRetrievedAt?: number
+  /** 最近一次复习/效果回报时刻（schema v15 拆时钟）；缺省回退 lastAccessedAt。 */
+  readonly lastReviewedAt?: number
 }
 
 /** 记忆关系边。 */
@@ -267,6 +292,10 @@ export interface WriteInput {
   /** 初始复习排期：毫秒时间戳 = 指定首次到期；null = 明确不进入复习调度（历史回填用，
    *  避免一次性回填的条目同时涌入今日复习队列）；缺省 = 由写入期自动化决定。 */
   readonly initialReviewAt?: number | null
+  /** 过期时刻（schema v15 TTL）；缺省 = 由写入期按 kind 的 TTL 自动计算（0 天 = 不过期）。 */
+  readonly expiresAt?: number
+  /** 来源分级（schema v15）；缺省 = agent-inferred。 */
+  readonly sourceTier?: KyzmemSourceTier
 }
 
 /** 检索请求。 */
@@ -279,6 +308,8 @@ export interface SearchQuery {
    * 缺省全库检索；未排桩（slot_room 为空）的条目不属于任何房间，指定 rooms 时不出现。
    */
   readonly rooms?: readonly string[]
+  /** 时点检索（schema v15）：只看该时刻仍有效的条目（created_at <= asOf 且未失效）。 */
+  readonly asOf?: number
 }
 
 /** 一条检索命中。 */
@@ -291,15 +322,32 @@ export interface SearchHit {
   /** 经关系边一跳扩展引入时，来源条目 id 与边类型。 */
   readonly viaEdge?: { readonly from: MemoryId; readonly type: KyzmemEdgeType }
   /** 编码特异性线索（schema v6 起）：同房间相邻桩位的条目 id——提取时重建编码情境。 */
-  readonly cues?: { readonly neighbors: readonly MemoryId[] }
+  readonly cues?: {
+    readonly neighbors: readonly MemoryId[]
+    /** 与该条目存在 contradicts 边的条目 id（schema v15 起）：只提示不计分，供模型自行判断。 */
+    readonly contradicts?: readonly MemoryId[]
+  }
   /** 命中条目关联的实体（schema v10 起；无关联时缺省）。 */
   readonly entities?: readonly { readonly id: EntityId; readonly name: string }[]
+  /** TTL 已过期（schema v15 起）：仍可命中但已降权，渲染时标 [已过期]。 */
+  readonly expired?: boolean
+}
+
+/** 单条检索通道的统计（schema v15，批四）：面板"检索通道"表数据源。 */
+export interface SearchChannelStat {
+  readonly channel: 'fts' | 'vector' | 'graph'
+  readonly tookMs: number
+  readonly hits: number
+  /** 该道降级（如无查询向量时的向量道）。 */
+  readonly degraded: boolean
 }
 
 /** 检索结果：degraded=true 表示嵌入缺失/失败，仅关键词道参与排序。 */
 export interface SearchResult {
   readonly hits: readonly SearchHit[]
   readonly degraded: boolean
+  /** 各检索道统计（schema v15 起；旧调用方缺省不读）。 */
+  readonly channels?: readonly SearchChannelStat[]
 }
 
 /** 时间线查询。since/until 为 epoch 毫秒；topic 为子串匹配。 */
@@ -478,6 +526,16 @@ export interface StoreStats {
   readonly edges: number
   readonly opLogCount: number
   readonly signalRatio: number
+  /** TTL 已过期但仍 active 的条目数（schema v15）。 */
+  readonly expired?: number
+  /** 已失效（invalid_at 非空）的条目数（schema v15）。 */
+  readonly invalidated?: number
+  /** 按来源分级的计数（schema v15，R4）。 */
+  readonly byTier?: Readonly<Record<string, number>>
+  /** 待裁决冲突对数量（contradicts 边去重后的端点数，schema v15）。 */
+  readonly openConflicts?: number
+  /** 今日到期复习条目数（schema v15）。 */
+  readonly dueCount?: number
 }
 
 /** 全库导出（数据可携带：任意状态条目 + 全部边）。 */
@@ -540,6 +598,50 @@ export interface ImportResult {
 export interface DecayOptions {
   readonly olderThanDays: number
   readonly reviewGraceDays?: number
+  /** 单次最多归档条数（减载档用，schema v15）；缺省不限。 */
+  readonly limit?: number
+}
+
+/** 冲突的处置动作（schema v15 批一：defer 产生的 contradicts 边终于有了裁决出口）。 */
+export type ConflictAction = 'keep-left' | 'keep-right' | 'keep-both' | 'drop-both'
+
+/** 一对待裁决冲突：left/right 为 contradicts 边两端。 */
+export interface ConflictPair {
+  readonly left: MemoryRecord
+  readonly right: MemoryRecord
+  /** 冲突边建立时刻。 */
+  readonly createdAt: number
+}
+
+/** 待裁决冲突列表。 */
+export interface ConflictListResult {
+  readonly items: readonly ConflictPair[]
+  readonly total: number
+}
+
+/** 后台整理任务种类（批三：欠账偿还状态机，取代夜间定时）。 */
+export type MaintenanceJob = 'decay' | 'merge' | 'refurb'
+
+/** 后台整理欠账快照：决定"该不该跑"，不依赖钟点。 */
+export interface MaintenanceDebt {
+  /** 近 7 天新增条目 / 当前 active 总量（0-1，缺分母时为 0）。 */
+  readonly activeGrowth: number
+  /** 待裁决冲突对数量。 */
+  readonly openConflicts: number
+  /** 已到期复习条目数。 */
+  readonly dueReviews: number
+  /** 未清 pending 摄取轮数。 */
+  readonly pendingIngests: number
+  /** 缺失的会话摘要数（暂以 0 表示未接）。 */
+  readonly missingSummaries: number
+}
+
+/** 一次后台整理运行的结果（写 op_log 'maintenance-run'）。 */
+export interface MaintenanceRunResult {
+  readonly job: MaintenanceJob
+  readonly items: number
+  readonly ms: number
+  readonly debt: MaintenanceDebt
 }
 
 /** 闭馆三问的答案（墓志铭）。写入 op_log 的 forget 详情，方便 kyzmem_audit_forgotten 考古。 */
@@ -574,6 +676,8 @@ export interface ListFilter {
   readonly q?: string
   /** 脱敏标记过滤：true 只看含 `[REDACTED:` 的条目，false 只看不含的；缺省不过滤。 */
   readonly redacted?: boolean
+  /** 只看受信来源（user-confirmed + agent-inferred，schema v15 R4）。 */
+  readonly confirmedOnly?: boolean
   /** 排序：缺省 created_at 倒序；'tour' = 按固定巡游路线桩位顺序（未上路线者按创建时间排末尾）。 */
   readonly sort?: 'tour'
   readonly limit: number

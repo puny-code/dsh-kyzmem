@@ -80,6 +80,7 @@ export const zh = {
   'tool.saveAcceptedText': '已保存记忆 {id}（kind={kind}, importance={importance}{slot}）。后续会话可用 kyzmem_search 召回。',
   'tool.saveDroppedChitchat': '未写入：内容是寒暄或空话，没有可复用的信息。',
   'tool.saveDroppedDuplicate': '未写入：与库内已有条目逐字相同，无需重复记录。',
+  'tool.saveDroppedNearDuplicate': '未写入：与库内已有条目近重复（内容几乎相同，仅 kind 不同）。若确实需要独立记录，请换一种表述；想找已有条目请用 kyzmem_search。',
   'tool.saveBatchDropped': '另有 {count} 条因寒暄或逐字重复未写入',
   'tool.saveMergeText': '与既有记忆高度重复（相似度 {similarity}），已并入 {mergedInto} 并强化其置信度与访问计数，未新建条目。若这是修正而非复述，请用 kyzmem_update 归并。',
   'tool.saveDeferText': '已保存 {id}。注意：与现有记忆高度相似——{listed}。若这是修正而非新事实，请用 kyzmem_update 归并，或 kyzmem_forget 去重。{placardHint}',
@@ -135,6 +136,14 @@ export const zh = {
   'tool.searchAsOfPrefix': '（时点回看：行尾「时点事实」为关联实体在 {date} 仍有效的事实快照）\n',
   'tool.searchBatchNote': '\n批次 {batchId}（{count} 条可引用证据）：作答前用 kyzmem_assess 判定证据是否充分，evidenceRefs 只能引用上面的 ref。',
   'tool.searchNoHits': '无命中',
+  'tool.searchModeDescription': '渲染模式：index（默认，只回元信息行——坐标/日期/门牌/线索/id，不含正文，省上下文；需要原文时按末尾提示用 kyzmem_examine 取）；timeline（按创建时间升序，附来源会话摘要线索，回答「那段时间发生了什么」）；full（带正文，只在需要逐条精读时用，最费上下文）',
+  'tool.searchPlacard': ' 门牌: {placard}',
+  'tool.searchSessionCue': '会话线索: {summary}',
+  'tool.searchExpired': '[已过期]',
+  'tool.searchTierTool': '[未确认:tool]',
+  'tool.searchTierWeb': '[未确认:web]',
+  'tool.searchConflictCue': '与 {ids} 冲突待裁决',
+  'tool.searchExamineHint': '以上只含元信息（不含正文）。需要原文时：kyzmem_examine ids=[{ids}]',
 
   // ---- Схема и результат kyzmem_facts ----
   'tool.factsDescription': '实体事实链：查询某实体的时序事实（asOf 时点回看 / includeInvalid 全链展开），或写入与修正事实（facts 数组）。事实是关于具体实体的一条客观陈述（状态/归属/关系/数据）。修正过时事实时传 replaces=旧事实 id：旧事实软失效、新事实接棒，历史链保留——不要反复保存互相矛盾的事实，用取代链表达演变。',
@@ -223,6 +232,7 @@ export const zh = {
   'tool.forgetAffectsDescription': '影响哪些条目/人/项目，空串表示不适用',
   'tool.forgetStillUsefulDescription': '遗留价值：可考古 / 可复习 / 回滚时如何理解',
   'tool.forgetRendered': '记忆 {id} 已闭馆（软删，可恢复），墓志铭已刻入操作日志。',
+  'tool.forgetRestoreHint': '删错了可在面板「已遗忘」列表里重开（恢复）。',
   'tool.forgetTombstoneRequired': 'kyzmem_forget: 闭馆三问（reason / affects / stillUseful）都必须填写，方便日后考古',
 
   // ---- Схема kyzmem_ingest_history ----
@@ -305,6 +315,7 @@ export const zh = {
   'tool.exportMarkdownEdges': '## 关系边',
   'tool.exportWritten': '{path}（{records} 条记忆，{edges} 条边{redacted}）',
   'tool.exportDone': '已导出{redacted}:\n{paths}',
+  'tool.exportSecretWarning': '⚠ 警告：{scopes} 作用域的导出内容里仍有未脱敏的密钥/凭据。分享或提交前请先脱敏，或用 redactedView=true 重新导出。\n',
   'tool.exportRedactedView': '（脱敏视图）',
   'tool.importDescription': '从 dsh-kyzmem 导出文件导入记忆：JSON（kyzmem_export format=json 的产物，无损）或导出 Markdown（有损回解析，缺省按扩展名自动识别）。先 dryRun=true 预览分类（新增/重复/冲突），确认后正式导入；导入条目自动就地补嵌入。',
   'tool.importPathDescription': '导出文件的绝对路径（kyzmem_export 的 JSON 或 Markdown 产物）',
@@ -467,6 +478,7 @@ export const en = {
   'tool.saveAcceptedText': 'Saved memory {id} (kind={kind}, importance={importance}{slot}). Later sessions can recall it with kyzmem_search.',
   'tool.saveDroppedChitchat': 'Not saved: the content is pure chitchat with no reusable information.',
   'tool.saveDroppedDuplicate': 'Not saved: verbatim identical to an existing memory, no need to record it twice.',
+  'tool.saveDroppedNearDuplicate': 'Not saved: near-duplicate of an existing memory (nearly identical content, only the kind differs). If you really need a separate record, rephrase it; use kyzmem_search to find the existing entry.',
   'tool.saveBatchDropped': 'and {count} more were skipped as chitchat or verbatim duplicates',
   'tool.saveMergeText': 'Highly duplicated with an existing memory (similarity {similarity}); merged into {mergedInto} and reinforced its confidence and visit count; no new entry was created. If this is a correction rather than a restatement, merge it with kyzmem_update.',
   'tool.saveDeferText': 'Saved {id}. Note: highly similar to existing memories — {listed}. If this is a correction rather than a new fact, merge it with kyzmem_update or deduplicate with kyzmem_forget.{placardHint}',
@@ -522,6 +534,14 @@ export const en = {
   'tool.searchAsOfPrefix': '(point-in-time lookback: the “facts at that moment” at the end of a line is a snapshot of the facts still valid on {date} for the linked entities)\n',
   'tool.searchBatchNote': '\nBatch {batchId} ({count} citable evidence refs): before answering, use kyzmem_assess to judge whether the evidence suffices; evidenceRefs may only cite the refs above.',
   'tool.searchNoHits': 'no hits',
+  'tool.searchModeDescription': 'rendering mode: index (default — metadata only: coordinates/date/placard/cues/id, no body text, saves context; fetch the original with kyzmem_examine as hinted at the end); timeline (ascending by creation time with source-session summary cues, to answer “what happened in that period”); full (with body text — only when you truly need to read each entry closely, costs the most context)',
+  'tool.searchPlacard': ' placard: {placard}',
+  'tool.searchSessionCue': 'session cue: {summary}',
+  'tool.searchExpired': '[expired]',
+  'tool.searchTierTool': '[unconfirmed:tool]',
+  'tool.searchTierWeb': '[unconfirmed:web]',
+  'tool.searchConflictCue': 'in conflict with {ids}, pending adjudication',
+  'tool.searchExamineHint': 'The lines above are metadata only (no body text). For the original text: kyzmem_examine ids=[{ids}]',
 
   // ---- kyzmem_facts schema and result ----
   'tool.factsDescription': 'Entity fact chains: query an entity’s facts over time (asOf for a point-in-time lookback / includeInvalid to expand the whole chain), or write and correct facts (the facts array). A fact is one objective statement about a concrete entity (state/ownership/relation/data). When correcting an outdated fact, pass replaces=<old fact id>: the old fact is softly invalidated, the new one takes over and the history chain is kept — do not keep saving contradictory facts; express evolution with a replacement chain.',
@@ -610,6 +630,7 @@ export const en = {
   'tool.forgetAffectsDescription': 'which entries/people/projects it affects; an empty string means not applicable',
   'tool.forgetStillUsefulDescription': 'residual value: worth excavating / worth reviewing / how to read it if rolled back',
   'tool.forgetRendered': 'Memory {id} is now closed (soft delete, recoverable); the epitaph is inscribed in the operation log.',
+  'tool.forgetRestoreHint': 'Deleted by mistake? Reopen (restore) it from the “Forgotten” list in the panel.',
   'tool.forgetTombstoneRequired': 'kyzmem_forget: all three closing questions (reason / affects / stillUseful) must be answered so the memory can be excavated later',
 
   // ---- kyzmem_ingest_history schema ----
@@ -692,6 +713,7 @@ export const en = {
   'tool.exportMarkdownEdges': '## Relation edges',
   'tool.exportWritten': '{path} ({records} memories, {edges} edges{redacted})',
   'tool.exportDone': 'Exported{redacted}:\n{paths}',
+  'tool.exportSecretWarning': '⚠ Warning: the exported content of scope(s) {scopes} still contains unredacted secrets/credentials. Redact them before sharing or committing, or re-export with redactedView=true.\n',
   'tool.exportRedactedView': ' (redacted view)',
   'tool.importDescription': 'Import memories from a dsh-kyzmem export file: JSON (product of kyzmem_export format=json, lossless) or exported Markdown (lossy re-parsing; auto-detected by extension by default). Preview first with dryRun=true (new/duplicate/conflict classification), then commit; imported entries are embedded in place automatically.',
   'tool.importPathDescription': 'Absolute path to the export file (JSON or Markdown product of kyzmem_export)',
@@ -854,6 +876,7 @@ export const ru = {
   'tool.saveAcceptedText': 'Сохранено воспоминание {id} (kind={kind}, importance={importance}{slot}). В последующих сессиях его можно вызвать через kyzmem_search.',
   'tool.saveDroppedChitchat': 'Не сохранено: это чистая болтовня без полезной информации.',
   'tool.saveDroppedDuplicate': 'Не сохранено: дословно совпадает с уже существующим воспоминанием.',
+  'tool.saveDroppedNearDuplicate': 'Не сохранено: почти совпадает с уже существующим воспоминанием (текст почти идентичен, отличается только kind). Если действительно нужна отдельная запись, переформулируйте; чтобы найти существующую, используйте kyzmem_search.',
   'tool.saveBatchDropped': 'ещё {count} пропущено как болтовня или дословные дубли',
   'tool.saveMergeText': 'Почти дубликат существующего воспоминания (сходство {similarity}): объединено с {mergedInto} с усилением его уверенности и счётчика обращений, новая запись не создана. Если это исправление, а не повтор, объедините через kyzmem_update.',
   'tool.saveDeferText': 'Сохранено {id}. Внимание: очень похоже на существующие воспоминания — {listed}. Если это исправление, а не новый факт, объедините через kyzmem_update или уберите дубликат через kyzmem_forget.{placardHint}',
@@ -909,6 +932,14 @@ export const ru = {
   'tool.searchAsOfPrefix': '(взгляд на момент времени: «факты на тот момент» в конце строки — снимок фактов о связанных сущностях, действовавших на {date})\n',
   'tool.searchBatchNote': '\nПартия {batchId} (ссылок, на которые можно ссылаться: {count}): перед ответом проверьте достаточность доказательств через kyzmem_assess; в evidenceRefs допустимы только ref из списка выше.',
   'tool.searchNoHits': 'совпадений нет',
+  'tool.searchModeDescription': 'режим вывода: index (по умолчанию — только метаданные: координаты/дата/табличка/подсказки/id, без текста, экономит контекст; оригинал берётся через kyzmem_examine по подсказке в конце); timeline (по возрастанию времени создания, с подсказками из сводок исходных сессий — отвечает на вопрос «что происходило в тот период»); full (с текстом — только когда нужно внимательно прочитать каждую запись, самый дорогой по контексту)',
+  'tool.searchPlacard': ' табличка: {placard}',
+  'tool.searchSessionCue': 'подсказка сессии: {summary}',
+  'tool.searchExpired': '[истекло]',
+  'tool.searchTierTool': '[не подтверждено:tool]',
+  'tool.searchTierWeb': '[не подтверждено:web]',
+  'tool.searchConflictCue': 'конфликтует с {ids}, ждёт решения',
+  'tool.searchExamineHint': 'Выше только метаданные (без текста). Оригинал: kyzmem_examine ids=[{ids}]',
 
   // ---- Схема и результат kyzmem_facts ----
   'tool.factsDescription': 'Цепочки фактов о сущности: запрос фактов сущности во времени (asOf — взгляд на момент, includeInvalid — развернуть всю цепочку) либо запись и исправление фактов (массив facts). Факт — одно объективное утверждение о конкретной сущности (состояние/принадлежность/связь/данные). Исправляя устаревший факт, передайте replaces=<id старого факта>: старый факт мягко аннулируется, новый вступает в силу, история цепочки сохраняется — не сохраняйте противоречащие друг другу факты повторно, выражайте развитие через цепочку замен.',
@@ -997,6 +1028,7 @@ export const ru = {
   'tool.forgetAffectsDescription': 'какие записи/люди/проекты затронуты; пустая строка означает «не применимо»',
   'tool.forgetStillUsefulDescription': 'остаточная ценность: для раскопок / для повторения / как понимать при откате',
   'tool.forgetRendered': 'Воспоминание {id} закрыто (мягкое удаление, восстановимо), эпитафия внесена в журнал операций.',
+  'tool.forgetRestoreHint': 'Удалили по ошибке? Откройте (восстановите) запись в списке «Забытые» на панели.',
   'tool.forgetTombstoneRequired': 'kyzmem_forget: нужно ответить на все три вопроса закрытия (reason / affects / stillUseful), чтобы позже можно было провести раскопки',
 
   // ---- Схема kyzmem_ingest_history ----
@@ -1079,6 +1111,7 @@ export const ru = {
   'tool.exportMarkdownEdges': '## Связи',
   'tool.exportWritten': '{path} ({records} воспоминаний, {edges} связей{redacted})',
   'tool.exportDone': 'Экспортировано{redacted}:\n{paths}',
+  'tool.exportSecretWarning': '⚠ Внимание: в экспортированном содержимом области {scopes} остались необезличенные секреты/учётные данные. Обезличьте их перед публикацией или коммитом либо повторите экспорт с redactedView=true.\n',
   'tool.exportRedactedView': ' (обезличенный вид)',
   'tool.importDescription': 'Импортировать воспоминания из файла экспорта dsh-kyzmem: JSON (продукт kyzmem_export format=json, без потерь) или экспортированный Markdown (разбор с потерями; по умолчанию формат определяется по расширению). Сначала предпросмотр с dryRun=true (классификация: новое / дубликат / конфликт), затем импорт; импортированные записи автоматически снабжаются векторами на месте.',
   'tool.importPathDescription': 'Абсолютный путь к файлу экспорта (JSON или Markdown продукт kyzmem_export)',

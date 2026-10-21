@@ -38,6 +38,8 @@ export const zh = {
   // refurb.ts
   'misc.refurbDemoteReason': '重要性 {importance} < {threshold} 且 {days} 天未访问，建议降级为 archived。',
   'misc.refurbMergeReason': '与 {count} 条记忆内容前 20 字重复，建议蒸馏合并。',
+  'misc.refurbConflictReason': '与另一条记忆构成矛盾（{days} 天未裁决），建议裁决或合并。',
+  'misc.refurbConflictEscalatedReason': '矛盾已悬置 {days} 天仍未裁决，检索会引用互相打架的信念，建议优先处理。',
   'misc.refurbReviewReason': '重要性 {importance} 但从未被参观，可能埋没在走廊，建议复习。',
   'misc.refurbSplitReason': '内容长度 {length} > 400，建议拆为多条独立记忆。',
   'misc.refurbNoPlacardReason': '{slot}未挂门牌：宫殿纪律要求每个标记唯一、差异化、带日期，建议用 kyzmem_update 的 placard 参数补挂。',
@@ -80,6 +82,8 @@ export const en = {
   // refurb.ts
   'misc.refurbDemoteReason': 'importance {importance} < {threshold} and not accessed for {days} days; consider demoting to archived.',
   'misc.refurbMergeReason': 'the first 20 characters duplicate {count} other memories; consider distilling and merging them.',
+  'misc.refurbConflictReason': 'contradicts another memory ({days} days unresolved); adjudicate or merge it.',
+  'misc.refurbConflictEscalatedReason': 'the contradiction has been unresolved for {days} days; recall would surface conflicting beliefs, so handle it first.',
   'misc.refurbReviewReason': 'importance {importance} but never visited; it may be buried in a corridor, so review is recommended.',
   'misc.refurbSplitReason': 'content length {length} > 400; consider splitting it into several independent memories.',
   'misc.refurbNoPlacardReason': '{slot}no placard yet: palace discipline requires every marker to be unique, distinctive and date-anchored; add one with the placard parameter of kyzmem_update.',
@@ -119,6 +123,8 @@ export const ru = {
   // refurb.ts
   'misc.refurbDemoteReason': 'важность {importance} < {threshold} и нет обращений {days} дн.; рекомендуется понизить до archived.',
   'misc.refurbMergeReason': 'первые 20 символов совпадают с {count} записями; рекомендуется объединить их дистилляцией.',
+  'misc.refurbConflictReason': 'противоречит другой записи ({days} дн. без решения); рекомендуется разрешить или объединить.',
+  'misc.refurbConflictEscalatedReason': 'противоречие не разрешено уже {days} дн.; поиск будет выдавать конфликтующие убеждения — займитесь им в первую очередь.',
   'misc.refurbReviewReason': 'важность {importance}, но запись ни разу не посещали — возможно, она затерялась в коридоре; рекомендуется повторить.',
   'misc.refurbSplitReason': 'длина содержимого {length} > 400; рекомендуется разделить на несколько независимых записей.',
   'misc.refurbNoPlacardReason': '{slot}табличка не установлена: дисциплина дворца требует, чтобы каждый маркер был уникальным, различимым и с датой; добавьте её параметром placard инструмента kyzmem_update.',

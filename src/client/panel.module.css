@@ -777,3 +777,50 @@ select.input { padding-right: 28px; appearance: none; }
 @media (max-width: 720px) {
   .metricValue { font-size: 22px; }
 }
+
+/* ===== ops tab 运行观测（v0.11）：冲突队列 / 通道表 / 采用率 / 十二指标 ===== */
+.opsStack { display: flex; flex-direction: column; gap: var(--space-5); margin-bottom: var(--space-5); }
+.opsErrorNote { font-size: var(--fs-micro); color: var(--dsw-alias-state-error-primary); line-height: 1.4; }
+.opsEmpty { padding: var(--space-4) 0; font-size: var(--fs-body); line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
+.opsFootNote { margin-top: var(--space-3); font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); }
+.opsOk { font-size: var(--fs-body); color: var(--dsw-alias-state-success-primary); }
+.opsWarn { font-size: var(--fs-body); color: var(--dsw-alias-state-warn-primary); }
+.opsNum { font-size: var(--fs-body); color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
+.opsTable { display: flex; flex-direction: column; }
+.opsTableHead { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); letter-spacing: 0.02em; }
+.opsTableRow { display: grid; grid-template-columns: minmax(0, 1.4fr) 72px 88px 80px; gap: var(--space-3); align-items: center; padding: var(--space-2); border-bottom: 1px solid var(--dsw-alias-border-l1); font-size: var(--fs-body); }
+.opsTableRow:last-child { border-bottom: 0; }
+.opsChannelLabel { color: var(--dsw-alias-label-primary); }
+.opsAdoption { display: flex; flex-direction: column; gap: var(--space-3); }
+.opsAdoptionValue { font-size: 40px; line-height: 1; font-weight: 600; letter-spacing: -0.02em; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+.opsAdoptionCounts { display: flex; flex-wrap: wrap; gap: var(--space-5); font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); }
+.opsMetricsGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--space-3); }
+.opsMetricTile { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: var(--space-3) var(--space-4); background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 6%, transparent); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-control); }
+.opsMetricLabel { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.opsMetricValue { font-size: 22px; line-height: 1.1; font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+
+/* 冲突卡：左右对照 + 底部裁决按钮；窄屏折成上下两段。 */
+.conflictList { display: flex; flex-direction: column; }
+.conflictRow { padding: var(--space-3) 0; border-bottom: 1px solid var(--dsw-alias-border-l1); animation: fadeSoft var(--dur-base) var(--ease-spring) both; }
+.conflictRow:first-child { padding-top: 0; }
+.conflictRow:last-child { padding-bottom: 0; border-bottom: 0; }
+.conflictSides { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.conflictSide { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.conflictSide + .conflictSide { border-left: 1px solid var(--dsw-alias-border-soft); padding-left: var(--space-4); }
+.conflictText { margin: 0; font-size: var(--fs-body); line-height: 1.5; color: var(--dsw-alias-label-secondary); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.conflictFoot { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); margin-top: var(--space-3); }
+.conflictTime { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); }
+.conflictActions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-left: auto; }
+
+/* 来源分级徽标（状态徽标旁）：已确认 → 代理推断 → 工具输出 → 网页内容。 */
+.pill.tierConfirmed { background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); color: var(--dsw-alias-state-success-primary); }
+.pill.tierInferred { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent); color: var(--dsw-alias-brand-primary); }
+.pill.tierTool { background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 14%, transparent); color: var(--dsw-alias-label-tertiary); }
+.pill.tierWeb { background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent); color: var(--dsw-alias-state-warn-primary); }
+
+@media (max-width: 720px) {
+  .conflictSides { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
+  .conflictSide + .conflictSide { border-left: 0; padding-left: 0; border-top: 1px solid var(--dsw-alias-border-soft); padding-top: var(--space-3); }
+  .conflictActions { margin-left: 0; }
+  .opsTableRow { grid-template-columns: minmax(0, 1fr) 56px 72px 64px; }
+}

@@ -62,6 +62,9 @@ function Icon({ name, className }: { readonly name: IconName; readonly className
   )
 }
 
+/** 来源分级（v0.11）：宿主按写入来源打的信任标签；旧记录没有该字段时按代理推断显示。 */
+type SourceTier = 'user-confirmed' | 'agent-inferred' | 'tool-output' | 'web-content'
+
 /** 列表/详情用的记忆视图（宿主 /api/kyzmem/list 的行结构）。 */
 interface MemoryRow {
   readonly id: string
@@ -79,6 +82,8 @@ interface MemoryRow {
   readonly sourceRound: number | null
   /** 桩位（v0.7.2 起；未排桩时缺省）。 */
   readonly slot?: { readonly room: string; readonly index: number }
+  /** 来源分级（v0.11 起；旧库记录缺省，按 agent-inferred 处理）。 */
+  readonly sourceTier?: SourceTier
 }
 
 interface ListResult {
@@ -98,6 +103,55 @@ interface StatsPart {
     /** 各房间（kind）条目数；stats 路由的 byKind 字段（房间目录数据源）。 */
     readonly byKind?: Readonly<Record<string, number>>
   }
+}
+
+/** 单条检索通道的耗时/命中快照（/stats 与 /search-test 的 channels 数组元素）。 */
+interface ChannelStat {
+  readonly channel: string
+  readonly tookMs: number
+  readonly hits: number
+  readonly degraded: boolean
+}
+
+/**
+ * 十二项运行指标（/stats 顶层 metrics）。宿主契约里十二项一定给出、取不到给 0，
+ * 但面板仍按可选字段读取：旧宿主或半升级部署时用「—」代替编造的数字。
+ */
+interface OpsMetrics {
+  readonly adoptionRate?: number
+  readonly recallUsed?: number
+  readonly recallIgnored?: number
+  readonly dropRate?: number
+  readonly openConflicts?: number
+  readonly expiredHitRate?: number
+  readonly unconfirmedRatio?: number
+  readonly injectTokens?: number
+  readonly searchP95Ms?: number
+  readonly weeklyGrowth?: number
+  readonly reviewCompletionRate?: number
+  readonly maintenanceDebt?: number
+}
+
+/** /stats 的响应（parts 为既有多作用域统计；channels/metrics 是 v0.11 新增的顶层字段）。 */
+interface StatsView {
+  readonly parts: readonly StatsPart[]
+  readonly channels?: readonly ChannelStat[]
+  readonly metrics?: OpsMetrics
+}
+
+/** 四个裁决动作（与宿主 ConflictAction 一致；客户端本地声明，不 import 服务端类型）。 */
+type ConflictAction = 'keep-left' | 'keep-right' | 'keep-both' | 'drop-both'
+
+/** 一对待裁决冲突（/conflicts 的 items 元素）。 */
+interface ConflictPairView {
+  readonly left: MemoryRow
+  readonly right: MemoryRow
+  readonly createdAt: number
+}
+
+interface ConflictListResult {
+  readonly items: readonly ConflictPairView[]
+  readonly total: number
 }
 
 /** review API 的返回结构（详情行内展开区的数据源）。 */
@@ -172,6 +226,63 @@ const SCOPE_KEY: Record<MemoryRow['scope'], KyzmemKey> = {
   project: 'scopeProject',
   shared: 'scopeShared',
 }
+/** 来源分级 → 标签与徽标类（四档按可信度从高到低；缺省按代理推断）。 */
+const TIER_KEY: Record<SourceTier, KyzmemKey> = {
+  'user-confirmed': 'tierConfirmed',
+  'agent-inferred': 'tierInferred',
+  'tool-output': 'tierTool',
+  'web-content': 'tierWeb',
+}
+const TIER_CLASS: Record<SourceTier, string> = {
+  'user-confirmed': 'tierConfirmed',
+  'agent-inferred': 'tierInferred',
+  'tool-output': 'tierTool',
+  'web-content': 'tierWeb',
+}
+/** 检索通道 → 词典键（后端出现未知通道时回退原始 channel 名）。 */
+const CHANNEL_KEY: Record<string, KyzmemKey> = {
+  fts: 'opsChannelFts',
+  vector: 'opsChannelVector',
+  graph: 'opsChannelGraph',
+}
+/** 冲突卡上的四个动作；drop-both 会同时弃掉两端，用危险色提示。 */
+const CONFLICT_ACTIONS: readonly { readonly action: ConflictAction; readonly key: KyzmemKey; readonly danger: boolean }[] = [
+  { action: 'keep-left', key: 'opsConflictKeepLeft', danger: false },
+  { action: 'keep-right', key: 'opsConflictKeepRight', danger: false },
+  { action: 'keep-both', key: 'opsConflictKeepBoth', danger: false },
+  { action: 'drop-both', key: 'opsConflictDropBoth', danger: true },
+]
+
+/** 指标值的展示形态：比率（0..1 → 百分比）、整数、token 估算、毫秒。 */
+type MetricFormat = 'ratio' | 'count' | 'tokens' | 'ms'
+
+/** 十二项指标表：标签 + 取值器 + 展示形态。字段缺失由 formatMetricValue 显示「—」。 */
+const METRIC_ROWS: readonly {
+  readonly label: KyzmemKey
+  readonly pick: (metrics: OpsMetrics) => number | undefined
+  readonly format: MetricFormat
+}[] = [
+  { label: 'metricAdoption', pick: metrics => metrics.adoptionRate, format: 'ratio' },
+  { label: 'metricRecallUsed', pick: metrics => metrics.recallUsed, format: 'count' },
+  { label: 'metricRecallIgnored', pick: metrics => metrics.recallIgnored, format: 'count' },
+  { label: 'metricDropRate', pick: metrics => metrics.dropRate, format: 'ratio' },
+  { label: 'metricOpenConflicts', pick: metrics => metrics.openConflicts, format: 'count' },
+  { label: 'metricExpiredHitRate', pick: metrics => metrics.expiredHitRate, format: 'ratio' },
+  { label: 'metricUnconfirmedShare', pick: metrics => metrics.unconfirmedRatio, format: 'ratio' },
+  { label: 'metricInjectTokens', pick: metrics => metrics.injectTokens, format: 'tokens' },
+  { label: 'metricSearchP95', pick: metrics => metrics.searchP95Ms, format: 'ms' },
+  { label: 'metricWeeklyGrowth', pick: metrics => metrics.weeklyGrowth, format: 'ratio' },
+  { label: 'metricReviewCompletion', pick: metrics => metrics.reviewCompletionRate, format: 'ratio' },
+  { label: 'metricMaintenanceDebt', pick: metrics => metrics.maintenanceDebt, format: 'count' },
+]
+
+/** 指标数值 → 文案；缺失/非有限值一律「—」，不把 0 和「没数据」混成同一个样子。 */
+function formatMetricValue(format: MetricFormat, value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) return '—'
+  if (format === 'ratio') return `${String(Math.round(value * 100))}%`
+  if (format === 'ms') return `${String(Math.round(value))} ms`
+  return String(Math.round(value))
+}
 /** 房间色相类（panel.module.css 的 .roomFact 等）；未知 kind 回退通用的 .kind。 */
 const ROOM_CLASS: Record<string, string> = {
   fact: 'roomFact',
@@ -224,6 +335,16 @@ function kindLabel(t: T, kind: string): string {
 /** 房间 pill 的类名：按 kind 取色相类，未知 kind 回退通用品牌色。 */
 function roomPillClass(kind: string): string {
   return `${styles.pill} ${styles[ROOM_CLASS[kind] ?? 'kind'] ?? ''}`
+}
+
+/** 状态 pill 的修饰类（列表行与冲突卡共用；未知状态不加修饰，只剩基础 pill 样式）。 */
+function statusPillClass(status: MemoryRow['status']): string {
+  return styles[`status${status.charAt(0).toUpperCase()}${status.slice(1)}`] ?? ''
+}
+
+/** 来源分级徽标：缺省（旧数据）按代理推断显示。 */
+function tierPillClass(tier: SourceTier): string {
+  return `${styles.pill} ${styles[TIER_CLASS[tier]] ?? ''}`
 }
 
 /** op 数据值 → 本地化标签（未知值回退原文）。 */
@@ -2940,6 +3061,262 @@ function ImportButton({ t, scope, toast, onImported }: {
     </div>
   )
 }
+/** 运维 tab 一次拉取的冲突对数（队列可能比这长，卡片底部标出总数）。 */
+const CONFLICT_LIMIT = 20
+
+/**
+ * 冲突对在 UI 层的稳定键：left/right id 用 NUL 拼接，避免 id 里含分隔符时撞键。
+ */
+function conflictKey(pair: ConflictPairView): string {
+  return `${pair.left.id}\u0000${pair.right.id}`
+}
+
+/**
+ * 检索通道表：一路一行（通道名 / 命中 / 耗时 / 是否降级）。
+ * 通道名走词典，后端出现未知通道时回退原始标识；降级行用 warn 色提醒。
+ */
+function ChannelTable({ t, channels }: {
+  readonly t: T
+  readonly channels: readonly ChannelStat[]
+}): React.ReactElement {
+  if (channels.length === 0) {
+    return <div className={styles.opsEmpty}>{t('opsChannelEmpty')}</div>
+  }
+  return (
+    <div className={styles.opsTable}>
+      <div className={`${styles.opsTableRow} ${styles.opsTableHead}`}>
+        <span>{t('opsChannelName')}</span>
+        <span>{t('opsChannelHits')}</span>
+        <span>{t('opsChannelTook')}</span>
+        <span>{t('opsChannelState')}</span>
+      </div>
+      {channels.map((row) => {
+        const key = CHANNEL_KEY[row.channel]
+        return (
+          <div key={row.channel} className={styles.opsTableRow}>
+            <span className={styles.opsChannelLabel}>{key === undefined ? row.channel : t(key)}</span>
+            <span className={styles.opsNum}>{String(row.hits)}</span>
+            <span className={styles.opsNum}>{`${String(Math.round(row.tookMs))} ms`}</span>
+            <span className={row.degraded ? styles.opsWarn : styles.opsOk}>
+              {row.degraded ? t('opsChannelDegraded') : t('opsChannelHealthy')}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * 采用率卡：近 7 天 recall 被采用 /（采用 + 略过）。
+ * 宿主给了 adoptionRate 就用它；否则用两个计数现算，口径与契约一致。
+ */
+function AdoptionCard({ t, metrics }: {
+  readonly t: T
+  readonly metrics: OpsMetrics | undefined
+}): React.ReactElement {
+  const used = metrics?.recallUsed
+  const ignored = metrics?.recallIgnored
+  const total = used !== undefined && ignored !== undefined ? used + ignored : undefined
+  const rate = metrics !== undefined && metrics.adoptionRate !== undefined
+    ? metrics.adoptionRate
+    : used !== undefined && total !== undefined && total > 0
+      ? used / total
+      : undefined
+  if (rate === undefined || total === undefined || total === 0) {
+    return <div className={styles.opsEmpty}>{t('opsAdoptionEmpty')}</div>
+  }
+  const percent = Math.max(0, Math.min(100, Math.round(rate * 100)))
+  return (
+    <div className={styles.opsAdoption}>
+      <div className={styles.opsAdoptionValue}>{`${String(percent)}%`}</div>
+      <div className={styles.progressBar}>
+        <i style={{ width: `${String(percent)}%` }} />
+      </div>
+      <div className={styles.opsAdoptionCounts}>
+        <span>{t('opsAdoptionUsed', { n: Math.round(used ?? 0) })}</span>
+        <span>{t('opsAdoptionIgnored', { n: Math.round(ignored ?? 0) })}</span>
+      </div>
+    </div>
+  )
+}
+
+/** 十二项指标表：字段缺失显示「—」，不把「没数据」渲染成 0。 */
+function MetricsGrid({ t, metrics }: {
+  readonly t: T
+  readonly metrics: OpsMetrics | undefined
+}): React.ReactElement {
+  return (
+    <div className={styles.opsMetricsGrid}>
+      {METRIC_ROWS.map(row => (
+        <div key={row.label} className={styles.opsMetricTile}>
+          <span className={styles.opsMetricLabel}>{t(row.label)}</span>
+          <span className={styles.opsMetricValue}>
+            {formatMetricValue(row.format, metrics === undefined ? undefined : row.pick(metrics))}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * 冲突卡列表：两端各显示状态/房间/时间与三行内容，底部四个裁决按钮。
+ * 一次只允许一条在提交（busy 非空时全部禁用），避免连点造成重复裁决。
+ */
+function ConflictQueue({ t, items, busy, onResolve }: {
+  readonly t: T
+  readonly items: readonly ConflictPairView[]
+  readonly busy: string | null
+  readonly onResolve: (pair: ConflictPairView, action: ConflictAction) => void
+}): React.ReactElement {
+  const locked = busy !== null
+  return (
+    <div className={styles.conflictList}>
+      {items.map((pair) => {
+        const pairKey = conflictKey(pair)
+        return (
+          <div key={pairKey} className={styles.conflictRow}>
+            <div className={styles.conflictSides}>
+              {([pair.left, pair.right] as const).map((side, index) => (
+                <div key={`${String(index)}:${side.id}`} className={styles.conflictSide}>
+                  <div className={styles.itemTags}>
+                    <span className={`${styles.pill} ${statusPillClass(side.status)}`}>{t(STATUS_KEY[side.status])}</span>
+                    <span className={roomPillClass(side.kind)}>{kindLabel(t, side.kind)}</span>
+                    <span className={styles.itemStamp} title={fmtTime(side.createdAt)}>{relTime(t, side.createdAt)}</span>
+                  </div>
+                  <p className={styles.conflictText} title={side.content}>{side.content}</p>
+                </div>
+              ))}
+            </div>
+            <div className={styles.conflictFoot}>
+              <span className={styles.conflictTime}>{t('opsConflictCreatedAt', { time: relTime(t, pair.createdAt) })}</span>
+              <div className={styles.conflictActions}>
+                {CONFLICT_ACTIONS.map(option => (
+                  <button key={option.action} type="button" disabled={locked}
+                    className={option.danger ? `${styles.button} ${styles.danger}` : styles.button}
+                    onClick={() => { onResolve(pair, option.action) }}>
+                    {t(option.key)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * 运维总览（ops tab 顶部四张卡）：待裁决冲突、检索通道、采用率、十二项指标。
+ * /stats 与 /conflicts 各自失败只降级对应卡片，不影响 ops tab 里的历史回填区块；
+ * 裁决成功后自增 tick，让冲突队列与指标一起刷新。
+ */
+function OpsPanel({ t, scope, project, reloadTick, toast }: {
+  readonly t: T
+  readonly scope: 'user' | 'project' | 'shared'
+  readonly project: string
+  readonly reloadTick: number
+  readonly toast: ToastController
+}): React.ReactElement {
+  const [stats, setStats] = useState<StatsView | null>(null)
+  const [statsError, setStatsError] = useState<string | null>(null)
+  const [conflicts, setConflicts] = useState<ConflictListResult | null>(null)
+  const [conflictError, setConflictError] = useState<string | null>(null)
+  /** 正在裁决的冲突对键；非空时所有裁决按钮禁用。 */
+  const [busy, setBusy] = useState<string | null>(null)
+  /** 裁决计数器：自增即触发上面的 effect 重拉两个接口。 */
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    api<StatsView>(`stats?scope=${scope}`)
+      .then((data) => { if (!cancelled) { setStats(data); setStatsError(null) } })
+      .catch((error: Error) => { if (!cancelled) setStatsError(error.message) })
+    api<ConflictListResult>(`conflicts?scope=${scope}&limit=${String(CONFLICT_LIMIT)}`)
+      .then((data) => { if (!cancelled) { setConflicts(data); setConflictError(null) } })
+      .catch((error: Error) => { if (!cancelled) { setConflicts(null); setConflictError(error.message) } })
+    return () => { cancelled = true }
+  }, [scope, project, reloadTick, tick])
+
+  const resolve = (pair: ConflictPairView, action: ConflictAction): void => {
+    if (busy !== null) return
+    setBusy(conflictKey(pair))
+    // 传 id 而非整条记录：服务端按 id 取最新行再裁决，避免用客户端缓存的内容。
+    // scope 让 api() 在 project 作用域下自动注入当前项目选择器。
+    void api<{ readonly ok: boolean }>('conflicts/resolve', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ left: pair.left.id, right: pair.right.id, action, scope }),
+    })
+      .then(() => {
+        toast.push('success', t('opsConflictResolved'))
+        setTick(current => current + 1)
+      })
+      .catch((error: Error) => { toast.push('error', error.message) })
+      .finally(() => { setBusy(null) })
+  }
+
+  const channels = stats?.channels ?? []
+  const metrics = stats?.metrics
+
+  return (
+    <div className={styles.opsStack}>
+      {statsError !== null && <div className={styles.opsErrorNote}>{t('loadFailed', { msg: statsError })}</div>}
+      <section className={styles.section}>
+        <div className={styles.sectionHead}>
+          <h4 className={styles.sectionTitle}>{t('opsConflictTitle')}</h4>
+          <span className={styles.sectionHint}>{t('opsConflictHint')}</span>
+        </div>
+        <div className={styles.panelCard}>
+          {conflictError !== null
+            ? <div className={styles.opsEmpty}>{`${t('opsConflictUnavailable')} · ${conflictError}`}</div>
+            : conflicts === null
+              ? <div className={styles.opsEmpty}>{t('loading')}</div>
+              : conflicts.items.length === 0
+                ? <div className={styles.opsEmpty}>{t('opsConflictEmpty')}</div>
+                : (
+                  <Fragment>
+                    <ConflictQueue t={t} items={conflicts.items} busy={busy} onResolve={resolve} />
+                    <div className={styles.opsFootNote}>
+                      {t('opsConflictTotal', { n: conflicts.total, shown: conflicts.items.length })}
+                    </div>
+                  </Fragment>
+                )}
+        </div>
+      </section>
+      <section className={styles.section}>
+        <div className={styles.sectionHead}>
+          <h4 className={styles.sectionTitle}>{t('opsChannelTitle')}</h4>
+          <span className={styles.sectionHint}>{t('opsChannelHint')}</span>
+        </div>
+        <div className={styles.panelCard}>
+          <ChannelTable t={t} channels={channels} />
+        </div>
+      </section>
+      <section className={styles.section}>
+        <div className={styles.sectionHead}>
+          <h4 className={styles.sectionTitle}>{t('opsAdoptionTitle')}</h4>
+          <span className={styles.sectionHint}>{t('opsAdoptionHint')}</span>
+        </div>
+        <div className={styles.panelCard}>
+          <AdoptionCard t={t} metrics={metrics} />
+        </div>
+      </section>
+      <section className={styles.section}>
+        <div className={styles.sectionHead}>
+          <h4 className={styles.sectionTitle}>{t('opsMetricsTitle')}</h4>
+          <span className={styles.sectionHint}>{t('opsMetricsHint')}</span>
+        </div>
+        <div className={styles.panelCard}>
+          <MetricsGrid t={t} metrics={metrics} />
+        </div>
+      </section>
+    </div>
+  )
+}
+
 /** KyzmemSection 的 props：渲染器给的 t（locale 席位）+ 可选取用的宿主服务。 */
 export type KyzmemSectionProps = PropsLocale<typeof NS> & {
   /** 宿主工作区服务（缺席时 chip 显示「无工作区信息」，面板其余功能照常）。 */
@@ -2969,6 +3346,12 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
   const [dueIds, setDueIds] = useState<ReadonlySet<string>>(new Set())
   /** 陈展「今日到期」筛选：只显示复习调度今天到期的条目。 */
   const [dueOnly, setDueOnly] = useState(false)
+  /**
+   * 列表「仅看已确认」筛选（持久化）：confirmedOnly=1 只列 source_tier=user-confirmed
+   * 的条目——代理推断、工具输出、网页内容都不进列表。
+   */
+  const [confirmedOnlyFlag, setConfirmedOnlyFlag] = usePersistedState<'0' | '1'>('library.confirmedOnly', '0', ['0', '1'])
+  const confirmedOnly = confirmedOnlyFlag === '1'
   /** 脱敏筛选已合并到顶部 KPI 与 tag 视觉，不再作为过滤器。 */
   const [redacted] = useState('all')
   const [offset, setOffset] = useState(0)
@@ -3071,11 +3454,13 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
     })
     if (query !== '') qs.set('q', query)
     if (sort === 'tour') qs.set('sort', 'tour')
+    // 来源分级筛选：confirmedOnly=1 在服务端是严格 source_tier='user-confirmed'。
+    if (confirmedOnly) qs.set('confirmedOnly', '1')
     api<ListResult>(`list?${qs.toString()}`)
       .then((data) => { if (!cancelled) { setList(data); setError(null) } })
       .catch((loadError: Error) => { if (!cancelled) setError(loadError.message) })
     return () => { cancelled = true }
-  }, [scope, status, kind, redacted, q, sort, offset, reloadTick, projectSelector])
+  }, [scope, status, kind, redacted, q, sort, confirmedOnly, offset, reloadTick, projectSelector])
 
   /** 项目宫殿切换（工作区切换 / 手动固定）：回到第 1 页并清掉跨库无意义的展开与选择态。 */
   const lastProject = useRef(projectSelector)
@@ -3386,6 +3771,12 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
               onClick={() => { setDueOnly(!dueOnly); setOffset(0); setExpanded(null); clearSelection() }}>
               {t('filterDueToday')}
             </button>
+            {/* 仅看已确认：confirmedOnly=1 只留 user-confirmed，tooltip 把口径说清楚。 */}
+            <button type="button" aria-pressed={confirmedOnly} title={t('filterConfirmedHint')}
+              className={confirmedOnly ? `${styles.chip} ${styles.chipOn}` : styles.chip}
+              onClick={() => { setConfirmedOnlyFlag(confirmedOnly ? '0' : '1'); setOffset(0); setExpanded(null); clearSelection() }}>
+              {t('filterConfirmed')}
+            </button>
             <div className={styles.segGroup}>
               {([['time', t('sortTime')], ['tour', t('sortTour')]] as const).map(([value, label]) => (
                 <button key={value} type="button"
@@ -3451,7 +3842,11 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
                     aria-label={record.content.slice(0, 24)} onChange={() => toggleSelect(record.id)} />
                   <div className={styles.itemBody}>
                     <div className={styles.itemTags}>
-                      <span className={`${styles.pill} ${styles[`status${record.status.charAt(0).toUpperCase()}${record.status.slice(1)}`] ?? ''}`}>{t(STATUS_KEY[record.status])}</span>
+                      <span className={`${styles.pill} ${statusPillClass(record.status)}`}>{t(STATUS_KEY[record.status])}</span>
+                      {/* 来源分级徽标：紧跟状态之后，旧记录没有 sourceTier 时按代理推断显示。 */}
+                      <span className={tierPillClass(record.sourceTier ?? 'agent-inferred')} title={t('tierBadgeTitle')}>
+                        {t(TIER_KEY[record.sourceTier ?? 'agent-inferred'])}
+                      </span>
                       <span className={roomPillClass(record.kind)}>{kindLabel(t, record.kind)}</span>
                       {record.slot !== undefined && (
                         <span className={styles.pill}>{record.slot.room}#{record.slot.index}</span>
@@ -3628,6 +4023,7 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
         <div className={styles.tabPanel}>
           {/* ops tab 是后台管线的容器，不是独立页面：去掉 PageHeader，让每个 sectionHead
               作为唯一标题层，与 library/corridor 等"单页面"tab 的视觉语言对齐。 */}
+          <OpsPanel t={t} scope={scope} project={projectSelector ?? ''} reloadTick={reloadTick} toast={toast} />
           <section className={styles.section}>
             <div className={styles.sectionHead}>
               <h4 className={styles.sectionTitle}>{t('tabBackfill')}</h4>

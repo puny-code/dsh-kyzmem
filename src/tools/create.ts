@@ -18,7 +18,7 @@ import type { LlmRoute } from '../llm/client.ts'
 import type { KyzmemStore } from '../store/interface.ts'
 import { embedImportedRecords, parseImportData, parseMarkdownExport } from '../store/import.ts'
 import { parseEntityMentions } from '../ingest/hook.ts'
-import type { KyzmemKind, KyzmemScope, EntityId, EntityMention, ExportData, FactRecord, FactWriteInput, ImageryLabel, MemoryId } from '../types.ts'
+import type { KyzmemKind, KyzmemScope, KyzmemSourceTier, EntityId, EntityMention, ExportData, FactRecord, FactWriteInput, ImageryLabel, MemoryId } from '../types.ts'
 import type { MemoryRecord, SearchHit } from '../types.ts'
 import { EPISODE_PROXIMITY_MS_DEFAULT, EPISODE_TIMELINE_LIMIT_DEFAULT, asEntityId, asFactId, asMemoryId, normalizeEntityName } from '../types.ts'
 import { renderMemoryPacket, sanitizeProtocolText } from '../security/sanitize.ts'
@@ -27,7 +27,7 @@ import {
   MAX_REWRITE_QUERIES, REWRITE_MAX_TOKENS, rewriteSystem, RRF_CONSTANT,
   mergeQueryResults, normalizeRewriteQueries,
 } from '../retrieve/rewrite.ts'
-import { RECALL_TOTAL_CHARS, enforceBudget, fitWithinBudget, truncateItem } from '../retrieve/budget.ts'
+import { RECALL_PER_ITEM_CHARS, RECALL_TOTAL_CHARS, enforceBudget, fitWithinBudget, truncateItem, truncateRecallItem } from '../retrieve/budget.ts'
 import {
   MAX_BATCHES_PER_SESSION, MAX_EVIDENCE_REFS, NEXT_STRATEGIES, assessEvidence, evidenceBatches, evidenceRefOf,
 } from '../retrieve/evidence.ts'
@@ -39,6 +39,7 @@ import type { DropReason, MemoryJudge, WriteDisposition } from '../write-disposi
 import type { KyzmemLanguage } from '../i18n/language.ts'
 import { message } from '../i18n/messages.ts'
 import { resolveRoomInput, roomLabel } from '../i18n/rooms.ts'
+import { resolveDefaultScope } from '../scope.ts'
 
 /** 工具依赖：分库打开器、嵌入器承诺、辅助 LLM 调用与导出目录。 */
 export interface ToolDeps {
@@ -73,9 +74,24 @@ export interface ToolDeps {
     /** 执行：逐会话逐轮摄取（同步等待，受调用方 signal 约束）。 */
     readonly run: (rules: HistoryBackfillRules, signal: AbortSignal) => Promise<HistoryRunResult>
   }
+  /**
+   * 召回类输出的单条内容上限（Config `recallPerItem`，缺省 160）。
+   * 为什么可选：index.ts 由运行时代理维护，本层先接受可选字段+缺省值，
+   * 避免「配置已下发但入口还没接」时整条链路编译不过。
+   */
+  readonly recallPerItem?: number
+  /** 召回输出总字符预算（Config `recallTotal`，缺省 4800）。 */
+  readonly recallTotal?: number
 }
 
 const KINDS = ['fact', 'preference', 'decision', 'episode', 'skill'] as const
+
+/**
+ * kyzmem_search 的渲染模式（契约 §7）：
+ * index = 只回元信息行（默认，省上下文）；timeline = 时间升序 + 来源会话线索；
+ * full = 带正文——只有确实需要逐条精读时才该显式要，避免每轮召回都灌满正文。
+ */
+type SearchMode = 'index' | 'timeline' | 'full'
 
 /**
  * 工具执行期的会话 cwd：project scope 的读写据此解析项目宫殿。
@@ -216,10 +232,15 @@ function renderAssessText(verdict: AssessVerdict, batchId: string): string {
   return lines.join('\n')
 }
 
-/** 从模型参数收敛 scope（非法值或缺失回退 fallback）。 */
-function scopeOf(raw: unknown, fallback: KyzmemScope): KyzmemScope {
+/**
+ * 从模型参数收敛 scope：显式值优先；未给时按「当前有无项目上下文（会话 cwd）」
+ * 落到 project / user——规则收敛在 src/scope.ts，与面板入口同一口径。
+ * fallback 显式传入时用于少数跨库维护操作（导入/画像等，缺省落 user 更安全）。
+ */
+function scopeOf(raw: unknown, fallback?: KyzmemScope): KyzmemScope {
   if (raw === 'user' || raw === 'project' || raw === 'shared') return raw
-  return fallback
+  if (fallback !== undefined) return fallback
+  return resolveDefaultScope(execSessionCwd.getStore() !== undefined)
 }
 
 /** 把 search scope 参数收敛为分库集合。 */
@@ -287,6 +308,63 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
   }
   /** 批量保存上限（协议内常量：与单轮摄取候选量级对齐，防一次灌入过多）。 */
   const MAX_SAVE_BATCH = 10
+
+  /**
+   * 批次 ref → 记忆坐标。为什么不用 evidence.ts 的 ref 反解：ref 在有宫位时只含
+   * 「房间#桩位」，不含完整 id；assess 判定充分后要按 ref 做引用强化，必须拿到真实 id。
+   * 注册批次时顺手留一份映射，按 `${sessionId}\u0000${batchId}` 键存，避免跨会话串号。
+   */
+  const citationRefs = new Map<string, Map<string, { scope: KyzmemScope; id: MemoryId }>>()
+  const CITATION_REF_SESSIONS_MAX = 32
+
+  function rememberCitationRefs(sessionId: string, batchId: string, kept: readonly { readonly ref: string; readonly hit: SearchHit }[]): void {
+    const map = new Map<string, { scope: KyzmemScope; id: MemoryId }>()
+    for (const entry of kept) map.set(entry.ref, { scope: entry.hit.record.scope, id: entry.hit.record.id })
+    citationRefs.set(`${sessionId}\u0000${batchId}`, map)
+    // 上限保护：工具进程长驻，批次映射不能无限增长（超限丢最旧，旧批次本就不可再引用）。
+    if (citationRefs.size > CITATION_REF_SESSIONS_MAX * MAX_BATCHES_PER_SESSION) {
+      const oldest = citationRefs.keys().next()
+      if (oldest.done !== true) citationRefs.delete(oldest.value)
+    }
+  }
+
+  /**
+   * 引用强化：判定「证据充分且确实引用了」后，给每条被引用的记忆 +0.02（上限由 store 侧夹）。
+   * store 可能尚未实现 reinforceCitation（并行落地中）：能力缺失或失败都不影响 assess 的判定结果，
+   * 失败记 op_log 供事后排查，绝不向模型抛错。
+   */
+  async function reinforceAssessedRefs(sessionId: string | undefined, batchId: string, refs: readonly string[]): Promise<void> {
+    if (sessionId === undefined || refs.length === 0) return
+    const map = citationRefs.get(`${sessionId}\u0000${batchId}`)
+    if (map === undefined) return
+    const targets = new Map<string, { scope: KyzmemScope; id: MemoryId }>()
+    for (const ref of refs) {
+      const target = map.get(ref)
+      if (target !== undefined) targets.set(String(target.id), target)
+    }
+    if (targets.size === 0) return
+    const reinforced: string[] = []
+    const failed: string[] = []
+    for (const [id, target] of targets) {
+      try {
+        const store = await deps.openStore(target.scope)
+        // 能力探测：store 层的 reinforceCitation 由并行任务落地，缺失时静默跳过（不阻断 assess）。
+        const ext = store as unknown as { reinforceCitation?: (memoryId: MemoryId, delta?: number) => Promise<void> }
+        if (typeof ext.reinforceCitation !== 'function') continue
+        await ext.reinforceCitation(target.id, 0.02)
+        reinforced.push(id)
+      } catch {
+        failed.push(id)
+      }
+    }
+    // op_log 用 user store 落一行（与 assess 判定同库，审计时能前后对照）；审计本身失败也不再抛。
+    try {
+      const userStore = await deps.openStore('user')
+      await userStore.audit('assess-reinforce', batchId, JSON.stringify({ ids: reinforced, failed }))
+    } catch {
+      /* 审计失败不影响判定结果 */
+    }
+  }
 
   /** kyzmem_save 输出视图（schema 放宽后单条/批量字段均可能缺席）。 */
   interface SaveResultView {
@@ -375,6 +453,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       sourceSessionId: string | null
       embedding?: Float32Array
       imagery?: ImageryLabel
+      /** 来源分级默认由调用方决定：显式 save 是用户确认，自动摄取才是 agent-inferred。 */
+      sourceTier?: KyzmemSourceTier
     },
   ): Promise<WriteOutcome | { readonly dropped: DropReason }> {
     const { embedding } = item
@@ -394,6 +474,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       content: item.content,
       ...(item.importance === undefined ? {} : { importance: item.importance }),
       sourceSessionId: item.sourceSessionId,
+      ...(item.sourceTier === undefined ? {} : { sourceTier: item.sourceTier }),
       ...(embedding === undefined ? {} : { embedding }),
       ...(item.imagery === undefined ? {} : { imagery: item.imagery }),
     })
@@ -497,6 +578,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           content: item.content,
           ...(item.importance === undefined ? {} : { importance: item.importance }),
           sourceSessionId,
+          // 批量 save 同样是显式保存动作：整批记 user-confirmed。
+          sourceTier: 'user-confirmed',
           ...(embedding === undefined ? {} : { embedding }),
         })
         // DROP：过短或逐字重复，不落库、不计失败（op_log 已在判定处留痕）。
@@ -606,7 +689,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       // 入库前协议剥离 + 密钥脱敏（模型可能把会话中的密钥或协议块原样写进记忆）。
       const content = redactSecrets(sanitizeProtocolText(input.content))
       if (content.trim() === '') throw new Error(message('tool.saveContentEmptyAfterSanitize'))
-      const scope = scopeOf(input.scope, 'project')
+      const scope = scopeOf(input.scope)
       const store = await deps.openStore(scope)
       const embedder = await deps.embedder
       const embeddings = embedder === undefined ? undefined : await embedder.embed([content.trim()])
@@ -618,15 +701,22 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         content,
         ...(typeof input.importance === 'number' ? { importance: input.importance } : {}),
         sourceSessionId,
+        // 显式 save（单条）是用户侧「保存这条」的动作 → 记为 user-confirmed；
+        // 自动摄取走 classifyIngestSourceTier，不受这里影响。
+        sourceTier: 'user-confirmed',
         ...(embeddings?.[0] === undefined ? {} : { embedding: embeddings[0] }),
         ...(imagery === undefined ? {} : { imagery }),
       })
       // 实体关联：merge 挂被并入的既有条目，accept/defer 挂新条目；失败静默。
       if ('dropped' in outcome) {
-        // DROP：如实告知模型「这次没记」，原因来自规则判定（太短/逐字重复），op_log 已有审计行。
-        return {
-          text: message(outcome.dropped === 'chitchat' ? 'tool.saveDroppedChitchat' : 'tool.saveDroppedDuplicate'),
-        }
+        // DROP：如实告知模型「这次没记」，原因来自规则判定（寒暄/逐字重复/跨 kind 近重复），op_log 已有审计行。
+        // near-duplicate 单独一条文案：它不是「别处已有同一条」，而是「这条太像了、没有独立信息量」，
+        // 模型需要的是「换个说法或先去查那条」而不是「算了」。
+        // 这里逐分支静态调用 message()：check-messages 只认字面量 key，拼动态 key 会被判成「声明未使用」。
+        const text = outcome.dropped === 'chitchat'
+          ? message('tool.saveDroppedChitchat')
+          : outcome.dropped === 'near-duplicate' ? message('tool.saveDroppedNearDuplicate') : message('tool.saveDroppedDuplicate')
+        return { text }
       }
       if (mentions.length > 0) {
         const nodeId = outcome.disposition === 'merge' && outcome.relatedId !== undefined
@@ -679,16 +769,19 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       room: { type: 'string', description: message('tool.searchRoomDescription') },
       limit: { type: 'number', description: message('tool.searchLimitDescription') },
       asOf: { type: 'string', description: message('tool.searchAsOfDescription') },
+      mode: { type: 'string', enum: ['index', 'timeline', 'full'], description: message('tool.searchModeDescription') },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
         degraded: { type: 'boolean', required: true },
+        mode: { type: 'string' },
+        ids: { type: 'array', items: { type: 'string' } },
         text: { type: 'string', required: true },
       } },
       render: (_args: any, value: any) => [{ type: 'text', text: value.text }],
     },
     async execute(args, exec) {
-      const input = args as { query: string; scope?: unknown; room?: unknown; limit?: number; asOf?: unknown }
+      const input = args as { query: string; scope?: unknown; room?: unknown; limit?: number; asOf?: unknown; mode?: unknown }
       const scopes = scopesOf(input.scope)
       const rooms = typeof input.room === 'string' && input.room.trim() !== ''
         ? [resolveRoomInput(input.room) ?? input.room.trim()]
@@ -750,27 +843,99 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           }
         }
       }
-      const candidates = merged.map((hit, index) => {
+      // 渲染模式与预算：预算走部署配置（缺省单条 160 / 总量 4800）。
+      const mode: SearchMode = input.mode === 'timeline' || input.mode === 'full' ? input.mode : 'index'
+      const recallPerItem = deps.recallPerItem ?? RECALL_PER_ITEM_CHARS
+      const recallTotal = deps.recallTotal ?? RECALL_TOTAL_CHARS
+      // timeline 模式的会话摘要线索：一条会话查一次，失败视为无摘要（线索是增强项，不阻塞召回）。
+      const sessionCues = new Map<string, string>()
+      if (mode === 'timeline') {
+        const scopeOfSession = new Map<string, KyzmemScope>()
+        for (const hit of merged) {
+          const sid = hit.record.sourceSessionId
+          if (sid === null || sid === '') continue
+          scopeOfSession.set(sid, hit.record.scope)
+        }
+        for (const [sid, scope] of scopeOfSession) {
+          try {
+            const summary = await (await deps.openStore(scope)).getSessionSummary(sid)
+            if (summary !== undefined && summary !== '') sessionCues.set(sid, message('tool.searchSessionCue', { summary }))
+          } catch {
+            // 摘要读失败：时间线照常输出，只是少一句线索。
+          }
+        }
+      }
+      /**
+       * 来源分级 / 过期 / 冲突标记。为什么要显式标：工具输出与网页内容是「未确认」上下文，
+       * 模型很容易把召回里的二手信息当已确认事实复述；标记贴在行上，比在提示里说一遍可靠。
+       */
+      const markersOf = (hit: SearchHit): string => {
+        const parts: string[] = []
+        if (hit.expired === true) parts.push(message('tool.searchExpired'))
+        if (hit.record.sourceTier === 'tool-output') parts.push(message('tool.searchTierTool'))
+        else if (hit.record.sourceTier === 'web-content') parts.push(message('tool.searchTierWeb'))
+        if (hit.cues?.contradicts !== undefined && hit.cues.contradicts.length > 0) {
+          parts.push(message('tool.searchConflictCue', { ids: hit.cues.contradicts.map(cid => `#${cid}`).join(message('tool.separatorIdea')) }))
+        }
+        return parts.length === 0 ? '' : ` ${parts.join(' ')}`
+      }
+      /** 单条召回行（不含序号：timeline 会重排，序号按最终顺序补）。 */
+      interface RecallEntry {
+        readonly hit: SearchHit
+        readonly ref: string
+        readonly row: string
+        readonly createdAt: number
+        /** timeline：来源会话摘要行（缺省不携带）。 */
+        readonly sessionCue?: string
+      }
+      const candidates: RecallEntry[] = merged.map((hit) => {
         const ref = evidenceRefOf(hit.record.scope, hit.record.id, hit.record.slot, deps.language)
         const edge = hit.viaEdge === undefined ? '' : message('tool.searchViaEdge', { type: hit.viaEdge.type, from: hit.viaEdge.from })
         const slot = hit.record.slot === undefined ? '' : ` ${roomLabel(hit.record.slot.room, deps.language)}#${hit.record.slot.index}`
         const date = message('tool.searchCreatedAt', { date: new Date(hit.record.createdAt).toISOString().slice(0, 10) })
+        // 门牌：一句具象描述（缺省 = 未铭刻，不占位）。
+        const caption = hit.record.imagery?.caption
+        const placard = caption === null || caption === undefined ? '' : message('tool.searchPlacard', { placard: caption })
+        const head = `[${hit.record.scope}/${hit.record.kind}]${slot}${date}${placard}`
         const cues = hit.cues === undefined ? '' : message('tool.searchNeighborCues', { cues: hit.cues.neighbors.join(', ') })
+        const markers = markersOf(hit)
         const notes = factNotes.get(String(hit.record.id))
         const facts = notes === undefined ? '' : message('tool.searchAsOfFacts', { facts: notes.join(message('tool.separatorSemicolon')) })
+        const idRef = message('tool.searchHitIdRef', { id: hit.record.id, ref })
+        const sid = hit.record.sourceSessionId
+        const summary = sid === null ? undefined : sessionCues.get(sid)
         return {
+          hit,
           ref,
-          line: `${index + 1}. [${hit.record.scope}/${hit.record.kind}]${slot}${date} ${truncateItem(hit.record.content)}${message('tool.searchHitIdRef', { id: hit.record.id, ref })}${edge}${cues}${facts}`,
+          createdAt: hit.record.createdAt,
+          // index/timeline 不回正文：行里只有坐标、日期、门牌、线索、标记与 id。
+          row: mode === 'full'
+            ? `${head}${markers} ${truncateRecallItem(hit.record.content, recallPerItem)}${idRef}${edge}${cues}${facts}`
+            : `${head}${cues}${markers}${idRef}`,
+          ...(summary === undefined || summary === '' ? {} : { sessionCue: summary }),
         }
       })
-      const { kept, dropped } = fitWithinBudget(candidates, entry => entry.line.length, RECALL_TOTAL_CHARS)
-      const lines = kept.map(entry => entry.line)
+      const cost = (entry: RecallEntry): number => entry.row.length + (entry.sessionCue === undefined ? 0 : entry.sessionCue.length + 1)
+      const { kept, dropped } = fitWithinBudget(candidates, cost, recallTotal)
+      // timeline：预算筛选后按创建时间升序重排（问「那段时间发生了什么」时顺序本身就是信息）。
+      const ordered = mode === 'timeline' ? [...kept].sort((a, b) => a.createdAt - b.createdAt) : kept
+      const lines = ordered.map((entry, index) => `${index + 1}. ${entry.row}${entry.sessionCue === undefined ? '' : `\n${entry.sessionCue}`}`)
       if (dropped > 0) lines.push(message('store.budgetDropped', { count: dropped }))
+      // 索引/时间线末尾固定提示：正文不在召回里，需要时二次取。把「该调哪个工具」写死在输出末尾，
+      // 避免模型拿元信息行当正文引用（幻觉来源之一）。
+      if (mode !== 'full' && ordered.length > 0) {
+        lines.push(message('tool.searchExamineHint', { ids: ordered.map(entry => String(entry.hit.record.id)).join(', ') }))
+      }
       // 证据门：把本次真正输出的 ref 登记成批次，kyzmem_assess 只能引用这里登记过的 ref。
       const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
       const batch = sessionId === undefined || kept.length === 0
         ? undefined
         : evidenceBatches.register(sessionId, kept.map(entry => entry.ref))
+      // ref → 条目坐标（scope + 真实 id）：assess 判定充分后要按 ref 找到记忆做引用强化，
+      // 而 ref 里有宫位时只含「房间#桩位」、并不含完整 id，所以登记时就把映射留在本进程。
+      if (batch !== undefined && sessionId !== undefined) {
+        rememberCitationRefs(sessionId, batch.batchId, kept)
+      }
       const prefix = degraded && lines.length > 0 ? message('tool.searchDegradedPrefix') : ''
       const roomNote = rooms === undefined ? '' : message('tool.searchRoomRoutePrefix', { rooms: rooms.join(message('tool.separatorIdea')) })
       const asOfNote = asOfMs === undefined ? '' : message('tool.searchAsOfPrefix', { date: new Date(asOfMs).toISOString().slice(0, 10) })
@@ -778,7 +943,13 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         ? ''
         : message('tool.searchBatchNote', { batchId: batch.batchId, count: batch.refs.size })
       // 输出包协议标签：记忆正文是不可信历史上下文，当前请求为检索词本身。
-      return { degraded, text: renderMemoryPacket(`${prefix}${roomNote}${asOfNote}${lines.join('\n') || message('tool.searchNoHits')}${batchNote}`, 'tool_search', input.query) }
+      // mode/ids 回给调用端（面板/诊断）以便知道这次召回用的是哪种视图、涉及哪些条目。
+      return {
+        degraded,
+        mode,
+        ...(ordered.length === 0 ? {} : { ids: ordered.map(entry => String(entry.hit.record.id)) }),
+        text: renderMemoryPacket(`${prefix}${roomNote}${asOfNote}${lines.join('\n') || message('tool.searchNoHits')}${batchNote}`, 'tool_search', input.query),
+      }
     },
   })
 
@@ -826,7 +997,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         scope?: unknown; entityId?: unknown; entity?: unknown; asOf?: unknown
         includeInvalid?: unknown; limit?: unknown; offset?: unknown; facts?: unknown
       }
-      const scope = scopeOf(input.scope, 'project')
+      const scope = scopeOf(input.scope)
       const store = await deps.openStore(scope)
       const asOfMs = parseTimeParam(typeof input.asOf === 'string' ? input.asOf : undefined, 'kyzmem_facts', 'asOf')
       // —— 写入模式：facts 与查询参数互斥（照 kyzmem_save 的 items 模式）。
@@ -1016,6 +1187,11 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         rejected: verdict.rejectedRefs,
         strategy: verdict.nextStrategy,
       }))
+      // 判定「证据充分」且确有引用 → 被引用条目的引用证明 +0.02（契约 §7）：
+      // 强化发生在判定之后、失败静默，绝不影响已经返回给模型的判定结论。
+      if (verdict.sufficient && verdict.evidenceRefs.length > 0) {
+        await reinforceAssessedRefs(sessionId, batch.batchId, verdict.evidenceRefs)
+      }
       return { sufficient: verdict.sufficient, nextStrategy: verdict.nextStrategy, text: renderAssessText(verdict, batch.batchId) }
     },
   })
@@ -1171,7 +1347,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       // 入库前协议剥离 + 密钥脱敏，与 kyzmem_save 同一防线。
       const content = redactSecrets(sanitizeProtocolText(input.content))
       if (content.trim() === '') throw new Error(message('tool.updateContentEmptyAfterSanitize'))
-      const scope = scopeOf(input.scope, 'project')
+      const scope = scopeOf(input.scope)
       const store = await deps.openStore(scope)
       const old = await store.get(input.id as never)
       if (old === undefined) throw new Error(message('tool.updateNotFound', { id: input.id, scope }))
@@ -1202,11 +1378,11 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true } } },
-      render: (_args: any, value: any) => [{ type: 'text', text: message('tool.forgetRendered', { id: value.id }) }],
+      render: (_args: any, value: any) => [{ type: 'text', text: `${message('tool.forgetRendered', { id: value.id })} ${message('tool.forgetRestoreHint')}` }],
     },
     async execute(args) {
       const input = args as { id: string; scope?: unknown; reason: unknown; affects: unknown; stillUseful: unknown }
-      const scope = scopeOf(input.scope, 'project')
+      const scope = scopeOf(input.scope)
       const reason = typeof input.reason === 'string' ? input.reason.trim() : ''
       const affects = typeof input.affects === 'string' ? input.affects.trim() : ''
       const stillUseful = typeof input.stillUseful === 'string' ? input.stillUseful.trim() : ''
@@ -1291,7 +1467,9 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       ))).flat()
       all.sort((a, b) => b.forgottenAt - a.forgottenAt)
       const sliced = all.slice(0, limit)
-      if (sliced.length === 0) return { text: message('tool.auditForgottenEmpty') }
+      // 遗忘是软删（保留墓碑），误删可在面板重开——输出末尾如实告知恢复途径。
+      const restoreHint = message('tool.forgetRestoreHint')
+      if (sliced.length === 0) return { text: `${message('tool.auditForgottenEmpty')} ${restoreHint}` }
       const lines = sliced.map((row, index) => {
         const stamp = new Date(row.forgottenAt).toISOString()
         const tomb = row.tombstone === null
@@ -1313,7 +1491,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           tombstone: tomb,
         })
       })
-      return { text: message('tool.auditForgottenHeader', { count: sliced.length, lines: lines.join('\n') }) }
+      return { text: `${message('tool.auditForgottenHeader', { count: sliced.length, lines: lines.join('\n') })} ${restoreHint}` }
     },
   })
 
@@ -1401,7 +1579,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         ? input.outcome
         : (input.grade as number) >= 3 ? 'success' : 'failure'
       const grade = (hasGrade ? input.grade : outcome === 'success' ? 5 : 1) as 0 | 1 | 2 | 3 | 4 | 5
-      const scope = scopeOf(input.scope, 'project')
+      const scope = scopeOf(input.scope)
       const store = await deps.openStore(scope)
       const record = await store.reportOutcome(input.id as never, outcome)
       if (record === undefined) throw new Error(message('tool.reportNotFound', { id: input.id, scope }))
@@ -1430,7 +1608,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     },
     async execute(args) {
       const input = args as { id: string; scope?: unknown }
-      const store = await deps.openStore(scopeOf(input.scope, 'project'))
+      const store = await deps.openStore(scopeOf(input.scope))
       const view = await store.review(input.id as never)
       if (view === undefined) return { text: message('tool.reviewNotFound', { id: input.id }) }
       const record = view.record
@@ -1549,9 +1727,16 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       }
       await mkdir(deps.exportDir, { recursive: true, mode: 0o700 })
       const written: string[] = []
+      // 导出前扫描未脱敏敏感词：镜像模式忽略 redactedView（完整导出），其余格式用 redactedView 时已重洗。
+      // 扫描到就直接在结果里显式警告——导出文件常被分享/提交，静默带出密钥是不可接受的。
+      const secretScopes: string[] = []
+      const scanSecrets = (scope: KyzmemScope, records: readonly { readonly content: string }[]): void => {
+        if (records.some(record => redactSecrets(record.content) !== record.content)) secretScopes.push(scope)
+      }
       for (const scope of scopes) {
         const data = await (await deps.openStore(scope)).exportAll()
         if (format === 'markdown-mirror') {
+          scanSecrets(scope, data.records)
           // 镜像模式：完整导出，忽略脱敏（用户用 Obsidian 看完整内容更符合预期；脱敏请走 markdown/json + redactedView）。
           const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19)
           const mirrorRoot = join(deps.exportDir, `mirror-${scope}-${stamp}`)
@@ -1567,6 +1752,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         const payload = redactedView
           ? { ...data, records: data.records.map(record => ({ ...record, content: preview(record.content) })) }
           : data
+        if (!redactedView) scanSecrets(scope, payload.records)
         const stamp = new Date().toISOString().replaceAll(':', '-')
         const suffix = redactedView ? '-redacted' : ''
         const path = join(deps.exportDir, `kyzmem-${scope}${suffix}-${stamp}.${format === 'json' ? 'json' : 'md'}`)
@@ -1596,7 +1782,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           redacted: redactedView ? message('tool.exportRedactedMark') : '',
         }))
       }
-      return { text: message('tool.exportDone', { redacted: redactedView ? message('tool.exportRedactedView') : '', paths: written.join('\n') }) }
+      const warning = secretScopes.length === 0 ? '' : message('tool.exportSecretWarning', { scopes: secretScopes.join(message('tool.separatorIdea')) })
+      return { text: `${warning}${message('tool.exportDone', { redacted: redactedView ? message('tool.exportRedactedView') : '', paths: written.join('\n') })}` }
     },
   })
 
@@ -1829,15 +2016,23 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       const [fromUser, fromProject] = await Promise.all([store.getMany(ids), projectStore.getMany(ids)])
       const records = [...fromUser, ...fromProject]
       if (records.length === 0) throw new Error(message('tool.examineAllNotFound', { count: ids.length }))
-      const text = records.map((record, index) => [
-        `### ${index + 1}. [${record.scope}/${record.kind}/${record.status}] id=${record.id}`,
-        message('tool.examineNameplate', { content: record.content }),
-        message('tool.examineAttributes', {
-          brightness: record.importance.toFixed(2),
-          reliability: record.confidence.toFixed(2),
-          visits: record.accessCount,
-        }),
-      ].join('\n')).join('\n\n')
+      const text = records.map((record, index) => {
+        // 详情也标「未确认 / 已过期」：examine 常被拿来核对召回内容，来源分级只出现在 search 里不够。
+        const marks: string[] = []
+        if (record.expiresAt !== undefined && record.expiresAt <= Date.now()) marks.push(message('tool.searchExpired'))
+        if (record.sourceTier === 'tool-output') marks.push(message('tool.searchTierTool'))
+        else if (record.sourceTier === 'web-content') marks.push(message('tool.searchTierWeb'))
+        return [
+          `### ${index + 1}. [${record.scope}/${record.kind}/${record.status}] id=${record.id}`,
+          message('tool.examineNameplate', { content: record.content }),
+          message('tool.examineAttributes', {
+            brightness: record.importance.toFixed(2),
+            reliability: record.confidence.toFixed(2),
+            visits: record.accessCount,
+          }),
+          ...(marks.length === 0 ? [] : [marks.join(' ')]),
+        ].join('\n')
+      }).join('\n\n')
       return { text }
     },
   })

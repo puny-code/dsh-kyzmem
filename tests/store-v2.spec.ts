@@ -51,11 +51,14 @@ describe('KyzmemStore v2 additions', () => {
     const path = join(dir, 'user.db')
     await store.write({ scope: 'user', kind: 'fact', content: '将被衰减', importance: 0.1 })
     await store.write({ scope: 'user', kind: 'fact', content: '重要性高但同样零访问', importance: 0.9 })
-    // 把全部条目的最近访问时间拨回 40 天前，模拟长期未访问；
-    // 并清掉写入期自动排的复习日程——复习宽限期内（30 天）的条目不参与自动归档。
+    // 把全部条目的最近访问/最近复习时间拨回 40 天前，模拟长期未访问；
+    // v15 衰减判据读 last_reviewed_at（复习时钟，检索不再写它），last_accessed_at 只剩
+    // 「老库缺列时的回退源」语义，所以两列一起拨；并清掉写入期自动排的复习日程——
+    // 复习宽限期内（30 天）的条目不参与自动归档。
     const { DatabaseSync } = await import('node:sqlite')
     const raw = new DatabaseSync(path)
-    raw.prepare('UPDATE nodes SET last_accessed_at = ?, next_review_at = NULL').run(Date.now() - 40 * 86_400_000)
+    const staleAt = Date.now() - 40 * 86_400_000
+    raw.prepare('UPDATE nodes SET last_accessed_at = ?, last_reviewed_at = ?, next_review_at = NULL').run(staleAt, staleAt)
     raw.close()
     const archived = await store.decay({ olderThanDays: 30 })
     expect(archived).toBe(2)
@@ -280,12 +283,15 @@ describe('KyzmemStore 宫殿与复习调度（schema v6）', () => {
     expect((await migrated.get(asMemoryId('legacy-1')))?.slot).toEqual({ room: 'fact', index: 2 })
     await migrated.close()
     const check = new DatabaseSync(path)
-    expect((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value).toBe('14')
+    expect((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value).toBe('15')
     const indexes = (check.prepare('PRAGMA index_list(nodes)').all() as unknown as { name: string }[]).map(row => row.name)
     expect(indexes).toContain('nodes_slot')
     expect(indexes).toContain('nodes_review_due')
     expect(indexes).toContain('nodes_kind_created')
     expect(indexes).toContain('nodes_session_created')
+    // v15 新增的两个索引（TTL/失效时点检索用）同样必须建出来。
+    expect(indexes).toContain('nodes_invalid')
+    expect(indexes).toContain('nodes_expires')
     check.close()
   })
 
@@ -305,6 +311,6 @@ describe('KyzmemStore 宫殿与复习调度（schema v6）', () => {
     const check = new DatabaseSync(path)
     const version = (check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string }).value
     check.close()
-    expect(version).toBe('14')
+    expect(version).toBe('15')
   })
 })

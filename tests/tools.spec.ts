@@ -55,7 +55,8 @@ describe('kyzmem tools', () => {
 
   it('kyzmem_search 返回命中与降级标记', async () => {
     await store.write({ scope: 'user', kind: 'fact', content: '部署在 4000 端口' })
-    const result = await tools.get('kyzmem_search')!.execute({ query: '端口', scope: 'user' }, fakeExec) as { degraded: boolean; text: string }
+    // mode=full 才回正文；默认 index 只回定位行（见下方 index 模式测试）。
+    const result = await tools.get('kyzmem_search')!.execute({ query: '端口', scope: 'user', mode: 'full' }, fakeExec) as { degraded: boolean; text: string }
     expect(result.degraded).toBe(true)
     expect(result.text).toContain('4000')
     expect(result.text).toContain('id=')
@@ -288,7 +289,7 @@ describe('kyzmem tools', () => {
         exportDir: join(dir, 'exports'),
       }).map(tool => [tool.name, tool]),
     )
-    const result = await rewrittenTools.get('kyzmem_search')!.execute({ query: '端口', scope: 'user' }, fakeExec) as { text: string }
+    const result = await rewrittenTools.get('kyzmem_search')!.execute({ query: '端口', scope: 'user', mode: 'full' }, fakeExec) as { text: string }
     expect(result.text).toContain('4000')
     const ops = await store.stats()
     expect(ops.opLogCount).toBeGreaterThan(0)
@@ -308,7 +309,7 @@ describe('kyzmem tools', () => {
         exportDir: join(dir, 'exports'),
       }).map(tool => [tool.name, tool]),
     )
-    const result = await fallbackTools.get('kyzmem_search')!.execute({ query: '端口', scope: 'user' }, fakeExec) as { text: string }
+    const result = await fallbackTools.get('kyzmem_search')!.execute({ query: '端口', scope: 'user', mode: 'full' }, fakeExec) as { text: string }
     expect(result.text).toContain('4000')
   })
 
@@ -318,7 +319,7 @@ describe('kyzmem tools', () => {
     await store.linkNodeEntities(saved.id, [ken!.id])
     await store.writeFacts([{ entityId: ken!.id, content: 'ken 的服务跑在 4000 端口' }])
     const result = await tools.get('kyzmem_search')!.execute(
-      { query: '端口', scope: 'user', asOf: '2027-01-01' }, fakeExec) as { text: string }
+      { query: '端口', scope: 'user', asOf: '2027-01-01', mode: 'full' }, fakeExec) as { text: string }
     expect(result.text).toContain('时点回看')
     expect(result.text).toContain('2027-01-01')
     expect(result.text).toContain('时点事实: ken 的服务跑在 4000 端口')
@@ -634,7 +635,8 @@ describe('kyzmem_save 写入四态回报', () => {
   it('复述并入既有条目（MERGE）：不新建、强化置信度、输出标明并入', async () => {
     const { pin, embedder } = oneHotEmbedder()
     pin('用户现居杭州', [1, 0])
-    pin('复述：用户现居杭州', [1, 0])
+    // 0.94 余弦：落在 MERGE 带（[0.92, 0.98)）——0.98 以上会被 drop 判为近重复。
+    pin('复述：用户现居杭州', [1, 0.36])
     const toolsWithEmb = dispositionTools(embedder)
     const first = await toolsWithEmb.get('kyzmem_save')!.execute(
       { content: '用户现居杭州', kind: 'fact', scope: 'user' }, fakeExec) as { id: string; disposition: string }
@@ -669,11 +671,25 @@ describe('kyzmem_save 写入四态回报', () => {
     expect((await store.stats()).total).toBe(2)
     const edges = (await store.exportAll()).edges
     expect(edges.some(edge => edge.type === 'contradicts' && edge.from === deferBand.id && edge.to === base.id)).toBe(true)
-    // 跨 kind 即便余弦 1.0 也不并入（防把偏好错并进事实）。
-    const crossKind = await toolsWithEmb.get('kyzmem_save')!.execute(
-      { content: '用户偏好 SQLite 风格的本地存储', kind: 'preference', scope: 'user' }, fakeExec) as { disposition: string }
-    expect(crossKind.disposition).toBe('defer')
+    // 跨 kind 即便余弦 1.0 也不并入（防把偏好错并进事实）；但也不与既有条目争位：
+    // 近同文的跨 kind 写入按 near-duplicate 丢弃（§5 第四态的可达路径——同 kind ≥0.92 已被 merge 先截走）。
+    pin('用户偏好 SQLite 风格的本地存储', [1, 0])
+    // 跨 kind 的 defer 带（余弦 0.9）：仍有防错与证据价值，落库并建 contradicts 边。
+    // 用 [0.9, -sqrt(0.19)] 而不是复用上面的 DEFER_VECTOR：同向量会和 deferBand 那条余弦 1.0，
+    // 直接被 near-duplicate 丢掉，测不到 defer。
+    pin('用户偏好本地 SQLite 存储的传闻', [0.9, -Math.sqrt(0.19)])
+    const crossKindDefer = await toolsWithEmb.get('kyzmem_save')!.execute(
+      { content: '用户偏好本地 SQLite 存储的传闻', kind: 'preference', scope: 'user' }, fakeExec) as { disposition: string }
+    expect(crossKindDefer.disposition).toBe('defer')
     expect((await store.stats()).total).toBe(3)
+    // 跨 kind 近同文（余弦 1.0，仅 kind 不同）→ drop，且不新增条目。
+    const crossKind = await toolsWithEmb.get('kyzmem_save')!.execute(
+      { content: '用户偏好 SQLite 风格的本地存储', kind: 'preference', scope: 'user' }, fakeExec) as { disposition?: string; text: string }
+    expect(crossKind.disposition).toBeUndefined()
+    expect(crossKind.text).toContain('近重复')
+    expect((await store.stats()).total).toBe(3)
+    // 丢弃必须留审计（面板「我拦了什么」的数据源）。
+    expect((await store.recentOps(20)).some(op => op.op === 'drop')).toBe(true)
   })
 
   it('无近邻达到阈值时正常新建（ACCEPT）且不建边', async () => {
@@ -685,10 +701,29 @@ describe('kyzmem_save 写入四态回报', () => {
     expect((await store.exportAll()).edges).toHaveLength(0)
   })
 
+  it('显式 save 记为 user-confirmed：confirmedOnly 能查到，摄取/导入写入的查不到', async () => {
+    const { embedder } = oneHotEmbedder()
+    const toolsWithEmb = dispositionTools(embedder)
+    const saved = await toolsWithEmb.get('kyzmem_save')!.execute(
+      { content: '显式保存的一条偏好', kind: 'preference', scope: 'user' }, fakeExec) as { id: string }
+    // 模拟自动摄取：直接落库、不指定 sourceTier（缺省 agent-inferred），不应出现在「仅看已确认」里。
+    const ingested = await store.write({ scope: 'user', kind: 'fact', content: '自动摄取的一条事实' })
+    const confirmed = await store.list({ scope: 'user', confirmedOnly: true, limit: 50, offset: 0 })
+    expect(confirmed.records.map(record => record.id)).toContain(saved.id)
+    expect(confirmed.records.map(record => record.id)).not.toContain(ingested.id)
+    // 批量 save 同样记 user-confirmed。
+    await toolsWithEmb.get('kyzmem_save')!.execute({
+      items: [{ content: '批量保存的第一条', kind: 'fact' }, { content: '批量保存的第二条', kind: 'fact' }],
+      scope: 'user',
+    }, fakeExec)
+    const afterBatch = await store.list({ scope: 'user', confirmedOnly: true, limit: 50, offset: 0 })
+    expect(afterBatch.records.filter(record => record.content.startsWith('批量保存')).length).toBe(2)
+  })
+
   it('批量保存逐条回报处置：accept/merge 混合，失败不阻塞', async () => {
     const { pin, embedder } = oneHotEmbedder()
     pin('杭州事实甲', [1, 0])
-    pin('杭州事实甲的复述', [1, 0])
+    pin('杭州事实甲的复述', [1, 0.36])
     const toolsWithEmb = dispositionTools(embedder)
     const result = await toolsWithEmb.get('kyzmem_save')!.execute({
       items: [
@@ -711,3 +746,132 @@ describe('kyzmem_save 写入四态回报', () => {
     expect(rendered[0]?.text).toContain('并入强化 1 条')
   })
 })
+
+describe('kyzmem_search 三档渲染模式（contract §7）', () => {
+  /** 用真实 sqlite 库跑工具层：index/timeline/full 的差别全在渲染，不该被 mock 掩盖。 */
+  let dir2: string
+  let store2: KyzmemStore
+  let tools2: Map<string, ExecutableTool>
+
+  beforeEach(async () => {
+    dir2 = await mkdtemp(join(tmpdir(), 'kyzmem-modes-'))
+    store2 = await openKyzmemStore(join(dir2, 'user.db'))
+    tools2 = new Map<string, ExecutableTool>(
+      createKyzmemTools({
+        language: 'zh',
+        openStore: async () => store2,
+        resolveProjectStore: async () => store2,
+        embedder: Promise.resolve(undefined),
+        call: undefined,
+        routeOverride: undefined,
+        queryRewrite: false,
+        exportDir: join(dir2, 'exports'),
+      }).map(tool => [tool.name, tool]),
+    )
+  })
+  afterEach(async () => {
+    await store2.close()
+  })
+
+  it('默认 index：只回元信息行 + 固定 examine 提示，不回正文', async () => {
+    const saved = await store2.write({ scope: 'user', kind: 'fact', content: '部署在 4000 端口的网关' })
+    const result = await tools2.get('kyzmem_search')!.execute({ query: '端口', scope: 'user' }, fakeExec) as { text: string }
+    // 正文（含「4000」）不得出现在 index 输出里，否则「省上下文」就名不副实。
+    expect(result.text).not.toContain('4000')
+    expect(result.text).toContain('[user/fact]')
+    expect(result.text).toContain(`id=${saved.id}`)
+    expect(result.text).toContain('kyzmem_examine ids=[')
+    // 固定尾部提示带上了本批命中 id，模型可以无脑复制去取原文。
+    expect(result.text).toContain(saved.id)
+  })
+
+  it('index 行带门牌与日期；timeline 升序且带会话摘要线索', async () => {
+    const first = await store2.write({ scope: 'user', kind: 'fact', content: '第一条：先部署网关', sourceSessionId: 'sess-A' })
+    await store2.write({ scope: 'user', kind: 'fact', content: '第二条：再接通网关端口', sourceSessionId: 'sess-A' })
+    await store2.setSessionSummary('sess-A', '那天把网关和端口通了')
+    const indexed = await tools2.get('kyzmem_search')!.execute({ query: '网关', scope: 'user', mode: 'index' }, fakeExec) as { text: string }
+    // 门牌：索引行应含「房间#桩位」形式（未排桩时退化为空，但写入期自动化会给桩位）。
+    expect(indexed.text).toMatch(/#\d+/)
+    expect(indexed.text).toContain(`id=${first.id}`)
+
+    const timeline = await tools2.get('kyzmem_search')!.execute({ query: '网关', scope: 'user', mode: 'timeline' }, fakeExec) as { text: string }
+    // timeline 的会话摘要在检索时按 source_session 懒查，命中即渲染成线索行。
+    expect(timeline.text).toContain('会话线索')
+    expect(timeline.text).toContain('那天把网关和端口通了')
+    // 升序：较早写入的条目排在较晚之前（行号 1 是 first）。
+    const line1 = timeline.text.split('\n').find(line => /^1\./.test(line))
+    expect(line1).toContain(first.id)
+  })
+
+  it('full 模式保留正文渲染（与旧行为一致）', async () => {
+    await store2.write({ scope: 'user', kind: 'fact', content: '部署在 4000 端口的网关' })
+    const result = await tools2.get('kyzmem_search')!.execute({ query: '端口', scope: 'user', mode: 'full' }, fakeExec) as { text: string }
+    expect(result.text).toContain('4000')
+    expect(result.text).not.toContain('kyzmem_examine ids=[')
+  })
+
+  it('来源分级与过期标记贴在命中行上；contradicts 渲染成冲突待裁决', async () => {
+    const toolOut = await store2.write({
+      scope: 'user', kind: 'fact', content: '工具跑出来的端口是 4000', sourceTier: 'tool-output', expiresAt: Date.now() - 1000,
+    })
+    const webOut = await store2.write({ scope: 'user', kind: 'fact', content: '网页说端口是 5000', sourceTier: 'web-content' })
+    const plain = await store2.write({ scope: 'user', kind: 'fact', content: '端口最终定在 4000' })
+    await store2.linkEdge(asMemoryIdCompat(webOut.id), asMemoryIdCompat(plain.id), 'contradicts')
+    const result = await tools2.get('kyzmem_search')!.execute({ query: '端口', scope: 'user', mode: 'index' }, fakeExec) as { text: string }
+    expect(result.text).toContain('[未确认:tool]')
+    expect(result.text).toContain('[未确认:web]')
+    expect(result.text).toContain('[已过期]')
+    expect(result.text).toContain('冲突待裁决')
+    expect(result.text).toContain(`#${plain.id}`)
+    expect(result.text).toContain(toolOut.id)
+  })
+
+  it('examine 详情也标未确认/已过期（详情页与检索页口径一致）', async () => {
+    const saved = await store2.write({
+      scope: 'user', kind: 'fact', content: '工具跑出来的端口', sourceTier: 'tool-output', expiresAt: Date.now() - 1000,
+    })
+    const text = (await tools2.get('kyzmem_examine')!.execute({ ids: [saved.id] }, fakeExec) as { text: string }).text
+    expect(text).toContain('[未确认:tool]')
+    expect(text).toContain('[已过期]')
+  })
+
+  it('assess 判充足后对每个 ref 强化引用并记 assess-reinforce 审计', async () => {
+    const saved = await store2.write({ scope: 'user', kind: 'fact', content: '部署在 4000 端口的网关' })
+    const searched = await tools2.get('kyzmem_search')!.execute({ query: '端口', scope: 'user' }, fakeExec) as { text: string }
+    const batchId = /批次 (batch-\d+)/.exec(searched.text)?.[1]
+    const ref = /ref=([^\s）]+)/.exec(searched.text)?.[1]
+    await tools2.get('kyzmem_assess')!.execute(
+      { batchId, sufficient: true, evidenceRefs: [ref], missing: '', nextStrategy: 'answer' }, fakeExec,
+    )
+    const ops = await store2.recentOps(50)
+    expect(ops.some(op => op.op === 'assess-reinforce')).toBe(true)
+    // 命中被引用强化：lastRetrievedAt 落上，accessCount 增量（不关心具体数值，只要被动过）。
+    const after = await store2.get(saved.id)
+    expect(after?.lastRetrievedAt).toBeGreaterThan(0)
+  })
+
+  it('forget / audit_forgotten 都提示「删错了可在面板重开」', async () => {
+    const saved = await store2.write({ scope: 'user', kind: 'fact', content: '要删的条目' })
+    const forgotten = await tools2.get('kyzmem_forget')!.execute(
+      { id: saved.id, scope: 'user', reason: '过期', affects: '无', stillUseful: '可考古' }, fakeExec,
+    ) as { text?: string; id: string }
+    const forgetRender = (tools2.get('kyzmem_forget') as unknown as { output: { render: (args: unknown, value: unknown) => readonly { text: string }[] } })
+    expect(forgetRender.output.render({}, forgotten)[0]?.text).toContain('删错了可在面板')
+
+    const audit = await tools2.get('kyzmem_audit_forgotten')!.execute({}, fakeExec) as { text: string }
+    expect(audit.text).toContain('删错了可在面板')
+  })
+
+  it('export 发现未脱敏敏感词时在正文前显式警告', async () => {
+    // 绕过 save 的脱敏直接写库：模拟历史数据里已经落盘的密钥。
+    await store2.write({ scope: 'user', kind: 'fact', content: '线上密钥 sk-live-abcdef1234567890abcd' })
+    const result = await tools2.get('kyzmem_export')!.execute({ format: 'markdown', scope: 'user' }, fakeExec) as { text: string }
+    expect(result.text).toContain('警告')
+    expect(result.text).toContain('未脱敏')
+  })
+})
+
+/** 品牌类型在测试里的最小换算：MemoryId 是 string 的品牌子类型。 */
+function asMemoryIdCompat(id: string): never {
+  return id as never
+}
