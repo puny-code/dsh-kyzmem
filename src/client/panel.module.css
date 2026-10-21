@@ -109,9 +109,8 @@
 /* ---------- Header（单行两端对齐：左 scope 三宫格 / 右 到期角标+重访+导出；按设置弹窗 ~600px 内容区设计，无品牌装饰） ---------- */
 .header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-3); min-height: 36px; position: relative; z-index: 5; }
 .headerActions { display: flex; gap: var(--space-2); align-items: center; flex-shrink: 0; }
-/* 顶栏控件同高：按钮 28 / 下拉与输入框原本 30 / scope 段控 30，混排时基线参差 2px；
-   这里统一压到 28px，段控内边距同步收 1px（24 + 2×2 = 28）。 */
-.header .input { height: 28px; }
+/* 顶栏控件同高：.input 自身高度统一到 28px（见下方 .input），段控内边距收 1px
+   让 24px 的按钮加 2×2px 内边距正好 28px，与按钮、输入框同基线。 */
 .header .segScope { padding: 2px; }
 
 /* ---------- 线性图标基础样式（Phosphor 风：stroke 1.75 / round cap / currentColor） ---------- */
@@ -213,7 +212,9 @@
 .button.primary:hover { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 88%, transparent); border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 88%, transparent); color: var(--dsw-alias-label-primary-foreground); filter: brightness(1.05); }
 .button.primary:disabled { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, transparent); border-color: transparent; opacity: 0.6; }
 
-.input { height: 30px; padding: 0 10px; background-color: color-mix(in srgb, var(--dsw-alias-label-tertiary) 7%, var(--dsw-alias-bg-layer-1)); color: var(--dsw-alias-label-primary); border: 1px solid transparent; border-radius: 8px; font-size: 12px; line-height: 1; transition: border-color var(--dur-fast) var(--ease-spring), box-shadow var(--dur-fast) var(--ease-spring), background-color var(--dur-fast) var(--ease-spring); }
+/* 控件高度统一 28px：工具条、表单、抽屉底部、导入预览里按钮与输入框/下拉常并排，
+   30px 的输入框配 28px 的按钮会差 2px 基线，肉眼像没对齐。 */
+.input { height: 28px; padding: 0 10px; background-color: color-mix(in srgb, var(--dsw-alias-label-tertiary) 7%, var(--dsw-alias-bg-layer-1)); color: var(--dsw-alias-label-primary); border: 1px solid transparent; border-radius: 8px; font-size: 12px; line-height: 1; transition: border-color var(--dur-fast) var(--ease-spring), box-shadow var(--dur-fast) var(--ease-spring), background-color var(--dur-fast) var(--ease-spring); }
 .input::placeholder { color: var(--dsw-alias-label-tertiary); }
 .input:hover { background-color: color-mix(in srgb, var(--dsw-alias-label-tertiary) 11%, var(--dsw-alias-bg-layer-1)); border-color: var(--dsw-alias-border-l2); }
 .input:focus-visible { outline: none; background-color: var(--dsw-alias-bg-layer-1); border-color: var(--dsw-alias-brand-primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-brand-primary) 15%, transparent); }
@@ -231,6 +232,12 @@ button:focus-visible, a:focus-visible,
 }
 /* tab 底部无 border 的特例：focus-visible 时画一道底部品牌色短线。 */
 .tabItem:focus-visible::after { content: ''; position: absolute; left: -2px; right: -2px; bottom: -1px; height: 2px; background: var(--dsw-alias-brand-primary); border-radius: 2px; }
+/* 复选框/单选框沿用同一圈焦点环：宿主默认 outline 在暗色主题下几乎看不见。 */
+input[type='checkbox']:focus-visible, input[type='radio']:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
+/* 交互控件的文字不参与选择：连续点击筛选/切页时不会顺手把标签选进蓝底。 */
+.button, .tabItem, .segItem, .chip, .dueBadge, .refurbBadge { user-select: none; }
+/* 短标题允许断行均衡：窄侧栏里「今日待回忆」这类两行标题不再上行长下行短。 */
+.pageTitle, .empty b { text-wrap: balance; }
 .search { flex: 1 1 220px; min-width: 160px; }
 /* 工具条卡（v0.8.9）：过滤 chips / 搜索 / 计数收进一个有表面的容器,告别裸元素。 */
 .toolbarCard { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-card); margin-bottom: var(--space-3); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dsw-alias-label-primary) 4%, transparent); }
@@ -330,7 +337,7 @@ select.input { padding-right: 28px; appearance: none; }
 .itemCheck:active { transform: scale(0.85); }
 .itemBody { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 .itemTags { display: flex; gap: var(--space-1); flex-wrap: wrap; align-items: center; }
-.itemStamp { margin-left: auto; font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); white-space: nowrap; }
+.itemStamp { margin-left: auto; font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .content { white-space: pre-wrap; word-break: break-word; color: var(--dsw-alias-label-primary); font-size: var(--fs-body); line-height: 1.65; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .itemMeta { display: flex; gap: var(--space-3); flex-wrap: wrap; align-items: center; font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); }
 .itemMeta b { font-weight: 500; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
@@ -814,12 +821,18 @@ select.input { padding-right: 28px; appearance: none; }
 .opsWarn { font-size: var(--fs-body); color: var(--dsw-alias-state-warn-primary); }
 .opsNum { font-size: var(--fs-body); color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
 .opsTable { display: flex; flex-direction: column; }
-.opsTableHead { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); letter-spacing: 0.02em; }
-.opsTableRow { display: grid; grid-template-columns: minmax(0, 1.4fr) 72px 88px 80px; gap: var(--space-3); align-items: center; padding: var(--space-2); border-bottom: 1px solid var(--dsw-alias-border-l1); font-size: var(--fs-body); }
+/* 表头与首行之间用稍深的描边分开：否则四列文字和数据行同色，表头会「掉进」数据里。 */
+.opsTableHead { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); letter-spacing: 0.02em; border-bottom-color: var(--dsw-alias-border-l2); }
+/* 表头不是数据行，不给 hover 底纹；数据行跟随鼠标置底，长表也能对上列。 */
+.opsTableRow + .opsTableRow:hover { background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 6%, transparent); }
+.opsTableRow { display: grid; grid-template-columns: minmax(0, 1.4fr) 72px 88px 80px; gap: var(--space-3); align-items: center; padding: var(--space-2); border-bottom: 1px solid var(--dsw-alias-border-l1); font-size: var(--fs-body); transition: background var(--dur-fast) var(--ease-spring); }
 .opsTableRow:last-child { border-bottom: 0; }
+/* 数值列右对齐：命中数与耗时的位数差异大，左对齐时小数点各在各处，扫读困难。 */
+.opsTableRow > :nth-child(2), .opsTableRow > :nth-child(3) { text-align: right; }
 .opsChannelLabel { color: var(--dsw-alias-label-primary); }
 .opsAdoption { display: flex; flex-direction: column; gap: var(--space-3); }
-.opsAdoptionValue { font-size: 40px; line-height: 1; font-weight: 600; letter-spacing: -0.02em; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+/* 采用率主数与今日速览的 KPI 同级（32px）：40px 比页面主指标还抢眼，运维页不该比首页更响。 */
+.opsAdoptionValue { font-size: 32px; line-height: 1.05; font-weight: 600; letter-spacing: -0.02em; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
 .opsAdoptionCounts { display: flex; flex-wrap: wrap; gap: var(--space-5); font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); }
 .opsMetricsGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--space-3); }
 .opsMetricTile { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: var(--space-3) var(--space-4); background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 6%, transparent); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-control); }

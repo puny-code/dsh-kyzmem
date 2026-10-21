@@ -1,7 +1,7 @@
 {
   "name": "dsh-kyzmem",
   "description": "深度求索 Harness 插件：跨会话长期记忆（学习核心）。基于 @kenz1117/dsh-engram 的个人修改版，仅本人自用。",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "icon": "icon.svg",
   "logo": "icon-256.svg",
   "publishConfig": {

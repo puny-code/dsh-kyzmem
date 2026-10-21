@@ -3193,7 +3193,8 @@ function MetricsGrid({ t, metrics }: {
         const exact = value === undefined || !Number.isFinite(value) ? undefined : formatMetricExact(row.format, value)
         return (
           <div key={row.label} className={styles.opsMetricTile}>
-            <span className={styles.opsMetricLabel}>{t(row.label)}</span>
+            {/* 标签单行省略时靠 title 兜底：俄语标签在 150px 的瓦片里会被截断。 */}
+            <span className={styles.opsMetricLabel} title={t(row.label)}>{t(row.label)}</span>
             <span className={styles.opsMetricValue} title={exact}>
               {formatMetricValue(row.format, value)}
             </span>
