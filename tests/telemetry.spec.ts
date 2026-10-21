@@ -183,18 +183,17 @@ describe('R5 六项度量（曝光 / 激活 / 下钻 / token / 锚点）', () =>
     expect(metrics.activationRate).toBe(0.5)
   })
 
-  it('下钻率 = examine 次数 / 工具检索次数；examine 未接线时缺省而不是 0%', () => {
+  it('下钻率 = examine 次数 / 工具检索次数；只有分母为 0 时才缺省', () => {
     const withExamine = computeMetrics({
       windowDays: 7,
       stats: [],
       ops: [op('recall', { mode: 'search' }, 100), op('recall', { mode: 'search' }, 200), op('examine', null, 300)],
     })
     expect(withExamine.drillDownRate).toBe(0.5)
-    // 有工具检索但一条 examine 都没有：现在 examine 还不写 op_log，给 0% 会被读成
-    // 「没人下钻」，所以缺省。
+    // 有工具检索、零 examine：这是真实测量值 0%，不能藏成「—」。
     expect(computeMetrics({ windowDays: 7, stats: [], ops: [op('recall', { mode: 'search' }, 100)] }).drillDownRate)
-      .toBeUndefined()
-    // 首问召回的 recall 不进分母。
+      .toBe(0)
+    // 分母为 0（首问召回的 recall 不算工具检索）才没有口径可言。
     expect(computeMetrics({ windowDays: 7, stats: [], ops: [op('recall', { mode: 'query-recall' }, 100)] }).drillDownRate)
       .toBeUndefined()
   })

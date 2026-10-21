@@ -441,9 +441,9 @@ export function computeMetrics(inputs: MetricInputs): TelemetryMetrics {
     }
     if (row.op === 'recall' && parseDetail(row.detail)?.['mode'] === 'search') indexSearches++
   }
-  const drillDownRate = indexSearches > 0 && examineRuns > 0
-    ? Math.min(1, examineRuns / indexSearches)
-    : undefined
+  // 分母为 0 才给缺省：只要窗口内有人用 index 模式检索，"检索了但没下钻" 就是一个
+  // 真实测量值 0，不能显示成「—」（那会被读成「还没开始测量」）。
+  const drillDownRate = indexSearches > 0 ? Math.min(1, examineRuns / indexSearches) : undefined
 
   // —— R5 stale 命中率 ——
   // stale（文件变了）与 missing（文件没了）都算「可能过期」：对使用者而言含义相同——

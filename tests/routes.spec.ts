@@ -158,7 +158,7 @@ describe('GET /api/kyzmem/stats（§8 指标 + 通道）', () => {
     expect(reply.json.metrics.exposureChars).toBeUndefined()
     expect(reply.json.metrics.activationRate).toBeUndefined()
     expect(reply.json.metrics.tokenCostEstimate).toBeUndefined()
-    // examine 还不写 op_log ⇒ 下钻率缺省（不是 0%）。
+    // 窗口内没有工具检索（分母 0）⇒ 下钻率缺省；有检索但零下钻会是 0%。
     expect(reply.json.metrics.drillDownRate).toBeUndefined()
     // 无带锚条目 ⇒ 锚点过期率缺省。
     expect(reply.json.metrics.staleAnchorRate).toBeUndefined()
