@@ -48,10 +48,29 @@
 /* 自身接管纵向滚动：宿主主列可能是 grid 子项（不滚动），这里声明 overflow-y 保证长列表/日志/回填
    页可独立滚动。内边距只在这一层给（面板内容层不再叠加，避免双重留白）。sticky 浮层定位到本层。
    v0.8.7 安全区：border-box（否则 100%+padding 溢出容器右缘，文字被裁）+ 四周留足 24-32px。 */
-.panelRoot { width: 100%; height: 100%; box-sizing: border-box; overflow-y: auto; overflow-x: hidden; padding: var(--space-5) var(--space-6) var(--space-7); }
-/* 吸顶区（v0.8.13,#15）：Header + Tab 栏在长内容滚动时钉在顶部。
-   z-index 40（drawerLayer 是 41，比它低一级）；背景不透明遮 content 从下方穿过。 */
-.panelSticky { position: sticky; top: 0; z-index: 40; background: var(--dsw-alias-bg-base); padding-bottom: var(--space-1); }
+.panelRoot { width: 100%; height: 100%; box-sizing: border-box; overflow-y: auto; overflow-x: hidden; padding: var(--space-5) var(--space-6) var(--space-7); scroll-padding-top: 104px; }
+/* 吸顶区（v0.8.13,#15；v0.12.1 重做留白）：Header + Tab 栏在长内容滚动时钉在顶部。
+   z-index 40（drawerLayer 是 41，比它低一级）。
+   v0.12.1 之前只有 4px 下内边距、四边零间距：钉住时 scope 段控顶着视口上沿、Tab 下划线与正文贴死，
+   滚动中像一条硬切的色带。现在：
+   - 负外边距抵消左右内边距，背景向两侧各溢出 8px，但内部内容列仍与下方卡片左右对齐；
+   - 上 8px / 下 12px 留白，钉住时不再贴边，正文与下划线之间有呼吸位；
+   - 极淡的下投影收边，替代原来不存在的分割线；
+   - 底色取实色（bg-base）。毛玻璃要透过内容才好看，可滚动容器有 24px 上内边距，
+     半透明会让正文从那道缝里透出来像没盖住；实色 + 下方投影反而干净。 */
+.panelSticky {
+  position: sticky; top: 0; z-index: 40;
+  margin: 0 calc(-1 * var(--space-2));
+  padding: var(--space-2) var(--space-2) var(--space-3);
+  background: var(--dsw-alias-bg-base);
+  box-shadow: 0 12px 16px -16px color-mix(in srgb, var(--dsw-alias-label-primary) 48%, transparent);
+}
+/* 把吸顶条的底色向上续到滚动容器边缘：滚动容器的 24px 上内边距属于滚动区，
+   但吸顶元素钉在内容盒顶边，那道 24px 缝里会漏出正文。高一个身位补上，颜色一致即隐形。 */
+.panelSticky::before {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 100%;
+  height: var(--space-6); background: inherit; pointer-events: none;
+}
 /* 对角双光斑水印：右上琥珀 + 左下玫瑰。伪元素 inset:0 铺满面板，渐变中心用 at 定位到边缘之外——
    光斑视觉在面板外，但绘制面不溢出（旧版负偏移需要 overflow:hidden，会吞掉 sticky 浮层的滚动参照）。
    isolation 建立 stacking context，z-index:-1 让水印垫在流内容之下、panel 背景之上。
@@ -70,6 +89,8 @@
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 20%, transparent); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
+/* 选区底色跟随品牌色：宿主默认的蓝选区与橙调面板打架。 */
+.panel ::selection { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 28%, transparent); color: var(--dsw-alias-label-primary); }
 @keyframes panelIn {
   from { opacity: 0; transform: translateY(6px); filter: blur(2px); }
   to   { opacity: 1; transform: none; filter: blur(0); }
@@ -88,6 +109,10 @@
 /* ---------- Header（单行两端对齐：左 scope 三宫格 / 右 到期角标+重访+导出；按设置弹窗 ~600px 内容区设计，无品牌装饰） ---------- */
 .header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-3); min-height: 36px; position: relative; z-index: 5; }
 .headerActions { display: flex; gap: var(--space-2); align-items: center; flex-shrink: 0; }
+/* 顶栏控件同高：按钮 28 / 下拉与输入框原本 30 / scope 段控 30，混排时基线参差 2px；
+   这里统一压到 28px，段控内边距同步收 1px（24 + 2×2 = 28）。 */
+.header .input { height: 28px; }
+.header .segScope { padding: 2px; }
 
 /* ---------- 线性图标基础样式（Phosphor 风：stroke 1.75 / round cap / currentColor） ---------- */
 .brandIcon { width: 14px; height: 14px; flex: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; fill: none; display: inline-block; vertical-align: middle; }
@@ -106,7 +131,9 @@
 .dueDot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-state-error-primary); flex: none; }
 
 /* ---------- 顶部 Tab Bar（渐变下划线，amber→rose，工具型软件视觉签名） ---------- */
-.tabs { display: flex; align-items: flex-end; gap: var(--space-3); border-bottom: 1px solid var(--dsw-alias-border-l2); position: relative; overflow-x: auto; overflow-y: hidden; }
+.tabs { display: flex; align-items: flex-end; gap: var(--space-3); border-bottom: 1px solid var(--dsw-alias-border-l2); position: relative; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+/* Tab 行横向溢出时只允许滑动，不要那条压在渐变下划线下的滚动条（Windows 上尤其显眼）。 */
+.tabs::-webkit-scrollbar { display: none; }
 .tabItem { position: relative; background: transparent; border: 0; padding: var(--space-2) 0 var(--space-3); color: var(--dsw-alias-label-tertiary); font-size: var(--fs-ctrl); font-weight: 500; cursor: pointer; transition: color var(--dur-fast) var(--ease-spring); display: inline-flex; align-items: center; gap: 6px; flex: none; white-space: nowrap; }
 .tabItem:hover { color: var(--dsw-alias-label-secondary); }
 .tabItem.on { color: var(--dsw-alias-label-primary); }
@@ -206,7 +233,7 @@ button:focus-visible, a:focus-visible,
 .tabItem:focus-visible::after { content: ''; position: absolute; left: -2px; right: -2px; bottom: -1px; height: 2px; background: var(--dsw-alias-brand-primary); border-radius: 2px; }
 .search { flex: 1 1 220px; min-width: 160px; }
 /* 工具条卡（v0.8.9）：过滤 chips / 搜索 / 计数收进一个有表面的容器,告别裸元素。 */
-.toolbarCard { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-card); margin-bottom: var(--space-3); }
+.toolbarCard { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-card); margin-bottom: var(--space-3); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dsw-alias-label-primary) 4%, transparent); }
 .searchBox { position: relative; display: inline-flex; align-items: center; flex: 1 1 240px; min-width: 220px; }
 .searchBox svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 14px; height: 14px; fill: none; stroke: var(--dsw-alias-label-tertiary); stroke-width: 1.75; stroke-linecap: round; pointer-events: none; }
 .searchBox .input { width: 100%; padding-left: 30px; }
@@ -398,7 +425,7 @@ select.input { padding-right: 28px; appearance: none; }
 /* ---------- 侧栏卡片（统一面板单元） ---------- */
 /* 卡片是静态容器：描边只表达边界，不给 hover 反馈（不可点的不装作可点）。
    v0.8+ 内边距从 16 抬到 20，配合主列满宽更舒展。 */
-.panelCard { position: relative; background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); border-radius: var(--radius-card); padding: var(--space-5); animation: cardIn var(--dur-slow) var(--ease-spring) both; }
+.panelCard { position: relative; background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); border-radius: var(--radius-card); padding: var(--space-5); animation: cardIn var(--dur-slow) var(--ease-spring) both; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dsw-alias-label-primary) 4%, transparent); }
 /* 卡片入场：统一使用 opacity + 微缩放，避免与子元素 transform 冲突。 */
 @keyframes cardIn {
   from { opacity: 0; transform: scale(0.99); }

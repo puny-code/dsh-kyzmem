@@ -212,7 +212,7 @@ export interface ResolvedKyzmemConfig {
   readonly queryRewrite: boolean
   readonly autoSlot: boolean
   readonly reviewScheduling: boolean
-  /** 历史回填默认规则（历史会话 → 学习核心的一次性/按需回填）。 */
+  /** 历史回填默认规则（历史会话 → 天枢的一次性/按需回填）。 */
   readonly historyBackfill: ResolvedHistoryRules
   /** Язык вывода серверной половины (после разворачивания «auto» в язык системы). */
   readonly language: KyzmemLanguage

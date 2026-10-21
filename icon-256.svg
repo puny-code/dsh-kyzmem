@@ -1,40 +1,47 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- 学习核心大图标：256×256，正面立柱，渲染端用作市场卡片与详情页头图。 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Memory Palace">
+<!-- 天枢大图标：256×256，用作市场卡片与详情页头图。
+     意象：紫微垣的枢轴——北斗 α 星。深靛夜空里一颗金色四芒星，外围一道倾斜的星轨，
+     轨道上两颗伴星；金色取北斗定位的星图传统，靛底保证在浅色宿主界面上也站得住。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="天枢">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#5b8def" stop-opacity="0.18"/>
-      <stop offset="100%" stop-color="#5b8def" stop-opacity="0.04"/>
+    <linearGradient id="night" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1B2350"/>
+      <stop offset="52%" stop-color="#121739"/>
+      <stop offset="100%" stop-color="#0A0D22"/>
     </linearGradient>
-    <linearGradient id="roof" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#5b8def" stop-opacity="0.95"/>
-      <stop offset="100%" stop-color="#5b8def" stop-opacity="0.65"/>
-    </linearGradient>
-    <linearGradient id="floor" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#5b8def" stop-opacity="0.55"/>
-      <stop offset="100%" stop-color="#5b8def" stop-opacity="0.35"/>
+    <radialGradient id="glow" cx="0.5" cy="0.46" r="0.5">
+      <stop offset="0%" stop-color="#FFD37A" stop-opacity="0.42"/>
+      <stop offset="55%" stop-color="#F0B429" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#F0B429" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="star" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0%" stop-color="#FFF1C9"/>
+      <stop offset="46%" stop-color="#F8CE6B"/>
+      <stop offset="100%" stop-color="#E9A22B"/>
     </linearGradient>
   </defs>
-  <!-- 圆角背板 -->
-  <rect x="8" y="8" width="240" height="240" rx="32" fill="url(#bg)" stroke="#5b8def" stroke-opacity="0.25" stroke-width="2"/>
-  <!-- 三层阶梯 -->
-  <rect x="48" y="200" width="160" height="8" rx="2" fill="url(#floor)"/>
-  <rect x="58" y="208" width="140" height="8" rx="2" fill="url(#floor)"/>
-  <rect x="68" y="216" width="120" height="8" rx="2" fill="url(#floor)"/>
-  <!-- 三角顶 -->
-  <path d="M44 120 L128 56 L212 120 Z" fill="url(#roof)"/>
-  <!-- 立柱与墙身 -->
-  <rect x="60" y="120" width="136" height="80" rx="3" fill="#fff" stroke="#5b8def" stroke-width="3"/>
-  <line x1="60" y1="120" x2="196" y2="120" stroke="#5b8def" stroke-width="3"/>
-  <!-- 左窗 -->
-  <rect x="76" y="136" width="28" height="28" rx="3" fill="none" stroke="#5b8def" stroke-width="3"/>
-  <line x1="90" y1="136" x2="90" y2="164" stroke="#5b8def" stroke-width="2"/>
-  <line x1="76" y1="150" x2="104" y2="150" stroke="#5b8def" stroke-width="2"/>
-  <!-- 中门 -->
-  <path d="M112 200 L112 156 Q112 144 128 144 Q144 144 144 156 L144 200" fill="#fff" stroke="#5b8def" stroke-width="3"/>
-  <circle cx="138" cy="180" r="2.5" fill="#5b8def"/>
-  <!-- 右窗 -->
-  <rect x="152" y="136" width="28" height="28" rx="3" fill="none" stroke="#5b8def" stroke-width="3"/>
-  <line x1="166" y1="136" x2="166" y2="164" stroke="#5b8def" stroke-width="2"/>
-  <line x1="152" y1="150" x2="180" y2="150" stroke="#5b8def" stroke-width="2"/>
+
+  <!-- 夜空背板 -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#night)"/>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="none" stroke="#F0B429" stroke-opacity="0.22" stroke-width="2"/>
+
+  <!-- 星芒辉光 -->
+  <circle cx="124" cy="118" r="104" fill="url(#glow)"/>
+
+  <!-- 星轨：倾斜的椭圆轨道（虚线，暗示运转而非静止） -->
+  <g transform="rotate(-18 128 128)" fill="none">
+    <ellipse cx="128" cy="128" rx="104" ry="64" stroke="#F6D68C" stroke-opacity="0.34" stroke-width="2.4" stroke-dasharray="7 11"/>
+  </g>
+
+  <!-- 伴星：轨道上两颗小星 -->
+  <circle cx="196" cy="76" r="6" fill="#FFE7B0" fill-opacity="0.9"/>
+  <circle cx="196" cy="76" r="13" fill="#FFE7B0" fill-opacity="0.10"/>
+  <circle cx="63" cy="182" r="4.5" fill="#FFE7B0" fill-opacity="0.75"/>
+  <circle cx="63" cy="182" r="11" fill="#FFE7B0" fill-opacity="0.08"/>
+
+  <!-- 枢星：四芒 -->
+  <path d="M124 44 L141 105 L202 122 L141 139 L124 200 L107 139 L46 122 L107 105 Z"
+        fill="url(#star)" stroke="#FFF4D6" stroke-opacity="0.55" stroke-width="1.6" stroke-linejoin="round"/>
+  <!-- 星芯 -->
+  <circle cx="124" cy="122" r="9" fill="#FFFCF0"/>
 </svg>

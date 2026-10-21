@@ -5,10 +5,10 @@
 
 import type { KyzmemKey } from './index.ts'
 
-/** 英文词典。整页采用「Memory Palace」语言：palace / room (kind group) / memory / placard / tour / curator / corridor。
+/** 英文词典。整页沿用 palace 语汇，入口名 Tianshu（北斗 α 星，意为“天枢/极星”）：palace / room (kind group) / memory / placard / tour / curator / corridor。
    数据层英文枚举（status/kind/op）不在此映射，文案键保持稳定。 */
 export const en: Record<KyzmemKey, string> = {
-  nav: 'Memory Palace',
+  nav: 'Tianshu',
   scopeUser: 'Private',
   scopeProject: 'Project',
   scopeShared: 'Shared',

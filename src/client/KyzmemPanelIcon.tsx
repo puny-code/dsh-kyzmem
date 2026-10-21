@@ -1,12 +1,12 @@
 /**
- * 顶层侧栏「学习核心」入口图标。
+ * 顶层侧栏「天枢」入口图标。
  *
- * v0.8.15:回归宿主单色规范（issue #19 用户反馈:amber→orange→rose 品牌 tile
- * 在一排单色图标中过于醒目）。v0.8.10 的「与彩色邻居对齐」方案撤销——侧栏
- * 图标的平台约定优先于插件品牌表达。宫殿剪影改为 currentColor 描边,深浅
- * 主题与选中态全部交给宿主;描边从 1.6 提到 1.7,补回 tile 时代的视觉分量。
+ * v0.12.1：随改名重绘。天枢是北斗七星的 α 星（紫微垣的枢轴），旧版宫殿剪影换成
+ * 「枢星 + 星轨」：四芒星是那颗用来定位的极星，外围一道弧是绕它运转的星轨——
+ * 既扣住名字，也对应这个插件做的事（给长期记忆定一个可回访的坐标）。
  *
- * 宿主只传 size(塌缩 16 / 展开 18)。
+ * 仍守宿主单色规范：只用 currentColor，描边粗细与邻居一致（1.6 / round），
+ * 深浅主题与选中态全部交给宿主。宿主只传 size（塌缩 16 / 展开 18）。
  * @module dsh-kyzmem/client/KyzmemPanelIcon
  */
 
@@ -17,13 +17,13 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 export function KyzmemPanelIcon({ size }: PropsRuntime<'sidebar.panellist'>): ReactElement {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <g fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
-        {/* 宫殿剪影:屋顶 / 墙身 / 门洞 / 地基 */}
-        <path d="M6.5 10.4 L12 6.4 L17.5 10.4" />
-        <path d="M7.8 10.4 V17 H16.2 V10.4" />
-        <path d="M10.6 17 V13.6 Q10.6 12.5 12 12.5 Q13.4 12.5 13.4 13.6 V17" />
-        <path d="M7.5 19.6 H16.5" opacity={0.55} />
+      <g fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+        {/* 枢星：四芒 */}
+        <path d="M12 5 L13.3 10.7 L19 12 L13.3 13.3 L12 19 L10.7 13.3 L5 12 L10.7 10.7 Z" />
+        {/* 星轨：绕枢星的一段弧。弧与右芒留 2px 间隙——贴太近缩到 16px 会黏成一条尾巴 */}
+        <path d="M20.3 5.7 A 10.6 10.6 0 0 1 17.3 19.9" opacity={0.5} />
       </g>
+      <circle cx="12" cy="12" r="1.5" fill="currentColor" />
     </svg>
   )
 }

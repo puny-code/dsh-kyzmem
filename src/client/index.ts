@@ -1,5 +1,5 @@
 /**
- * dsh-kyzmem client half: 注册顶层侧栏「学习核心」入口与主列面板。
+ * dsh-kyzmem client half: 注册顶层侧栏「天枢」入口与主列面板。
  * v0.7.16+ 由设置弹窗内的 section 升级为顶层入口，与「Hyreal FDE 工作台」平起平坐：
  * 一击进入 + 主列满宽，不再被设置弹窗的 ~600px 限制。
  * 数据经回环 API（/api/kyzmem/*）读取与操作，与 host 半的路由对齐。

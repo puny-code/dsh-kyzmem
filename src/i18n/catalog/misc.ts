@@ -22,7 +22,7 @@ export const zh = {
   'misc.archivePathOutsideDbDir': 'archivePath 必须在 dbDir 内',
   'misc.restoreFailed': '恢复失败：{message}',
   // mirror/markdown.ts
-  'misc.mirrorTitle': '# 学习核心 · {palace}',
+  'misc.mirrorTitle': '# 天枢 · {palace}',
   'misc.mirrorPalacePersonal': '私人宫殿',
   'misc.mirrorPalaceProject': '项目宫殿',
   'misc.mirrorSummary': '> 导出时间 {at} · 共 **{total}** 条记忆（对外开放 {active}） · 走廊 {edges} 条',
@@ -66,7 +66,7 @@ export const en = {
   'misc.archivePathOutsideDbDir': 'archivePath must be inside dbDir',
   'misc.restoreFailed': 'restore failed: {message}',
   // mirror/markdown.ts
-  'misc.mirrorTitle': '# Memory palace · {palace}',
+  'misc.mirrorTitle': '# Tianshu · {palace}',
   'misc.mirrorPalacePersonal': 'Personal palace',
   'misc.mirrorPalaceProject': 'Project palace',
   'misc.mirrorSummary': '> Exported at {at} · **{total}** memories in total ({active} public) · {edges} corridors',
@@ -107,7 +107,7 @@ export const ru = {
   'misc.archivePathOutsideDbDir': 'archivePath должен находиться внутри dbDir',
   'misc.restoreFailed': 'восстановление не удалось: {message}',
   // mirror/markdown.ts
-  'misc.mirrorTitle': '# Дворец памяти · {palace}',
+  'misc.mirrorTitle': '# Тяньшу · {palace}',
   'misc.mirrorPalacePersonal': 'Личный дворец',
   'misc.mirrorPalaceProject': 'Дворец проекта',
   'misc.mirrorSummary': '> Экспорт {at} · всего **{total}** записей (открыто {active}) · коридоров {edges}',

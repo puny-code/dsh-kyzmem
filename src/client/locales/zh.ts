@@ -5,10 +5,10 @@
 
 import type { KyzmemKey } from './index.ts'
 
-/** 中文词典（宿主默认语言）。整页采用「学习核心」语言：宫殿 / 房间（kind 分组）/ 记忆 / 铭牌 / 参观 / 管家 / 走廊。
+/** 中文词典（宿主默认语言）。整页沿用「记忆宫殿」语汇，入口名取「天枢」（北斗第一星，取“枢轴/极星”之意）：宫殿 / 房间（kind 分组）/ 记忆 / 铭牌 / 参观 / 管家 / 走廊。
    数据层英文枚举（status/kind/op）不在此映射，文案键保持稳定以保证编译约束。 */
 export const zh: Record<KyzmemKey, string> = {
-  nav: '学习核心',
+  nav: '天枢',
   scopeUser: '私人',
   scopeProject: '项目',
   scopeShared: '共享',

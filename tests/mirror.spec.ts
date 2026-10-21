@@ -58,7 +58,7 @@ describe('Markdown 镜像导出', () => {
     await store.write({ scope: 'user', kind: 'episode', content: '事件一', importance: 0.6 })
     const report = await writeMirror(mirrorRoot, await store.exportAll(), 'zh')
     const index = await readFile(join(mirrorRoot, '_index.md'), 'utf8')
-    expect(index).toContain('# 学习核心 · 私人宫殿')
+    expect(index).toContain('# 天枢 · 私人宫殿')
     expect(index).toContain('## 房间导览')
     expect(index).toContain('**事实厅** · 2 条记忆')
     expect(index).toContain('**往事廊** · 1 条记忆')
