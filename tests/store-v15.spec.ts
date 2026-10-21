@@ -393,3 +393,82 @@ describe('scheduleReview 接入重学窗口', () => {
     expect(scheduled?.review?.intervalDays).toBe(1)
   })
 })
+
+describe('检索副作用控制（touch / auditMode / auditQuery / markRetrieved）', () => {
+  it('touch:false 不强化命中，但 recall 审计照写', async () => {
+    const record = await store.write({ scope: 'user', kind: 'fact', content: '只读检索的条目', confidence: 0.5 })
+    const before = await store.get(record.id)
+    const result = await store.search({ text: '只读检索', scopes: ['user'], touch: false }, undefined)
+    expect(result.hits.map(hit => hit.record.id)).toEqual([record.id])
+
+    const after = await store.get(record.id)
+    expect(after?.accessCount).toBe(before?.accessCount)
+    expect(after?.confidence).toBeCloseTo(before!.confidence, 5)
+    expect(after?.lastRetrievedAt).toBe(before?.lastRetrievedAt)
+
+    // 审计与 touch 解耦：不强化也要留下「召回过什么」，否则自动召回不可观测（评审 M4）。
+    expect(await store.countAudit('recall', 0)).toBe(1)
+    const detail = JSON.parse((await store.recentAudit('recall', 1))[0]!.detail!) as { ids: string[]; mode: string }
+    expect(detail.ids).toEqual([record.id])
+    expect(detail.mode).toBe('search')
+  })
+
+  it('缺省 touch=true 仍强化（access_count+1 / confidence+0.05）', async () => {
+    const record = await store.write({ scope: 'user', kind: 'fact', content: '默认强化条目', confidence: 0.5 })
+    await store.search({ text: '默认强化', scopes: ['user'] }, undefined)
+    const after = await store.get(record.id)
+    expect(after?.accessCount).toBe(1)
+    expect(after?.confidence).toBeCloseTo(0.55, 5)
+  })
+
+  it('auditMode 落库：自动召回与工具检索可区分', async () => {
+    await store.write({ scope: 'user', kind: 'fact', content: '审计模式条目' })
+    await store.search({ text: '审计模式', scopes: ['user'], auditMode: 'query-recall' }, undefined)
+    const auto = JSON.parse((await store.recentAudit('recall', 1))[0]!.detail!) as { mode: string }
+    expect(auto.mode).toBe('query-recall')
+    // 缺省保持旧行为 'search'（不破坏既有指标与测试）。
+    await store.search({ text: '审计模式', scopes: ['user'] }, undefined)
+    const tool = JSON.parse((await store.recentAudit('recall', 1))[0]!.detail!) as { mode: string }
+    expect(tool.mode).toBe('search')
+  })
+
+  it('auditQuery：raw 默认存原文；hash 只存 16 位哈希；none 都不存', async () => {
+    // 查询必须命中至少一条（否则不会写 recall 审计）：正文同时含命中词与密钥。
+    const queryText = '隐私审计条目 sk-abcdefghijklmnop'
+    const secret = 'sk-abcdefghijklmnop'
+    await store.write({ scope: 'user', kind: 'fact', content: '隐私审计条目' })
+
+    await store.search({ text: queryText, scopes: ['user'] }, undefined)
+    const raw = JSON.parse((await store.recentAudit('recall', 1))[0]!.detail!) as { query?: string; queryHash?: string }
+    expect(raw.query).toBe(queryText)
+
+    await store.search({ text: queryText, scopes: ['user'], auditQuery: 'hash' }, undefined)
+    const hashed = JSON.parse((await store.recentAudit('recall', 1))[0]!.detail!) as { query?: string; queryHash?: string }
+    expect(hashed.query).toBeUndefined()
+    expect(hashed.queryHash).toMatch(/^[0-9a-f]{16}$/)
+    expect(JSON.stringify(hashed)).not.toContain(secret)
+
+    await store.search({ text: queryText, scopes: ['user'], auditQuery: 'none' }, undefined)
+    const none = JSON.parse((await store.recentAudit('recall', 1))[0]!.detail!) as { query?: string; queryHash?: string }
+    expect(none.query).toBeUndefined()
+    expect(none.queryHash).toBeUndefined()
+    expect(JSON.stringify(none)).not.toContain(secret)
+  })
+
+  it('markRetrieved 只推进检索时钟与 confidence，不动 access_count', async () => {
+    const record = await store.write({ scope: 'user', kind: 'fact', content: '被展示过但没用', confidence: 0.5 })
+    expect(record.accessCount).toBe(0)
+    const before = record.lastRetrievedAt
+    await store.markRetrieved([record.id])
+
+    const after = await store.get(record.id)
+    // 关键：access_count 不动——被召回一次就免疫衰减是评审 M6 指出的反馈回路。
+    expect(after?.accessCount).toBe(0)
+    expect(after?.confidence).toBeCloseTo(0.52, 5)
+    expect(after?.lastRetrievedAt).toBeGreaterThanOrEqual(before ?? 0)
+
+    // 空数组 no-op；缺失 id 静默（并发删除时不该炸召回路径）。
+    await expect(store.markRetrieved([])).resolves.toBeUndefined()
+    await expect(store.markRetrieved([asMemoryId('missing-id')])).resolves.toBeUndefined()
+  })
+})

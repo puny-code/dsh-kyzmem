@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { openKyzmemStore } from '../src/store/sqlite.ts'
 import type { KyzmemStore } from '../src/store/interface.ts'
-import { createKyzmemTools } from '../src/tools/create.ts'
+import { createKyzmemTools, rememberCitationRefs } from '../src/tools/create.ts'
 
 /** 工具执行的可调用视图：只保留 execute，exec 参数收窄为真实 ToolRunContext。 */
 type ExecutableTool = { execute: (args: unknown, exec: ToolRunContext) => Promise<unknown> }
@@ -868,6 +868,89 @@ describe('kyzmem_search 三档渲染模式（contract §7）', () => {
     const result = await tools2.get('kyzmem_export')!.execute({ format: 'markdown', scope: 'user' }, fakeExec) as { text: string }
     expect(result.text).toContain('警告')
     expect(result.text).toContain('未脱敏')
+  })
+})
+
+describe('kyzmem_examine 的三种 id 形态（评审 P1-2）', () => {
+  let dir3: string
+  let store3: KyzmemStore
+  let tools3: Map<string, ExecutableTool>
+
+  /** 每个用例独享会话 id：citationRefs 是进程级映射，复用会话会串批次。 */
+  const execFor = (sessionId: string): ToolRunContext => ({
+    agent: { id: sessionId, session: { id: sessionId, snapshotEvents: () => [] } },
+    signal: new AbortController().signal,
+  } as unknown as ToolRunContext)
+
+  beforeEach(async () => {
+    dir3 = await mkdtemp(join(tmpdir(), 'kyzmem-examine-'))
+    store3 = await openKyzmemStore(join(dir3, 'user.db'))
+    tools3 = new Map<string, ExecutableTool>(
+      createKyzmemTools({
+        language: 'zh',
+        openStore: async () => store3,
+        resolveProjectStore: async () => store3,
+        embedder: Promise.resolve(undefined),
+        call: undefined,
+        routeOverride: undefined,
+        queryRewrite: false,
+        exportDir: join(dir3, 'exports'),
+      }).map(tool => [tool.name, tool]),
+    )
+  })
+  afterEach(async () => {
+    await store3.close()
+  })
+
+  it('完整 UUID：原样查得到，输出回带完整 id', async () => {
+    const saved = await store3.write({ scope: 'user', kind: 'fact', content: '完整 id 的条目' })
+    const exec = execFor('sess-examine-uuid')
+    const result = await tools3.get('kyzmem_examine')!.execute({ ids: [String(saved.id)] }, exec) as { text: string }
+    expect(result.text).toContain(String(saved.id))
+    expect(result.text).toContain('完整 id 的条目')
+  })
+
+  it('≥8 位十六进制前缀（带不带 #）都能解析到唯一条目', async () => {
+    const saved = await store3.write({ scope: 'user', kind: 'fact', content: '前缀可查的条目' })
+    const exec = execFor('sess-examine-prefix')
+    const prefix = String(saved.id).slice(0, 8)
+    for (const token of [prefix, `#${prefix}`]) {
+      const result = await tools3.get('kyzmem_examine')!.execute({ ids: [token] }, exec) as { text: string }
+      // 结果必须给回完整 id：前缀只是入口，后续工具（update/forget/report）要的是完整 id。
+      expect(result.text, token).toContain(String(saved.id))
+      expect(result.text).toContain('前缀可查的条目')
+    }
+  })
+
+  it('search 行尾的 ref（scope/#8）：经会话批次映射反查到条目', async () => {
+    const saved = await store3.write({ scope: 'user', kind: 'fact', content: 'ref 可查的条目' })
+    const exec = execFor('sess-examine-ref')
+    const searched = await tools3.get('kyzmem_search')!.execute({ query: 'ref 可查', scope: 'user' }, exec) as { text: string }
+    const ref = /ref=([^\s）]+)/.exec(searched.text)?.[1]
+    expect(ref).toBeDefined()
+    const result = await tools3.get('kyzmem_examine')!.execute({ ids: [ref] }, exec) as { text: string }
+    expect(result.text).toContain(String(saved.id))
+    expect(result.text).toContain('ref 可查的条目')
+  })
+
+  it('导出的 rememberCitationRefs 接受 {ref, record} 形态（首问召回登记用）', async () => {
+    const saved = await store3.write({ scope: 'user', kind: 'fact', content: '直接登记 ref 的条目' })
+    const exec = execFor('sess-examine-direct')
+    rememberCitationRefs('sess-examine-direct', 'batch-direct', [
+      { ref: 'user/#abcdef12', record: { scope: 'user', id: saved.id } },
+    ])
+    const result = await tools3.get('kyzmem_examine')!.execute({ ids: ['user/#abcdef12'] }, exec) as { text: string }
+    expect(result.text).toContain(String(saved.id))
+    expect(result.text).toContain('直接登记 ref 的条目')
+  })
+
+  it('格式不认识 与 库里没有 是两种错误，文案可区分', async () => {
+    const exec = execFor('sess-examine-errors')
+    const badFormat = tools3.get('kyzmem_examine')!.execute({ ids: ['这不是 id@@'] }, exec)
+    await expect(badFormat).rejects.toThrow('无法识别')
+    // 格式合法（8 位 hex）但库里没有：错在数据，不在用法，模型该做的是换 id 而不是改格式。
+    const notFound = tools3.get('kyzmem_examine')!.execute({ ids: ['deadbeef'] }, exec)
+    await expect(notFound).rejects.toThrow('库里没有')
   })
 })
 

@@ -93,6 +93,104 @@ const KINDS = ['fact', 'preference', 'decision', 'episode', 'skill'] as const
  */
 type SearchMode = 'index' | 'timeline' | 'full'
 
+/** 证据 ref 指向的条目坐标（分库 + 完整 id）。 */
+export interface CitationRefTarget {
+  readonly scope: KyzmemScope
+  readonly id: MemoryId
+}
+
+/**
+ * `rememberCitationRefs` 接受的条目形态：
+ * - 工具检索：`{ ref, hit }`（SearchHit.record 即坐标）；
+ * - 首问召回：`{ ref, record }`（query-recall 的候选直接给记录）。
+ * 两种都收，调用点不必为自己造一个假 SearchHit。
+ */
+export interface CitationRefEntry {
+  readonly ref: string
+  readonly hit?: { readonly record: CitationRefTarget }
+  readonly record?: CitationRefTarget
+}
+
+/**
+ * 批次 ref → 记忆坐标（进程内、按会话隔离）。
+ *
+ * 为什么需要：ref 在有宫位时只含「房间#桩位」，不含完整 id；assess 判充分后要按 ref
+ * 做引用强化，examine 也要能把 ref 还原成条目，因此登记批次时顺手留一份映射。
+ * 键 = `${sessionId}\u0000${batchId}`，避免跨会话串号。
+ */
+const citationRefs = new Map<string, Map<string, CitationRefTarget>>()
+/** 会话上限保护：工具进程长驻，批次映射不能无限增长（超限丢最旧，旧批次本就不可再引用）。 */
+const CITATION_REF_SESSIONS_MAX = 32
+
+/**
+ * 登记一批证据 ref → 条目坐标。工具检索（`kyzmem_search`）与首问召回共用：
+ * 评审 M2 要求召回批次也能参与引用强化与 examine 反查，否则「同一道证据门」只对了一半。
+ *
+ * @param sessionId - 会话标识（召回/检索都按会话隔离）。
+ * @param batchId - 证据批次 id（`evidenceBatches.register` 返回）。
+ * @param kept - 本次输出里可引用的条目（ref + 坐标）。
+ */
+export function rememberCitationRefs(sessionId: string, batchId: string, kept: readonly CitationRefEntry[]): void {
+  const map = new Map<string, CitationRefTarget>()
+  for (const entry of kept) {
+    const target = entry.record ?? entry.hit?.record
+    if (target === undefined) continue
+    map.set(entry.ref, target)
+  }
+  citationRefs.set(`${sessionId}\u0000${batchId}`, map)
+  if (citationRefs.size > CITATION_REF_SESSIONS_MAX * MAX_BATCHES_PER_SESSION) {
+    const oldest = citationRefs.keys().next()
+    if (oldest.done !== true) citationRefs.delete(oldest.value)
+  }
+}
+
+/** 会话内全部批次 ref 的合并视图（examine 按 ref 找条目时用；后登记的批次覆盖同名 ref）。 */
+function citationRefIndex(sessionId: string): ReadonlyMap<string, CitationRefTarget> {
+  const merged = new Map<string, CitationRefTarget>()
+  const prefix = `${sessionId}\u0000`
+  for (const [key, map] of citationRefs) {
+    if (!key.startsWith(prefix)) continue
+    for (const [ref, target] of map) merged.set(ref, target)
+  }
+  return merged
+}
+
+/**
+ * examine 接受的三种 id 形态（评审 P1-2）：
+ * 完整 UUID（`456b…`）、≥8 位十六进制前缀（`456b8435` / `#456b8435`）、
+ * 以及 search/recall 行尾给出的 ref（`user/#456b8435` 或带宫位的 `user/偏好阁#3`）。
+ * 为什么要放宽：召回块里给模型看的是 ref、提示行给的是完整 UUID，抄哪个都可能喂不进
+ * examine；让入口同时认三种形态，比要求模型「抄对那一个」可靠得多。
+ */
+type ExamineToken =
+  | { readonly kind: 'id'; readonly raw: string }
+  | { readonly kind: 'ref'; readonly raw: string; readonly scope: KyzmemScope }
+  | { readonly kind: 'prefix'; readonly raw: string; readonly prefix: string }
+  | { readonly kind: 'invalid'; readonly raw: string }
+
+const EXAMINE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const EXAMINE_SCOPED_REF = /^(user|project|shared)\/(.+)$/i
+const EXAMINE_HEX_PREFIX = /^#?([0-9a-f]{8,})$/i
+const EXAMINE_SCOPES: readonly KyzmemScope[] = ['user', 'project', 'shared']
+
+/** 把单个 token 解析成上述形态；解析不了返回 invalid（后续与「库里没有」分开报错）。 */
+function parseExamineToken(raw: string): ExamineToken {
+  const token = raw.trim().replace(/^[`'"(<]+|[`'")>]+$/g, '')
+  if (token === '') return { kind: 'invalid', raw }
+  if (EXAMINE_UUID.test(token)) return { kind: 'id', raw: token }
+  const scoped = EXAMINE_SCOPED_REF.exec(token)
+  if (scoped !== null) {
+    const scope = scoped[1]?.toLowerCase()
+    if (scope === 'user' || scope === 'project' || scope === 'shared') {
+      return { kind: 'ref', raw: token, scope }
+    }
+    return { kind: 'invalid', raw }
+  }
+  const prefix = EXAMINE_HEX_PREFIX.exec(token.replace(/^#/, ''))
+  if (prefix !== null) return { kind: 'prefix', raw: token, prefix: (prefix[1] ?? '').toLowerCase() }
+  return { kind: 'invalid', raw }
+}
+
 /**
  * 工具执行期的会话 cwd：project scope 的读写据此解析项目宫殿。
  * 用 AsyncLocalStorage 而不是模块级变量：同一进程里多个会话的工具调用可能交错，
@@ -310,25 +408,6 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
   const MAX_SAVE_BATCH = 10
 
   /**
-   * 批次 ref → 记忆坐标。为什么不用 evidence.ts 的 ref 反解：ref 在有宫位时只含
-   * 「房间#桩位」，不含完整 id；assess 判定充分后要按 ref 做引用强化，必须拿到真实 id。
-   * 注册批次时顺手留一份映射，按 `${sessionId}\u0000${batchId}` 键存，避免跨会话串号。
-   */
-  const citationRefs = new Map<string, Map<string, { scope: KyzmemScope; id: MemoryId }>>()
-  const CITATION_REF_SESSIONS_MAX = 32
-
-  function rememberCitationRefs(sessionId: string, batchId: string, kept: readonly { readonly ref: string; readonly hit: SearchHit }[]): void {
-    const map = new Map<string, { scope: KyzmemScope; id: MemoryId }>()
-    for (const entry of kept) map.set(entry.ref, { scope: entry.hit.record.scope, id: entry.hit.record.id })
-    citationRefs.set(`${sessionId}\u0000${batchId}`, map)
-    // 上限保护：工具进程长驻，批次映射不能无限增长（超限丢最旧，旧批次本就不可再引用）。
-    if (citationRefs.size > CITATION_REF_SESSIONS_MAX * MAX_BATCHES_PER_SESSION) {
-      const oldest = citationRefs.keys().next()
-      if (oldest.done !== true) citationRefs.delete(oldest.value)
-    }
-  }
-
-  /**
    * 引用强化：判定「证据充分且确实引用了」后，给每条被引用的记忆 +0.02（上限由 store 侧夹）。
    * store 可能尚未实现 reinforceCitation（并行落地中）：能力缺失或失败都不影响 assess 的判定结果，
    * 失败记 op_log 供事后排查，绝不向模型抛错。
@@ -337,7 +416,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     if (sessionId === undefined || refs.length === 0) return
     const map = citationRefs.get(`${sessionId}\u0000${batchId}`)
     if (map === undefined) return
-    const targets = new Map<string, { scope: KyzmemScope; id: MemoryId }>()
+    const targets = new Map<string, CitationRefTarget>()
     for (const ref of refs) {
       const target = map.get(ref)
       if (target !== undefined) targets.set(String(target.id), target)
@@ -638,7 +717,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           },
         } },
       },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescriptionProject') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
       importance: { type: 'number', description: message('tool.saveImportanceDescription') },
       placard: { type: 'string', description: message('tool.savePlacardDescription') },
     },
@@ -765,9 +844,9 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     description: message('tool.searchDescription'),
     parameters: {
       query: { type: 'string', required: true, description: message('tool.searchQueryDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
       room: { type: 'string', description: message('tool.searchRoomDescription') },
-      limit: { type: 'number', description: message('tool.searchLimitDescription') },
+      limit: { type: 'number', description: message('tool.limitDescription', { default: 8 }) },
       asOf: { type: 'string', description: message('tool.searchAsOfDescription') },
       mode: { type: 'string', enum: ['index', 'timeline', 'full'], description: message('tool.searchModeDescription') },
     },
@@ -957,12 +1036,12 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_facts',
     description: message('tool.factsDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescriptionProject') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
       entityId: { type: 'string', description: message('tool.factsEntityIdDescription') },
       entity: { type: 'string', description: message('tool.factsEntityDescription') },
       asOf: { type: 'string', description: message('tool.factsAsOfDescription') },
       includeInvalid: { type: 'boolean', description: message('tool.factsIncludeInvalidDescription') },
-      limit: { type: 'number', description: message('tool.limitDescription20') },
+      limit: { type: 'number', description: message('tool.limitDescription', { default: 20 }) },
       offset: { type: 'number', description: message('tool.factsOffsetDescription') },
       facts: {
         type: 'array',
@@ -1200,7 +1279,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_timeline',
     description: message('tool.timelineDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
       topic: { type: 'string', description: message('tool.timelineTopicDescription') },
       since: { type: 'string', description: message('tool.sinceDescription') },
       until: { type: 'string', description: message('tool.untilDescription') },
@@ -1245,13 +1324,13 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_episode_timeline',
     description: message('tool.episodeTimelineDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
-      since: { type: 'string', description: message('tool.sinceDateDescription') },
-      until: { type: 'string', description: message('tool.untilDateDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
+      since: { type: 'string', description: message('tool.sinceDescription') },
+      until: { type: 'string', description: message('tool.untilDescription') },
       sessionId: { type: 'string', description: message('tool.episodeSessionIdDescription') },
       around: { type: 'string', description: message('tool.episodeAroundDescription') },
       windowMinutes: { type: 'number', description: message('tool.episodeWindowMinutesDescription', { minutes: EPISODE_PROXIMITY_MS_DEFAULT / 60000 }) },
-      limit: { type: 'number', description: message('tool.episodeLimitDescription', { limit: EPISODE_TIMELINE_LIMIT_DEFAULT }) },
+      limit: { type: 'number', description: message('tool.limitDescription', { default: EPISODE_TIMELINE_LIMIT_DEFAULT }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1330,7 +1409,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     parameters: {
       id: { type: 'string', required: true, description: message('tool.updateIdDescription') },
       content: { type: 'string', required: true, description: message('tool.updateContentDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.updateScopeDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
       kind: { type: 'string', enum: [...KINDS], description: message('tool.updateKindDescription') },
       placard: { type: 'string', description: message('tool.updatePlacardDescription') },
     },
@@ -1371,7 +1450,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     description: message('tool.forgetDescription'),
     parameters: {
       id: { type: 'string', required: true, description: message('tool.idDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.entryScopeDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
       reason: { type: 'string', required: true, description: message('tool.forgetReasonDescription') },
       affects: { type: 'string', required: true, description: message('tool.forgetAffectsDescription') },
       stillUseful: { type: 'string', required: true, description: message('tool.forgetStillUsefulDescription') },
@@ -1451,8 +1530,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_audit_forgotten',
     description: message('tool.auditForgottenDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
-      limit: { type: 'integer', description: message('tool.limitDescription20') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
+      limit: { type: 'integer', description: message('tool.limitDescription', { default: 20 }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1501,8 +1580,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_review_queue',
     description: message('tool.reviewQueueDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
-      limit: { type: 'integer', description: message('tool.reviewQueueLimitDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
+      limit: { type: 'integer', description: message('tool.limitDescription', { default: 10 }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1546,7 +1625,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       id: { type: 'string', required: true, description: message('tool.idDescription') },
       outcome: { type: 'string', enum: ['success', 'failure'], description: message('tool.reportOutcomeDescription') },
       grade: { type: 'integer', description: message('tool.reportGradeDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.entryScopeDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
@@ -1600,7 +1679,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     description: message('tool.reviewDescription'),
     parameters: {
       id: { type: 'string', required: true, description: message('tool.idDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.entryScopeDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'project' }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1652,7 +1731,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_stats',
     description: message('tool.statsDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1708,7 +1787,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     description: message('tool.exportDescription'),
     parameters: {
       format: { type: 'string', enum: ['markdown', 'json', 'markdown-mirror'], description: message('tool.exportFormatDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
       redactedView: { type: 'boolean', description: message('tool.exportRedactedDescription') },
     },
     output: {
@@ -1792,7 +1871,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     description: message('tool.importDescription'),
     parameters: {
       path: { type: 'string', description: message('tool.importPathDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.importScopeDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'user' }) },
       format: { type: 'string', enum: ['json', 'markdown'], description: message('tool.importFormatDescription') },
       dryRun: { type: 'boolean', description: message('tool.importDryRunDescription') },
       keepDuplicates: { type: 'boolean', description: message('tool.importKeepDuplicatesDescription') },
@@ -1891,7 +1970,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_distill',
     description: message('tool.distillDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescriptionUser') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'user' }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1933,7 +2012,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     name: 'kyzmem_reflect',
     description: message('tool.reflectDescription'),
     parameters: {
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescriptionUser') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'user' }) },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
@@ -1993,8 +2072,68 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
   })
 
   /**
+   * 按 8+ 位十六进制前缀找 id。
+   * store 没有前缀查询接口（存储层不在本层改动范围），只能分页 list 后过滤；
+   * examine 是低频路径，5000 条扫描上限足够兜底，真到上限的库应当改用完整 id。
+   */
+  async function findIdsByPrefix(scope: KyzmemScope, prefix: string): Promise<MemoryId[]> {
+    const store = await deps.openStore(scope)
+    const matches: MemoryId[] = []
+    const pageSize = 500
+    for (let offset = 0; offset < 5000; offset += pageSize) {
+      const page = await store.list({ scope, limit: pageSize, offset })
+      for (const record of page.records) {
+        if (String(record.id).toLowerCase().startsWith(prefix)) matches.push(record.id)
+      }
+      if (page.records.length < pageSize) break
+    }
+    return matches
+  }
+
+  /** 单个 examine token 的解析结果：命中坐标 / 前缀歧义（列候选）/ 都没命中。 */
+  interface ExamineResolution {
+    readonly target?: CitationRefTarget
+    readonly ambiguous?: readonly MemoryId[]
+  }
+
+  /**
+   * token → 条目坐标。ref 先查会话里的批次映射（能还原带宫位的 ref），
+   * 查不到再按 `#8` 前缀扫库；完整 UUID 依次在 user / project / shared 里 get。
+   */
+  async function resolveExamineToken(token: ExamineToken, refs: ReadonlyMap<string, CitationRefTarget>): Promise<ExamineResolution> {
+    if (token.kind === 'invalid') return {}
+    if (token.kind === 'ref') {
+      const direct = refs.get(token.raw) ?? refs.get(token.raw.toLowerCase())
+      if (direct !== undefined) return { target: direct }
+      // `user/#8hex`：会话映射里没有（跨会话/重启后）时，还能拆出前缀按 scope 查。
+      const short = /^#?([0-9a-f]{8,})$/i.exec(token.raw.slice(token.scope.length + 1))
+      if (short === null) return {}
+      const matches = await findIdsByPrefix(token.scope, (short[1] ?? '').toLowerCase())
+      const only = matches[0]
+      if (matches.length === 1 && only !== undefined) return { target: { scope: token.scope, id: only } }
+      return matches.length > 1 ? { ambiguous: matches } : {}
+    }
+    if (token.kind === 'prefix') {
+      const matches: CitationRefTarget[] = []
+      for (const scope of ['user', 'project'] as const) {
+        for (const id of await findIdsByPrefix(scope, token.prefix)) matches.push({ scope, id })
+      }
+      const only = matches[0]
+      if (matches.length === 1 && only !== undefined) return { target: only }
+      return matches.length > 1 ? { ambiguous: matches.map(match => match.id) } : {}
+    }
+    // 完整 UUID：不知道在哪个库，按 user → project → shared 逐个 get（单次最多 16 条，代价可控）。
+    for (const scope of EXAMINE_SCOPES) {
+      const record = await (await deps.openStore(scope)).get(asMemoryId(token.raw))
+      if (record !== undefined) return { target: { scope, id: record.id } }
+    }
+    return {}
+  }
+
+  /**
    * 渐进式披露 — 记忆铭牌批量访客：拿到一组 id 后才决定取哪几条。
    * 与 kyzmem_search 配合使用：search 只返门牌号摘要，examine 才进房看铭牌。
+   * ids 接受完整 UUID、≥8 位十六进制前缀、search/recall 输出里的 ref 三种形态（评审 P1-2）。
    */
   const examine = defineTool({
     name: 'kyzmem_examine',
@@ -2006,16 +2145,46 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
       render: (_args: any, value: any) => [{ type: 'text', text: value.text }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       const input = args as { ids?: unknown }
       const rawIds = Array.isArray(input.ids) ? input.ids.filter((x): x is string => typeof x === 'string') : []
       if (rawIds.length === 0) throw new Error(message('tool.examineIdsRequired'))
-      const ids = rawIds.slice(0, 16).map(id => asMemoryId(id))
-      const store = await deps.openStore('user')
-      const projectStore = await deps.openStore('project')
-      const [fromUser, fromProject] = await Promise.all([store.getMany(ids), projectStore.getMany(ids)])
-      const records = [...fromUser, ...fromProject]
-      if (records.length === 0) throw new Error(message('tool.examineAllNotFound', { count: ids.length }))
+      const tokens = rawIds.slice(0, 16).map(parseExamineToken)
+      // 格式错误与「库里没有」分开报：前者是用法问题，后者是数据问题，模型该做的补救完全不同。
+      const invalid = tokens.filter(token => token.kind === 'invalid').map(token => token.raw)
+      if (invalid.length > 0) {
+        throw new Error(message('tool.examineIdFormatInvalid', { ids: invalid.join(message('tool.separatorIdea')) }))
+      }
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const refs = sessionId === undefined ? new Map<string, CitationRefTarget>() : citationRefIndex(sessionId)
+      const targets: CitationRefTarget[] = []
+      const seen = new Set<string>()
+      let ambiguous: { readonly raw: string; readonly ids: readonly MemoryId[] } | undefined
+      for (const token of tokens) {
+        const outcome = await resolveExamineToken(token, refs)
+        if (outcome.ambiguous !== undefined) {
+          ambiguous = { raw: token.raw, ids: outcome.ambiguous }
+          break
+        }
+        const target = outcome.target
+        if (target === undefined) continue
+        const key = `${target.scope}\u0000${String(target.id)}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        targets.push(target)
+      }
+      if (ambiguous !== undefined) {
+        throw new Error(message('tool.examineIdAmbiguous', {
+          prefix: ambiguous.raw,
+          ids: ambiguous.ids.map(id => String(id)).join(message('tool.separatorIdea')),
+        }))
+      }
+      const records: MemoryRecord[] = []
+      for (const target of targets) {
+        const record = await (await deps.openStore(target.scope)).get(target.id)
+        if (record !== undefined) records.push(record)
+      }
+      if (records.length === 0) throw new Error(message('tool.examineAllNotFound', { count: tokens.length }))
       const text = records.map((record, index) => {
         // 详情也标「未确认 / 已过期」：examine 常被拿来核对召回内容，来源分级只出现在 search 里不够。
         const marks: string[] = []
@@ -2088,7 +2257,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     parameters: {
       query: { type: 'string', description: message('tool.tourQueryDescription') },
       mode: { type: 'string', enum: ['fixed', 'thematic'], description: message('tool.tourModeDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescription', { default: 'all' }) },
       maxStops: { type: 'integer', description: message('tool.tourMaxStopsDescription') },
     },
     output: {
@@ -2180,7 +2349,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     description: message('tool.profileEditDescription'),
     parameters: {
       action: { type: 'string', enum: ['view', 'edit', 'rollback'], required: true, description: message('tool.profileEditActionDescription') },
-      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescriptionUser') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescription', { default: 'user' }) },
       content: { type: 'string', description: message('tool.profileEditContentDescription') },
       expectedVersion: { type: 'integer', description: message('tool.profileEditExpectedVersionDescription') },
       toVersion: { type: 'integer', description: message('tool.profileEditToVersionDescription') },

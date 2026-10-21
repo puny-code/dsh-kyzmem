@@ -6,7 +6,7 @@
  * @module dsh-kyzmem/store/sqlite
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { copyFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { KyzmemError, EPISODE_PROXIMITY_MS_DEFAULT, EPISODE_TIMELINE_LIMIT_DEFAULT, asEntityId, asFactId, asMemoryId, asObservationId, normalizeEntityName } from '../types.ts'
@@ -154,6 +154,9 @@ const RANK_POOL = 64
 const EXPANSION_LIMIT = 32
 /** 命中强化：每次检索命中的置信度增量。 */
 const CONFIDENCE_BUMP = 0.05
+/** 只看不取用（markRetrieved）的置信度增量：比命中强化小一个量级，且不动 access_count——
+ *  避免「被召回一次就免疫衰减」（评审 M6）。 */
+const RETRIEVAL_CONFIDENCE_BUMP = 0.02
 /** 效果回报降权：failure 回报的置信度扣减（success 复用 CONFIDENCE_BUMP）。 */
 const OUTCOME_PENALTY = 0.1
 /** 审计视图返回的操作日志条数上限。 */
@@ -599,6 +602,11 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   // 批量形态（json_each）：一次检索命中几十条也只发一条 UPDATE，避免 N 次 prepare/step。
   const sqlTouch = db.prepare(`UPDATE nodes SET access_count = access_count + 1, last_retrieved_at = ?,
     confidence = MIN(1, confidence + ${CONFIDENCE_BUMP}) WHERE id IN (SELECT value FROM json_each(?))`)
+  // 只记「被看过」不记「被取用」：markRetrieved 只推进检索时钟 + 小幅提 confidence，
+  // access_count 保持不动——否则一条召回即被算作「用过一次」，decay 的 access_count=0 判据
+  // 会把它永久排除（评审 M6）。批量形态同 sqlTouch。
+  const sqlMarkRetrieved = db.prepare(`UPDATE nodes SET last_retrieved_at = ?,
+    confidence = MIN(1, confidence + ${RETRIEVAL_CONFIDENCE_BUMP}) WHERE id IN (SELECT value FROM json_each(?))`)
   const sqlLog = db.prepare('INSERT INTO op_log (at, op, target_id, detail) VALUES (?, ?, ?, ?)')
   const sqlHasAudit = db.prepare('SELECT 1 AS x FROM op_log WHERE op = ? AND detail = ? LIMIT 1')
   const sqlListAudit = db.prepare('SELECT detail FROM op_log WHERE op = ? AND detail IS NOT NULL ORDER BY seq')
@@ -1123,14 +1131,27 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         })
         touchedIds.push(id)
       }
-      // 命中强化：截断、定稿后一次批量 UPDATE（access_count+1 / confidence+BUMP / last_retrieved_at）。
-      // 旧实现逐条 sqlTouch.run——一次检索 8 条就是 8 次写；批量后写放大降到 1 次。
-      // last_accessed_at 不再动：它在 v15 只是可选字段的缺省回退源，不是检索时钟。
+      // 命中强化 + 召回审计同事务落库：要么「强化+留痕」一起成功，要么都不写（避免出现
+      // 强化了却没有审计、或审计指向未强化条目的半成品状态）。
       if (touchedIds.length > 0) {
+        // touch === false（首问自动召回/预检）跳过强化：这些候选不一定被注入，给它们加
+        // access_count 会让「被召回过一次」的条目永久逃过衰减（评审 M6）；留痕用 markRetrieved。
+        const touchEnabled = query.touch !== false
+        // 召回审计（契约 §6）：与 touch 解耦——即便不强化也要留下「召回过什么」，
+        // 否则自动召回完全不可观测（评审 M4）。detail 形状 {ids, mode, query|queryHash}；
+        // 默认 mode='search'/auditQuery='raw' 保持旧行为，隐私路径可传 'hash'（只存 16 位
+        // sha256 前缀）或 'none'（不记原文，评审 M5）。
+        const mode = query.auditMode ?? 'search'
+        const auditQuery = query.auditQuery ?? 'raw'
+        const detail: { ids: string[]; mode: string; query?: string; queryHash?: string } = { ids: touchedIds, mode }
+        if (auditQuery === 'hash') {
+          detail.queryHash = createHash('sha256').update(query.text).digest('hex').slice(0, 16)
+        } else if (auditQuery === 'raw') {
+          detail.query = query.text
+        }
         withTransaction(() => {
-          sqlTouch.run(now, JSON.stringify(touchedIds))
-          // 召回审计（契约 §6）：ids/query/mode 一并记，供「检索采用率」与问题回放。
-          sqlLog.run(now, 'recall', 'BATCH', capDetail(JSON.stringify({ ids: touchedIds, query: query.text, mode: 'search' })))
+          if (touchEnabled) sqlTouch.run(now, JSON.stringify(touchedIds))
+          sqlLog.run(now, 'recall', 'BATCH', capDetail(JSON.stringify(detail)))
         })
       }
       return { hits, degraded, channels }
@@ -1789,6 +1810,15 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       // 只动 confidence——access_count/last_retrieved_at 是「被检索命中」的计数，
       // 把引用混进去会让 proof 因子与 recency 同时失真。id 缺失时静默（可能被并发删除）。
       sqlReinforceCitation.run(delta, id)
+    },
+
+    async markRetrieved(ids: readonly MemoryId[]): Promise<void> {
+      if (ids.length === 0) return
+      // 去重后一条批量 UPDATE（json_each）：只推进检索时钟 + 提 confidence，不动 access_count。
+      // 场景：首问召回这类「只展示、未必被用」的路径——要留下 recency 痕迹，但不能让条目
+      // 因为被展示过一次就逃出衰减候选（评审 M6）；真正被使用的强化走 search 的 touch。
+      const unique = [...new Set(ids.map(String))]
+      sqlMarkRetrieved.run(Date.now(), JSON.stringify(unique))
     },
 
     async supersedeMany(input: WriteInput, oldIds: readonly MemoryId[]) {

@@ -18,6 +18,11 @@ export const zh = {
   'core.observationsHeader': 'Consolidated beliefs (distilled from multiple stored memories; verify against sources before high-stakes use):',
   'core.observationItem': '- {belief} ({count} sources)',
   'core.reviewDue': '\nPalace review due today: {count}{plus} memories. Use kyzmem_review_queue for active recall (recall beats re-reading).',
+  // ---- 首问 keyed 召回（retrieve/query-recall：用首问原文检索一次，结果并入 memory_context）----
+  'core.recallHeader': '与本轮提问相关的既有记忆（首问召回，不是常驻画像）：',
+  'core.recallItem': '- [{kind}] {content}（{ref}）',
+  'core.recallExamineHint': '需要原文用 kyzmem_examine ids=[{ids}]',
+  'core.recallBatchNote': 'batch {batchId}：evidenceRefs 用行内括号里的 ref',
   'core.compressSystem': '把记忆条目压缩为更短的一句话表述（每条不超过 40 个字符），保留可跨会话复用的关键信息（事实、偏好、决策、方法）。\n只输出一个 JSON 数组，每项形如 {"id": "原样返回的id", "content": "压缩后表述"}，条目数量与 id 必须与输入一一对应。\n不要输出 JSON 以外的任何内容。',
 
   // ---- Обоснование отбора (selection-rationale) ----
@@ -64,6 +69,7 @@ export const zh = {
   'core.warnMaintenanceFailed': '[dsh-kyzmem] 后台整理失败（不影响对话）：',
   'core.warnMaintenanceAuditFailed': '[dsh-kyzmem] 后台整理审计写入失败（整理结果已生效）：',
   'core.warnRecallAuditFailed': '[dsh-kyzmem] 召回采用率统计失败（不影响对话）：',
+  'core.warnQueryRecallFailed': '[dsh-kyzmem] 首问召回失败（已跳过，不影响对话）：',
   'core.warnObservationBudget': '[dsh-kyzmem] 信念区块超出硬上限（{actual} > {limit}），已截断注入：',
   'core.logMaintenanceDone': '[dsh-kyzmem] 后台整理完成：{job} 处理 {items} 条（{ms} ms）',
   'core.warnEmbedderUnavailable': '[dsh-kyzmem] 嵌入器不可用，检索降级为纯关键词模式：',
@@ -83,6 +89,11 @@ export const en = {
   'core.observationsHeader': 'Consolidated beliefs (distilled from multiple stored memories; verify against sources before high-stakes use):',
   'core.observationItem': '- {belief} ({count} sources)',
   'core.reviewDue': '\nPalace review due today: {count}{plus} memories. Use kyzmem_review_queue for active recall (recall beats re-reading).',
+  // ---- First-question keyed recall (retrieve/query-recall) ----
+  'core.recallHeader': 'Memories relevant to this opening question (first-question recall, not the standing profile):',
+  'core.recallItem': '- [{kind}] {content} ({ref})',
+  'core.recallExamineHint': 'For the original text use kyzmem_examine ids=[{ids}]',
+  'core.recallBatchNote': 'batch {batchId}: use the ref in parentheses as evidenceRefs',
   'core.compressSystem': 'Compress each memory entry into a shorter single-sentence wording (at most 40 characters per entry), keeping the key information that can be reused across sessions (facts, preferences, decisions, methods).\nOutput only one JSON array, each item shaped like {"id": "the id returned verbatim", "content": "the compressed wording"}; the number of items and the ids must correspond one-to-one with the input.\nDo not output anything other than JSON.',
 
   // ---- Selection rationale (selection-rationale) ----
@@ -129,6 +140,7 @@ export const en = {
   'core.warnMaintenanceFailed': '[dsh-kyzmem] Background maintenance failed (conversation unaffected):',
   'core.warnMaintenanceAuditFailed': '[dsh-kyzmem] Background maintenance audit write failed (changes already applied):',
   'core.warnRecallAuditFailed': '[dsh-kyzmem] Recall adoption accounting failed (conversation unaffected):',
+  'core.warnQueryRecallFailed': '[dsh-kyzmem] First-question recall failed (skipped, conversation unaffected):',
   'core.warnObservationBudget': '[dsh-kyzmem] Belief block exceeded its hard cap ({actual} > {limit}); truncated for injection:',
   'core.logMaintenanceDone': '[dsh-kyzmem] Background maintenance done: {job} processed {items} item(s) ({ms} ms)',
   'core.warnEmbedderUnavailable': '[dsh-kyzmem] Embedder unavailable; retrieval degrades to keyword-only mode:',
@@ -148,6 +160,11 @@ export const ru = {
   'core.observationsHeader': 'Устоявшиеся убеждения (выведены из множества сохранённых воспоминаний; перед важными решениями сверяйтесь с источниками):',
   'core.observationItem': '- {belief} (источников: {count})',
   'core.reviewDue': '\nСегодня пора вспомнить: {count}{plus} воспоминаний во дворце. Используйте kyzmem_review_queue для активного припоминания (припоминание сильнее перечитывания).',
+  // ---- Поиск по первому запросу сессии (retrieve/query-recall) ----
+  'core.recallHeader': 'Воспоминания, связанные с первым вопросом этой сессии (поиск по первому запросу, а не постоянный профиль):',
+  'core.recallItem': '- [{kind}] {content} ({ref})',
+  'core.recallExamineHint': 'Чтобы получить исходный текст, используйте kyzmem_examine ids=[{ids}]',
+  'core.recallBatchNote': 'batch {batchId}: evidenceRefs — это ref в скобках',
   'core.compressSystem': 'Сожми каждую запись памяти в более короткую однострочную формулировку (не более 40 символов на запись), сохранив ключевую информацию, пригодную для повторного использования между сессиями (факты, предпочтения, решения, методы).\nВыведи только один JSON-массив, каждый элемент вида {"id": "id, возвращённый как есть", "content": "сжатая формулировка"}; число элементов и id должны взаимно однозначно соответствовать входу.\nНе выводи ничего, кроме JSON.',
 
   // ---- Обоснование отбора (selection-rationale) ----
@@ -194,6 +211,7 @@ export const ru = {
   'core.warnMaintenanceFailed': '[dsh-kyzmem] Фоновое обслуживание не удалось (диалог не затронут):',
   'core.warnMaintenanceAuditFailed': '[dsh-kyzmem] Не удалось записать аудит обслуживания (изменения применены):',
   'core.warnRecallAuditFailed': '[dsh-kyzmem] Не удалось учесть использование результатов поиска (диалог не затронут):',
+  'core.warnQueryRecallFailed': '[dsh-kyzmem] Поиск по первому запросу не удался (пропущен, диалог не затронут):',
   'core.warnObservationBudget': '[dsh-kyzmem] Блок убеждений превысил жёсткий лимит ({actual} > {limit}), при инъекции обрезан:',
   'core.logMaintenanceDone': '[dsh-kyzmem] Фоновое обслуживание завершено: {job}, обработано {items} ({ms} мс)',
   'core.warnEmbedderUnavailable': '[dsh-kyzmem] Встраиватель недоступен, поиск деградирует до режима «только ключевые слова»:',

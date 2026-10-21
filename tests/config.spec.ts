@@ -22,6 +22,11 @@ describe('resolveConfig', () => {
     expect(resolved.injectItemBudgetDecay).toBe(0.9)
     expect(resolved.injectItemBudgetFloor).toBe(24)
     expect(resolved.assessReminder).toBe(true)
+    // 首问 keyed 召回（方案 §4 A）：默认 light / 600 字 / 3 条。
+    // 600 是「3 条 × 80 字 + 标题 + examine 提示 + 批次行」在 zh/en/ru 三语下都装得下的最小实用值。
+    expect(resolved.queryRecall).toBe('light')
+    expect(resolved.queryRecallBudget).toBe(600)
+    expect(resolved.queryRecallTop).toBe(3)
   })
 
   it('显式值全部透传', () => {
@@ -104,6 +109,31 @@ describe('resolveConfig', () => {
 
   it('assessReminder 非布尔 loud 失败', () => {
     expect(() => resolveConfig({ assessReminder: 'yes' as never })).toThrow(/assessReminder/)
+  })
+
+  it('首问召回档位：full 同时抬条数与预算，避免 full 与 light 等效', () => {
+    expect(resolveConfig({ queryRecall: 'off' }).queryRecall).toBe('off')
+    expect(resolveConfig({ queryRecall: 'light' }).queryRecallTop).toBe(3)
+    expect(resolveConfig({ queryRecall: 'light' }).queryRecallBudget).toBe(600)
+    // full：5 条 + 预算至少 640。
+    expect(resolveConfig({ queryRecall: 'full' }).queryRecallTop).toBe(5)
+    expect(resolveConfig({ queryRecall: 'full' }).queryRecallBudget).toBe(640)
+    // 显式值：条数优先；预算在 full 下有个「至少 640」的下限，light 下原样透传。
+    expect(resolveConfig({ queryRecall: 'full', queryRecallTop: 2 }).queryRecallTop).toBe(2)
+    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 500 }).queryRecallBudget).toBe(640)
+    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 800 }).queryRecallBudget).toBe(800)
+    expect(resolveConfig({ queryRecallTop: 7, queryRecallBudget: 640 }).queryRecallBudget).toBe(640)
+    expect(resolveConfig({ queryRecallBudget: 300 }).queryRecallBudget).toBe(300)
+  })
+
+  it('首问召回非法值 loud 失败', () => {
+    expect(() => resolveConfig({ queryRecall: 'eager' as never })).toThrow(/queryRecall/)
+    expect(() => resolveConfig({ queryRecallBudget: 239 })).toThrow(/queryRecallBudget/)
+    expect(() => resolveConfig({ queryRecallBudget: 4001 })).toThrow(/queryRecallBudget/)
+    expect(() => resolveConfig({ queryRecallBudget: 320.5 })).toThrow(/queryRecallBudget/)
+    expect(() => resolveConfig({ queryRecallTop: 0 })).toThrow(/queryRecallTop/)
+    expect(() => resolveConfig({ queryRecallTop: 11 })).toThrow(/queryRecallTop/)
+    expect(() => resolveConfig({ queryRecallTop: 2.5 })).toThrow(/queryRecallTop/)
   })
 })
 

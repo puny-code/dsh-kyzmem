@@ -310,6 +310,23 @@ export interface SearchQuery {
   readonly rooms?: readonly string[]
   /** 时点检索（schema v15）：只看该时刻仍有效的条目（created_at <= asOf 且未失效）。 */
   readonly asOf?: number
+  /**
+   * 命中强化开关（默认 true）：false 时只检索、不写 access_count/confidence/last_retrieved_at。
+   * 首问自动召回、预检这类「可能不注入」的检索必须传 false——否则没被用到的候选也会被
+   * 记成「用过」，既污染 proof 因子又让它们永久逃过衰减（评审 M6）。
+   */
+  readonly touch?: boolean
+  /**
+   * 写入 op_log 的 recall 审计 mode（默认 'search'）。自动召回用独立值（如 'query-recall'），
+   * 面板指标才能把「工具检索」与「首问推送」分开统计（评审 M4）。
+   */
+  readonly auditMode?: string
+  /**
+   * recall 审计里查询文本的记录方式（默认 'raw'，保持既有行为）：
+   * 'hash' 只存 sha256 的 16 位前缀（隐私：首问原文可能是密钥/隐私文本，评审 M5）；
+   * 'none' 完全不记查询文本。
+   */
+  readonly auditQuery?: 'raw' | 'hash' | 'none'
 }
 
 /** 一条检索命中。 */

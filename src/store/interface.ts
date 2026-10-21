@@ -51,7 +51,10 @@ export interface KyzmemStore {
    */
   neighbors(id: MemoryId, depth: number): Promise<MemoryRecord[]>
   /**
-   * 混合检索（向量 + FTS5 + 一跳扩展）。命中强化：accessCount+1、confidence+0.05（封顶 1）。
+   * 混合检索（向量 + FTS5 + 一跳扩展）。默认命中强化：accessCount+1、confidence+0.05（封顶 1）。
+   * `query.touch===false` 时跳过强化（自动召回/预检用，避免反馈回路污染，评审 M6），
+   * 但仍写 recall 审计；`query.auditMode` / `query.auditQuery` 控制审计里的 mode 与查询文本
+   * 记录方式（'raw' 默认 / 'hash' 只存哈希前缀 / 'none' 不记，评审 M4/M5）。
    * @param queryVector - 查询向量；undefined 表示嵌入不可用（结果 degraded）。
    */
   search(query: SearchQuery, queryVector: Float32Array | undefined): Promise<SearchResult>
@@ -181,6 +184,12 @@ export interface KyzmemStore {
    * proof 因子与衰减判据同时失真。id 不存在时静默（引用可能来自并发删除）。
    */
   reinforceCitation(id: MemoryId, delta?: number): Promise<void>
+  /**
+   * 只记「被看过」（schema v12，评审 M6）：批量把 last_retrieved_at 推到 now、confidence 微增
+   * （+0.02），**不动 access_count**。用于首问召回这类「展示但未必被采用」的路径——
+   * 留 recency 痕迹，但不让条目因为被展示过一次就永久逃过衰减。
+   */
+  markRetrieved(ids: readonly MemoryId[]): Promise<void>
   /** 蒸馏写入原语：单事务内写新条目、归档全部旧条目并逐条建立 supersedes 边。 */
   supersedeMany(input: WriteInput, oldIds: readonly MemoryId[]): Promise<MemoryRecord>
   /**

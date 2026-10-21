@@ -53,12 +53,16 @@ import { findProjectPalace, listProjectPalaces } from './project/registry.ts'
 import type { ProjectPalace, WorkspaceRef } from './project/registry.ts'
 import { openKyzmemStore } from './store/sqlite.ts'
 import type { KyzmemStore } from './store/interface.ts'
-import { createKyzmemTools } from './tools/create.ts'
+import { createKyzmemTools, rememberCitationRefs } from './tools/create.ts'
 import { currentUserRequestText, renderMemoryPacket } from './security/sanitize.ts'
 import { wrapWithRationale } from './selection-rationale.ts'
 import { buildAssessReminder, evidenceBatches } from './retrieve/evidence.ts'
+import {
+  QUERY_RECALL_PROJECT_OPEN_MS, QUERY_RECALL_TIMEOUT_MS,
+  runQueryRecall, shouldQueryRecallText, shouldRunQueryRecall, withTimeBudget,
+} from './retrieve/query-recall.ts'
 import { estimateTokens } from './token.ts'
-import type { KyzmemScope, Slot } from './types.ts'
+import type { KyzmemScope, MemoryId, Slot } from './types.ts'
 
 /** Cordis 插件名（loader 诊断与注入 source 使用）。 */
 export const name = 'dsh-kyzmem'
@@ -261,10 +265,26 @@ function recallWasUsed(events: readonly SessionEventLike[], ids: readonly string
   return false
 }
 
+/** 采用率回看时每条 recall 审计的扫描深度（跳过头问召回等非工具批次）。 */
+const RECALL_ADOPTION_SCAN = 16
+
+/** 从 recall 审计 detail 里取通道标记（mode='search' 才是模型主动发起的工具检索）。 */
+function recallAuditMode(detail: string | null): string | undefined {
+  if (detail === null) return undefined
+  try {
+    const parsed = JSON.parse(detail) as { mode?: unknown }
+    return typeof parsed.mode === 'string' ? parsed.mode : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * R1 采用率：step>1 开答前读最近一条 recall 审计，检查上一轮是否用上了那批证据，
  * 写 op_log recall-used / recall-ignored（同一次 recall 只记一条，靠 state.lastRecallBatch 去重）。
  * 为什么在 pre-step 而不是工具层：只有下一轮开始时才可能知道模型有没有引用证据。
+ * 为什么只认 mode='search'：首问召回也走 store.search（mode='query-recall'），它由插件推给
+ * 模型、不是模型主动检索；把它算进采用率会把「插件推了但没被用」污染成「检索没用」。
  */
 async function auditRecallAdoption(
   openStore: (scope: KyzmemScope) => Promise<KyzmemStore>,
@@ -279,7 +299,9 @@ async function auditRecallAdoption(
   if (cwd !== undefined) stores.push(await openStoreForProjectCwd(cwd))
   let latest: { store: KyzmemStore; at: number; ids: string[] } | undefined
   for (const store of stores) {
-    const [row] = await store.recentAudit('recall', 1, 'BATCH')
+    // 多扫几条：最新的一条可能正是首问召回写的，跳过它才能找到模型上一次真正的检索批次。
+    const row = (await store.recentAudit('recall', RECALL_ADOPTION_SCAN, 'BATCH'))
+      .find(candidate => recallAuditMode(candidate.detail) === 'search')
     if (row === undefined) continue
     if (latest === undefined || row.at > latest.at) latest = { store, at: row.at, ids: parseRecallIds(row.detail) }
   }
@@ -346,6 +368,8 @@ async function preStep(
   ctx: Context,
   openStore: (scope: KyzmemScope) => Promise<KyzmemStore>,
   openStoreForProjectCwd: (cwd: string) => Promise<KyzmemStore>,
+  /** 项目分库「只在已存在时打开」：首问召回不为一次性 cwd 建空库。 */
+  openProjectStoreIfExists: (cwd: string) => Promise<KyzmemStore | undefined>,
   resolved: ResolvedKyzmemConfig,
   embedder: Promise<KyzmemEmbedder | undefined>,
   state: {
@@ -357,6 +381,10 @@ async function preStep(
     lastAssessReminder: string | null
     /** 上次统计过采用率的 recall 批次（at + ids），避免同一批证据重复记账。 */
     lastRecallBatch: string | null
+    /** 首问召回：已召回的 agent（会话）id——同一会话只做一次。 */
+    queryRecallAgent: string | null
+    /** 首问召回：上次召回时观察到的压缩计数（压缩后允许再召回一次）。 */
+    queryRecallCompactions: number | null
     route: LlmRoute | undefined
   },
   logRequest: (data: IngestRequestEventData) => void,
@@ -487,7 +515,113 @@ async function preStep(
     .filter(record => (record.expiresAt === undefined || record.expiresAt > now)
       && injectTiers.has(record.sourceTier ?? 'agent-inferred'))
     .slice(0, resolved.profileTopN)
-  if (top.length === 0 && curated === undefined) return decision
+  // 首问 keyed 召回（方案 §4 A）：画像按 importance 选，与本次会话问什么无关；检索能力
+  // 只在工具上时，模型自愿调用的比例很低。这里在会话第一次注入（或压缩后重注入）时用
+  // 首问原文做一次轻检索，把最相关的几条并进同一个 <memory_context>——不改检索算法，
+  // 只把它调到正确的时机。为什么放在这个位置：上面已确认本步确实在注入路径上
+  // （step===1 或压缩后），不会为注定跳过注入的轮次白跑一次检索。
+  const requestText = currentUserRequestText(decision.messages)
+  const agentId = String(agent.id)
+  const sessionId = String(agent.session.id)
+  // 每个分支都留一行审计：上线后要能回答「召回有没有跑、为什么没注入」（风险报告 M4）。
+  const auditQueryRecall = (detail: Record<string, unknown>): void => {
+    const payload = JSON.stringify(detail)
+    void openStore('user')
+      .then(auditStore => auditStore.audit('query-recall', 'BATCH', payload))
+      .catch(() => { /* 审计是旁路：失败不影响注入 */ })
+  }
+  // 只在「本步刚算出来」时把块拼进 packet：后续轮次画像 hash 变化会触发重注入，但那时
+  // 召回块已陈旧，再拼会把第 1 问的旧记忆标成「与本轮提问相关」（风险报告 M8）。
+  let recallBlock = ''
+  if (shouldRunQueryRecall({
+    agentId,
+    mode: resolved.queryRecall,
+    recallAgent: state.queryRecallAgent,
+    recallCompactions: state.queryRecallCompactions,
+    compactionCount,
+  })) {
+    // 文本门先判、且不消耗会话机会：占位句/寒暄/太短不算「已尝试」，机会留给真正的问题
+    // （首问是「继续」时下一次注入仍会重判，而不是整个会话静默失效——风险报告 M7）。
+    if (!shouldQueryRecallText(requestText, resolved.language)) {
+      auditQueryRecall({ outcome: 'no-text', chars: 0, tookMs: 0, top: resolved.queryRecallTop, ids: [] })
+    } else {
+      state.queryRecallAgent = agentId
+      state.queryRecallCompactions = compactionCount
+      const cwd = sessionCwd(agent.session)
+      // 无 cwd 的会话没有项目宫殿可查（与写入路由同口径）；有 cwd 也先探库是否存在，
+      // 不为一次性 cwd 建空库，且打开给 30ms 预算——打不开（超时/迁移中）就只查 user。
+      const recallScopes: readonly KyzmemScope[] = cwd === undefined ? ['user'] : ['user', 'project']
+      const openRecallStore = async (scope: KyzmemScope): Promise<KyzmemStore> => {
+        if (scope !== 'project' || cwd === undefined) return openStore('user')
+        const projectStore = await withTimeBudget(openProjectStoreIfExists(cwd), QUERY_RECALL_PROJECT_OPEN_MS)
+        if (projectStore === undefined) throw new Error('query-recall: project store unavailable')
+        return projectStore
+      }
+      const begun = performance.now()
+      try {
+        const run = await runQueryRecall({
+          open: openRecallStore,
+          registerBatch: refs => evidenceBatches.register(sessionId, refs).batchId,
+        }, {
+          text: requestText,
+          scopes: recallScopes,
+          top: resolved.queryRecallTop,
+          budget: resolved.queryRecallBudget,
+          language: resolved.language,
+          now,
+          injectTiers: resolved.injectTiers,
+          // 与本次即将注入的画像条目去重：同一段话不在一个包里出现两次。
+          excludeIds: new Set(top.map(record => String(record.id))),
+          timeoutMs: QUERY_RECALL_TIMEOUT_MS,
+        })
+        if (run.outcome === 'injected' && run.batchId !== undefined) {
+          recallBlock = run.block
+          // 证据门：批次已在 runQueryRecall 里登记，这里补 ref→条目的映射——assess 判定
+          // 充分后要按 ref 找到记忆做引用强化（与工具检索走同一条链路）。
+          rememberCitationRefs(sessionId, run.batchId, run.entries)
+          // 只有真正被注入的条目才强化「被看过」：检索走 touch:false（access_count 不变），
+          // last_retrieved_at / confidence 在这里补（风险报告 M6）。
+          const idsByScope = new Map<KyzmemScope, MemoryId[]>()
+          for (const entry of run.entries) {
+            const ids = idsByScope.get(entry.record.scope)
+            if (ids === undefined) idsByScope.set(entry.record.scope, [entry.record.id])
+            else ids.push(entry.record.id)
+          }
+          void Promise.all([...idsByScope].map(async ([scope, ids]) => {
+            try {
+              await (await openRecallStore(scope)).markRetrieved(ids)
+            } catch {
+              // 强化是旁路：失败不影响已注入的内容。
+            }
+          }))
+        }
+        auditQueryRecall({
+          outcome: run.outcome,
+          chars: run.chars,
+          tookMs: run.tookMs,
+          top: resolved.queryRecallTop,
+          ids: run.ids,
+          ...(run.batchId === undefined ? {} : { batchId: run.batchId }),
+        })
+      } catch (error) {
+        // 召回是增强路径：任何失败都只记日志 + 一行 error 审计，绝不阻塞首问请求。
+        console.warn(message('core.warnQueryRecallFailed'), error)
+        auditQueryRecall({
+          outcome: 'error',
+          chars: 0,
+          tookMs: Math.round(performance.now() - begun),
+          top: resolved.queryRecallTop,
+          ids: [],
+        })
+      }
+    }
+  } else if (resolved.queryRecall === 'off' && state.queryRecallAgent !== agentId) {
+    // off 也留一行痕（诊断「为什么没有召回」），但只有一次 op_log：不检索、不读记忆。
+    state.queryRecallAgent = agentId
+    auditQueryRecall({ outcome: 'off', chars: 0, tookMs: 0, top: resolved.queryRecallTop, ids: [] })
+  }
+  // 画像空（例如库内条目全被 tier 过滤）但首问召回到了东西时，仍值得注入这一包。
+  if (top.length === 0 && curated === undefined && recallBlock === '') return decision
   // 今日待回忆提示（检索练习调度）：有到期条目时在画像末尾附一行，引导 agent 主动自测。
   // user + project 两库合并计数；50 为计数上限（超过显示 50+）。
   const dueTotal = resolved.reviewScheduling
@@ -545,6 +679,9 @@ async function preStep(
     }
     text = `${text}\n\n${block}`
   }
+  // 首问召回小节放在包尾：画像是常驻层（每次都该在），召回回答的是「本轮提问」。
+  // 只有本步刚算出的块才拼——陈旧块会把上一问的记忆标成「与本轮提问相关」（M8）。
+  if (recallBlock !== '') text = `${text}\n\n${recallBlock}`
   // 注入去重：同一会话内画像文本与上次相同时跳过（上一轮注入仍在上下文里）；
   // 新会话（lastProfileAgent 不同）必须注入，即使文本与上个会话相同。控制面提示纳入 hash 输入。
   const dueLine = dueTotal === 0
@@ -561,7 +698,7 @@ async function preStep(
   state.lastProfileCompactions = compactionCount
   // 画像包协议标签：记忆条目是不可信历史上下文；当前请求取本轮 admitted 消息的最后一个文本块。
   // 控制句拼在包外、同一条 user 消息内（标签之外），模型读到的是「证据」+「插件操作提示」两段。
-  const packet = `${renderMemoryPacket(text, 'turn_start', currentUserRequestText(decision.messages))}\n\n${controlLine}`
+  const packet = `${renderMemoryPacket(text, 'turn_start', requestText)}\n\n${controlLine}`
   return {
     ...decision,
     messages: [
@@ -774,6 +911,17 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
   const openStoreForProjectCwd = (cwd: string): Promise<KyzmemStore> => openDb(dbNameForCwd(cwd))
 
   /**
+   * 项目分库「只在已存在时打开」：首问召回是旁路增强，不能为一次性 cwd 建空库
+   * （与 decay/reflect 同纪律——库里没有的东西没必要为它落一个 .db 文件）。
+   * @param cwd - 会话工作目录。
+   * @returns 该 cwd 的项目分库连接；库文件不存在时 undefined。
+   */
+  const openProjectStoreIfExists = (cwd: string): Promise<KyzmemStore | undefined> =>
+    existsSync(join(resolved.dbDir, dbNameForCwd(cwd)))
+      ? openStoreForProjectCwd(cwd)
+      : Promise.resolve(undefined)
+
+  /**
    * 工具调用期的项目分库解析：按会话 cwd 归属（缺省回退插件进程目录）。
    * 面板「项目」scope、工具读写与自动摄取的 project 落点因此同一口径。
    */
@@ -809,6 +957,8 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     lastProfileCompactions: number | null
     lastAssessReminder: string | null
     lastRecallBatch: string | null
+    queryRecallAgent: string | null
+    queryRecallCompactions: number | null
     route: LlmRoute | undefined
   } = {
     pendingReplayed: false,
@@ -817,6 +967,8 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
     lastProfileCompactions: null,
     lastAssessReminder: null,
     lastRecallBatch: null,
+    queryRecallAgent: null,
+    queryRecallCompactions: null,
     route: undefined,
   }
 
@@ -1065,7 +1217,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
   })
 
   if (resolved.injectProfile || resolved.ingest !== 'off') {
-    ctx.on('agent/pre-step', (payload, next) => preStep(ctx, openStore, openStoreForProjectCwd, resolved, embedder, preStepState, logIngestRequest, payload, next), { prepend: true })
+    ctx.on('agent/pre-step', (payload, next) => preStep(ctx, openStore, openStoreForProjectCwd, openProjectStoreIfExists, resolved, embedder, preStepState, logIngestRequest, payload, next), { prepend: true })
   }
 
   // 会话结束即释放该会话的证据批次（进程内注册表，避免长驻进程累积）。

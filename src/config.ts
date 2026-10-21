@@ -19,6 +19,12 @@ export type IngestModeConfig = 'off' | 'light' | 'eager'
 /** 信念巩固档位：off 仅允许手动 kyzmem_reflect；suggest 会话结束只登记待巩固；auto 会话结束后自动巩固。 */
 export type ReflectModeConfig = 'off' | 'suggest' | 'auto'
 
+/**
+ * 首问 keyed 召回档位：off 关闭；light 会话首问注入 3 条（默认）；full 注入 5 条且整块预算抬到 640 起。
+ * 档位只决定「默认条数 + 默认预算」——显式配置优先，整块字符预算（`queryRecallBudget`）是硬约束。
+ */
+export type QueryRecallMode = 'off' | 'light' | 'full'
+
 /** 插件配置。 */
 export interface KyzmemConfig {
   /** 两个 SQLite 分库与嵌入模型缓存的根目录；默认 `~/.dsh/kyzmem`。 */
@@ -79,6 +85,12 @@ export interface KyzmemConfig {
   injectItemBudgetFloor?: number
   /** 证据门收尾提醒：会话存在未判定检索批次时在下一步开始前注入提醒；默认 true。 */
   assessReminder?: boolean
+  /** 会话首问 keyed 召回档位；默认 light（注入 3 条）。off 完全关闭。 */
+  queryRecall?: QueryRecallMode
+  /** 首问召回整块字符预算（标题 + 条目 + examine 提示 + 批次行）；默认 600。条数是上限，预算才是硬约束；600 是「zh 3 条 449 / en 3 条 558 / ru 3 条 578 字符」都能装下的最小实用值。 */
+  queryRecallBudget?: number
+  /** 首问召回条数上限；缺省 light 3 / full 5。 */
+  queryRecallTop?: number
   /** 检索排序 recency 因子权重（0 关闭）；默认 0.2。 */
   rankRecencyWeight?: number
   /** 检索排序 proof 因子权重（0 关闭）；默认 0.05（实测 access_count 中位 0，旧 0.1 只会放大少数老条目）。 */
@@ -172,6 +184,12 @@ export interface ResolvedKyzmemConfig {
   readonly injectItemBudgetDecay: number
   readonly injectItemBudgetFloor: number
   readonly assessReminder: boolean
+  /** 会话首问 keyed 召回档位。 */
+  readonly queryRecall: QueryRecallMode
+  /** 首问召回整块字符预算。 */
+  readonly queryRecallBudget: number
+  /** 首问召回条数上限（light 3 / full 5 的缺省已在 resolve 落地）。 */
+  readonly queryRecallTop: number
   readonly rankRecencyWeight: number
   readonly rankProofWeight: number
   readonly queryRewrite: boolean
@@ -196,6 +214,7 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'injectTokenBudget', 'injectItemBudgetStart', 'injectItemBudgetDecay', 'injectItemBudgetFloor',
   'rankRecencyWeight', 'rankProofWeight', 'queryRewrite',
   'autoSlot', 'reviewScheduling', 'assessReminder',
+  'queryRecall', 'queryRecallBudget', 'queryRecallTop',
   'historyBackfillDays', 'historyBackfillMaxTurnsPerSession', 'historyBackfillMaxTotalTurns',
   'historyBackfillIncludeSubagents', 'historyBackfillIncludeSeeded', 'historyBackfillIncludeNoCwd',
   'language', 'redactWords',
@@ -203,6 +222,11 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
 
 const INGEST_MODES: ReadonlySet<string> = new Set(['off', 'light', 'eager'])
 const REFLECT_MODES: ReadonlySet<string> = new Set(['off', 'suggest', 'auto'])
+const QUERY_RECALL_MODES: ReadonlySet<string> = new Set(['off', 'light', 'full'])
+/** 首问召回整块字符预算缺省值：3 条 × 80 字（截断后 81）+ 标题 + examine 提示 + 批次行。 */
+const QUERY_RECALL_BUDGET_DEFAULT = 600
+/** full 档的预算下限：5 条 + 提示行要装得下，否则 full 与 light 等效。 */
+const QUERY_RECALL_FULL_BUDGET_FLOOR = 640
 
 /** Schemastery 校验面（cordis.yml 读取时校验）。 */
 export const Config: z<KyzmemConfig> = z.object({
@@ -242,6 +266,9 @@ export const Config: z<KyzmemConfig> = z.object({
   autoSlot: z.boolean(),
   reviewScheduling: z.boolean(),
   assessReminder: z.boolean(),
+  queryRecall: z.string() as unknown as z<QueryRecallMode>,
+  queryRecallBudget: z.number().step(1).min(240).max(4000),
+  queryRecallTop: z.number().step(1).min(1).max(10),
   historyBackfillDays: z.number().step(1).min(0).max(3650),
   historyBackfillMaxTurnsPerSession: z.number().step(1).min(1).max(500),
   historyBackfillMaxTotalTurns: z.number().step(1).min(1).max(5000),
@@ -256,7 +283,7 @@ export const Config: z<KyzmemConfig> = z.object({
  * 显式 resolve 步骤：默认值只在唯一的此处落地，非法值 loud 失败。
  * @param config - cordis.yml 传入的未校验配置。
  * @returns 完整解析配置。
- * @throws 未知键、ingest 档位非法、provider/model 只给其一、decay/预算/排序权重/历史回填规则越界时抛错。
+ * @throws 未知键、ingest/queryRecall 档位非法、provider/model 只给其一、decay/预算/排序权重/历史回填规则越界时抛错。
  */
 export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
   for (const key of Object.keys(config)) {
@@ -333,6 +360,17 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
   if (config.assessReminder !== undefined && typeof config.assessReminder !== 'boolean') {
     throw new Error('dsh-kyzmem: assessReminder must be a boolean')
   }
+  if (config.queryRecall !== undefined && !QUERY_RECALL_MODES.has(config.queryRecall)) {
+    throw new Error(`dsh-kyzmem: queryRecall must be one of off|light|full, got "${String(config.queryRecall)}"`)
+  }
+  if (config.queryRecallBudget !== undefined
+    && (!Number.isInteger(config.queryRecallBudget) || config.queryRecallBudget < 240 || config.queryRecallBudget > 4000)) {
+    throw new Error('dsh-kyzmem: queryRecallBudget must be an integer in [240, 4000]')
+  }
+  if (config.queryRecallTop !== undefined
+    && (!Number.isInteger(config.queryRecallTop) || config.queryRecallTop < 1 || config.queryRecallTop > 10)) {
+    throw new Error('dsh-kyzmem: queryRecallTop must be an integer in [1, 10]')
+  }
   if (config.rankRecencyWeight !== undefined && (config.rankRecencyWeight < 0 || config.rankRecencyWeight > 2)) {
     throw new Error('dsh-kyzmem: rankRecencyWeight must be in [0, 2]')
   }
@@ -351,6 +389,14 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     throw new Error('dsh-kyzmem: historyBackfillMaxTotalTurns must be an integer in [1, 5000]')
   }
   const dbDir = config.dbDir ?? join(homedir(), '.dsh', 'kyzmem')
+  // 首问召回：档位同时决定默认条数（light 3 / full 5）与整块预算。
+  // full 是「多给」档：预算一并抬到 640 起（显式调小也抬），否则 full 在默认配置下与 light
+  // 等效——3 条 × 80 字塞不进 480，5 条更塞不进（风险报告 M3）。
+  const queryRecallMode: QueryRecallMode = config.queryRecall ?? 'light'
+  const queryRecallBudget = config.queryRecallBudget ?? QUERY_RECALL_BUDGET_DEFAULT
+  const resolvedQueryRecallBudget = queryRecallMode === 'full'
+    ? Math.max(queryRecallBudget, QUERY_RECALL_FULL_BUDGET_FLOOR)
+    : queryRecallBudget
   return {
     dbDir,
     legacyMigration: config.legacyMigration ?? 'eager',
@@ -388,6 +434,9 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     injectItemBudgetDecay: config.injectItemBudgetDecay ?? 0.9,
     injectItemBudgetFloor: config.injectItemBudgetFloor ?? 24,
     assessReminder: config.assessReminder ?? true,
+    queryRecall: queryRecallMode,
+    queryRecallBudget: resolvedQueryRecallBudget,
+    queryRecallTop: config.queryRecallTop ?? (queryRecallMode === 'full' ? 5 : 3),
     rankRecencyWeight: config.rankRecencyWeight ?? 0.2,
     rankProofWeight: config.rankProofWeight ?? 0.05,
     queryRewrite: config.queryRewrite ?? true,
