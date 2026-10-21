@@ -370,6 +370,22 @@ export interface SearchHit {
   readonly expired?: boolean
 }
 
+/**
+ * 单条记忆的召回采纳计数（E：adoption 排序因子的数据源）。
+ *
+ * 数据来自 op_log 的 `recall-used` / `recall-ignored` 审计：detail 是批次级的
+ * `{batch, ids}`，这里按 id 拆开累加——一次批次里出现几次就记几次。
+ * 为什么把 `ignored` 也留着：它不产生加分，只是贝叶斯平滑的分母（「被展示过很多次
+ * 但没人用」应当比「刚写进来还没被看过」更难拿到加分），同时也让面板能解释
+ * 「为什么这条没顶上来」。
+ */
+export interface AdoptionStat {
+  /** 被判定「用上了」的批次数。 */
+  readonly used: number
+  /** 被判定「忽略」的批次数（只参与平滑分母，不产生加分、也不降权）。 */
+  readonly ignored: number
+}
+
 /** 单条检索通道的统计（schema v15，批四）：面板"检索通道"表数据源。 */
 export interface SearchChannelStat {
   readonly channel: 'fts' | 'vector' | 'graph'

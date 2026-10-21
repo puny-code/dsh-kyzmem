@@ -1,8 +1,9 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { aggregateTelemetry, collectMetrics, computeMetrics } from '../src/telemetry/aggregate.ts'
+import { aggregateTelemetry, collectMetrics, computeMetrics, tokensOfChars } from '../src/telemetry/aggregate.ts'
+import { computeAnchor } from '../src/anchor.ts'
 import { openKyzmemStore } from '../src/store/sqlite.ts'
 import type { KyzmemStore } from '../src/store/interface.ts'
 import type { MaintenanceDebt, OperationLogRow, StoreStats } from '../src/types.ts'
@@ -19,17 +20,21 @@ afterEach(async () => {
   await user.close()
 })
 
-describe('computeMetrics 十二项指标（§8，纯函数）', () => {
-  /** 构造一次 op_log 行；detail 用 JSON 字符串以免测试里重复手写转义。 */
-  const op = (name: string, detail: Record<string, unknown> | null = null, at = 1000): OperationLogRow => ({
-    at, op: name, targetId: name === 'write' ? 'x' : 'BATCH', detail: detail === null ? null : JSON.stringify(detail),
-  })
-  const statsOf = (patch: Partial<StoreStats>): StoreStats => ({
-    total: 1, active: 1, archived: 0, forgotten: 0, redacted: 0,
-    byKind: { fact: 1 }, edges: 0, opLogCount: 1, signalRatio: 0,
-    ...patch,
-  })
+/** 构造一次 op_log 行；detail 用 JSON 字符串以免测试里重复手写转义。 */
+const op = (name: string, detail: Record<string, unknown> | null = null, at = 1000): OperationLogRow => ({
+  at, op: name, targetId: name === 'write' ? 'x' : 'BATCH', detail: detail === null ? null : JSON.stringify(detail),
+})
+const statsOf = (patch: Partial<StoreStats>): StoreStats => ({
+  total: 1, active: 1, archived: 0, forgotten: 0, redacted: 0,
+  byKind: { fact: 1 }, edges: 0, opLogCount: 1, signalRatio: 0,
+  ...patch,
+})
 
+/** 一条首问召回注入审计（detail 形状与 index.ts 的 auditQueryRecall 一致）。 */
+const injection = (outcome: string, chars: number, at: number): OperationLogRow =>
+  op('query-recall', { outcome, chars, tookMs: 3, top: 3, ids: [] }, at)
+
+describe('computeMetrics 十二项指标（§8，纯函数）', () => {
   it('采用率 = recall-used / (used + ignored)；缺归因时缺省而非 0', () => {
     const used = computeMetrics({ windowDays: 7, stats: [], ops: [op('recall-used'), op('recall-used'), op('recall-used'), op('recall-ignored')] })
     expect(used.adoptionRate).toBeCloseTo(0.75, 5)
@@ -131,6 +136,110 @@ describe('computeMetrics 十二项指标（§8，纯函数）', () => {
     }, ['user', 'project'], 7)
     expect(gathering.metrics).toBeDefined()
     expect(gathering.channels).toEqual([])
+  })
+})
+
+describe('R5 六项度量（曝光 / 激活 / 下钻 / token / 锚点）', () => {
+  it('曝光字符 = Σ(注入字符 × 该注入之后的 op_log 事件数)；非 injected 不产生曝光', () => {
+    const metrics = computeMetrics({
+      windowDays: 7,
+      stats: [],
+      ops: [
+        injection('injected', 100, 1000),
+        op('recall', { ids: ['x'], mode: 'search' }, 1100),
+        op('write', null, 1200),
+        // 第二次注入：结算上一段 100 × max(1, 2) = 200
+        injection('injected', 50, 2000),
+        op('recall', { ids: ['y'], mode: 'query-recall' }, 2100),
+        // 最后一段：50 × max(1, 1) = 50
+        injection('no-text', 0, 3000),
+      ],
+    })
+    expect(metrics.injectionCount).toBe(2)
+    expect(metrics.exposureChars).toBe(250)
+  })
+
+  it('没有注入时曝光缺省、注入次数给 0（「没跑」与「跑了是 0」分开）', () => {
+    const metrics = computeMetrics({ windowDays: 7, stats: [], ops: [] })
+    expect(metrics.exposureChars).toBeUndefined()
+    expect(metrics.injectionCount).toBe(0)
+    expect(metrics.tokenCostEstimate).toBeUndefined()
+  })
+
+  it('激活率 = 注入后段内出现工具检索/下钻的会话比例', () => {
+    const metrics = computeMetrics({
+      windowDays: 7,
+      stats: [],
+      ops: [
+        injection('injected', 100, 1000),
+        // 段 1：工具检索 ⇒ 激活
+        op('recall', { ids: ['x'], mode: 'search' }, 1100),
+        injection('injected', 100, 2000),
+        // 段 2：只有首问召回自己写的 recall（mode='query-recall'），不算激活
+        op('recall', { ids: ['y'], mode: 'query-recall' }, 2100),
+        injection('off', 0, 3000),
+      ],
+    })
+    expect(metrics.activationRate).toBe(0.5)
+  })
+
+  it('下钻率 = examine 次数 / 工具检索次数；examine 未接线时缺省而不是 0%', () => {
+    const withExamine = computeMetrics({
+      windowDays: 7,
+      stats: [],
+      ops: [op('recall', { mode: 'search' }, 100), op('recall', { mode: 'search' }, 200), op('examine', null, 300)],
+    })
+    expect(withExamine.drillDownRate).toBe(0.5)
+    // 有工具检索但一条 examine 都没有：现在 examine 还不写 op_log，给 0% 会被读成
+    // 「没人下钻」，所以缺省。
+    expect(computeMetrics({ windowDays: 7, stats: [], ops: [op('recall', { mode: 'search' }, 100)] }).drillDownRate)
+      .toBeUndefined()
+    // 首问召回的 recall 不进分母。
+    expect(computeMetrics({ windowDays: 7, stats: [], ops: [op('recall', { mode: 'query-recall' }, 100)] }).drillDownRate)
+      .toBeUndefined()
+  })
+
+  it('token 成本按 estimateTokens 同源口径折算注入 chars（zh 1.5/字，en/ru 0.25/字符）', () => {
+    const ops = [injection('injected', 100, 1000)]
+    expect(tokensOfChars(100, 'zh')).toBe(150)
+    expect(tokensOfChars(100, 'en')).toBe(25)
+    expect(tokensOfChars(100, 'ru')).toBe(25)
+    expect(tokensOfChars(0, 'zh')).toBe(0)
+    expect(computeMetrics({ windowDays: 7, stats: [], ops, language: 'zh' }).tokenCostEstimate).toBe(150)
+    expect(computeMetrics({ windowDays: 7, stats: [], ops, language: 'en' }).tokenCostEstimate).toBe(25)
+    // 缺省按中文渲染（插件默认语言）。
+    expect(computeMetrics({ windowDays: 7, stats: [], ops }).tokenCostEstimate).toBe(150)
+  })
+
+  it('锚点过期率按「能判定的条数」为分母（stale + missing 都算可能过期）', () => {
+    const metrics = computeMetrics({
+      windowDays: 7, stats: [], ops: [], anchors: { total: 5, checked: 4, stale: 1 },
+    })
+    expect(metrics.staleAnchorRate).toBeCloseTo(0.25, 5)
+    // 全库没有带锚条目 / 一条都判定不了：缺省而不是 0。
+    expect(computeMetrics({ windowDays: 7, stats: [], ops: [], anchors: { total: 2, checked: 0, stale: 0 } }).staleAnchorRate)
+      .toBeUndefined()
+    expect(computeMetrics({ windowDays: 7, stats: [], ops: [] }).staleAnchorRate).toBeUndefined()
+  })
+
+  it('collectMetrics 用 anchorRoot 做 mtime 实时复验（文件一改，锚点就算过期）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kyzmem-anchor-'))
+    const file = join(root, 'notes.md')
+    await writeFile(file, 'alpha')
+    const anchor = await computeAnchor(root, 'notes.md', Date.now())
+    if (anchor === undefined) throw new Error('夹具文件存在，computeAnchor 不该返回 undefined')
+    await user.write({ scope: 'user', kind: 'fact', content: 'notes.md 里的配置项是 alpha', anchor })
+
+    const intact = await collectMetrics(async () => user, ['user'], 7, Date.now(), { anchorRoot: root })
+    expect(intact.metrics.staleAnchorRate).toBe(0)
+
+    await writeFile(file, 'alpha beta')
+    const stale = await collectMetrics(async () => user, ['user'], 7, Date.now(), { anchorRoot: root })
+    expect(stale.metrics.staleAnchorRate).toBe(1)
+
+    // 不给锚点根 = 不复验（用户库的锚点相对会话 cwd，猜一个根比不给更糟）。
+    const unknown = await collectMetrics(async () => user, ['user'], 7)
+    expect(unknown.metrics.staleAnchorRate).toBeUndefined()
   })
 })
 

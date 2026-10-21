@@ -114,8 +114,9 @@ interface ChannelStat {
 }
 
 /**
- * 十二项运行指标（/stats 顶层 metrics）。宿主契约里十二项一定给出、取不到给 0，
- * 但面板仍按可选字段读取：旧宿主或半升级部署时用「—」代替编造的数字。
+ * 十八项运行指标（/stats 顶层 metrics；R5 把 12 项扩到 18 项）。宿主契约里
+ * 这些字段只要接上了就一定给出，取不到则缺省——面板仍按可选字段读取：旧宿主或
+ * 半升级部署时用「—」代替编造的数字。
  */
 interface OpsMetrics {
   readonly adoptionRate?: number
@@ -130,6 +131,18 @@ interface OpsMetrics {
   readonly weeklyGrowth?: number
   readonly reviewCompletionRate?: number
   readonly maintenanceDebt?: number
+  /** R5：注入曝光字符（估算）= Σ(注入字符 × 后续请求数)。 */
+  readonly exposureChars?: number
+  /** R5：窗口内首问召回注入次数（exposure 的样本量 / activation 的分母）。 */
+  readonly injectionCount?: number
+  /** R5：注入后出现检索/下钻的会话比例。 */
+  readonly activationRate?: number
+  /** R5：examine 次数 / 索引检索次数（examine 未接线时缺省）。 */
+  readonly drillDownRate?: number
+  /** R5：注入 token 估算（与 injectTokens 不同源：这个走 estimateTokens 口径）。 */
+  readonly tokenCostEstimate?: number
+  /** R5：带锚条目里「可能过期」的比例（mtime 实时抽样复验）。 */
+  readonly staleAnchorRate?: number
 }
 
 /** /stats 的响应（parts 为既有多作用域统计；channels/metrics 是 v0.11 新增的顶层字段）。 */
@@ -253,10 +266,10 @@ const CONFLICT_ACTIONS: readonly { readonly action: ConflictAction; readonly key
   { action: 'drop-both', key: 'opsConflictDropBoth', danger: true },
 ]
 
-/** 指标值的展示形态：比率（0..1 → 百分比）、整数、token 估算、毫秒。 */
-type MetricFormat = 'ratio' | 'count' | 'tokens' | 'ms'
+/** 指标值的展示形态：比率（0..1 → 百分比）、整数、token 估算、毫秒、大字符数（缩写）。 */
+type MetricFormat = 'ratio' | 'count' | 'tokens' | 'ms' | 'chars'
 
-/** 十二项指标表：标签 + 取值器 + 展示形态。字段缺失由 formatMetricValue 显示「—」。 */
+/** 十八项指标表：标签 + 取值器 + 展示形态。字段缺失由 formatMetricValue 显示「—」。 */
 const METRIC_ROWS: readonly {
   readonly label: KyzmemKey
   readonly pick: (metrics: OpsMetrics) => number | undefined
@@ -274,12 +287,39 @@ const METRIC_ROWS: readonly {
   { label: 'metricWeeklyGrowth', pick: metrics => metrics.weeklyGrowth, format: 'ratio' },
   { label: 'metricReviewCompletion', pick: metrics => metrics.reviewCompletionRate, format: 'ratio' },
   { label: 'metricMaintenanceDebt', pick: metrics => metrics.maintenanceDebt, format: 'count' },
+  // R5 六项（v0.12 第三批）：曝光 / 激活 / 下钻 / token 成本 / 锚点过期 + 注入样本量。
+  // token 成本是估算（chars × 单位成本），不是计费口径；面板标签与 /stats 注释同口径。
+  { label: 'metricExposureChars', pick: metrics => metrics.exposureChars, format: 'chars' },
+  { label: 'metricInjectionCount', pick: metrics => metrics.injectionCount, format: 'count' },
+  { label: 'metricActivation', pick: metrics => metrics.activationRate, format: 'ratio' },
+  { label: 'metricDrillDown', pick: metrics => metrics.drillDownRate, format: 'ratio' },
+  { label: 'metricTokenCost', pick: metrics => metrics.tokenCostEstimate, format: 'tokens' },
+  { label: 'metricStaleAnchor', pick: metrics => metrics.staleAnchorRate, format: 'ratio' },
 ]
+
+/** 大数字缩写（磁贴宽度有限）：1234 → 1.2K，1_234_567 → 1.2M；万以下照原样显示。 */
+function compactCount(value: number): string {
+  const abs = Math.abs(value)
+  if (abs >= 1_000_000) {
+    const scaled = value / 1_000_000
+    return `${abs >= 10_000_000 ? String(Math.round(scaled)) : scaled.toFixed(1)}M`
+  }
+  if (abs >= 10_000) return `${String(Math.round(value / 1000))}K`
+  return String(Math.round(value))
+}
 
 /** 指标数值 → 文案；缺失/非有限值一律「—」，不把 0 和「没数据」混成同一个样子。 */
 function formatMetricValue(format: MetricFormat, value: number | undefined): string {
   if (value === undefined || !Number.isFinite(value)) return '—'
   if (format === 'ratio') return `${String(Math.round(value * 100))}%`
+  if (format === 'ms') return `${String(Math.round(value))} ms`
+  if (format === 'chars') return compactCount(value)
+  return String(Math.round(value))
+}
+
+/** 指标值的精确形态（磁贴显示缩写，title 里给准确值——「1.2K」不该是唯一可读信息）。 */
+function formatMetricExact(format: MetricFormat, value: number): string {
+  if (format === 'ratio') return `${String(Math.round(value * 1000) / 10)}%`
   if (format === 'ms') return `${String(Math.round(value))} ms`
   return String(Math.round(value))
 }
@@ -3141,21 +3181,25 @@ function AdoptionCard({ t, metrics }: {
   )
 }
 
-/** 十二项指标表：字段缺失显示「—」，不把「没数据」渲染成 0。 */
+/** 十八项指标表：字段缺失显示「—」，不把「没数据」渲染成 0。 */
 function MetricsGrid({ t, metrics }: {
   readonly t: T
   readonly metrics: OpsMetrics | undefined
 }): React.ReactElement {
   return (
     <div className={styles.opsMetricsGrid}>
-      {METRIC_ROWS.map(row => (
-        <div key={row.label} className={styles.opsMetricTile}>
-          <span className={styles.opsMetricLabel}>{t(row.label)}</span>
-          <span className={styles.opsMetricValue}>
-            {formatMetricValue(row.format, metrics === undefined ? undefined : row.pick(metrics))}
-          </span>
-        </div>
-      ))}
+      {METRIC_ROWS.map((row) => {
+        const value = metrics === undefined ? undefined : row.pick(metrics)
+        const exact = value === undefined || !Number.isFinite(value) ? undefined : formatMetricExact(row.format, value)
+        return (
+          <div key={row.label} className={styles.opsMetricTile}>
+            <span className={styles.opsMetricLabel}>{t(row.label)}</span>
+            <span className={styles.opsMetricValue} title={exact}>
+              {formatMetricValue(row.format, value)}
+            </span>
+          </div>
+        )
+      })}
     </div>
   )
 }

@@ -419,6 +419,13 @@ export const zh: Record<KyzmemKey, string> = {
   metricWeeklyGrowth: '库增长 / 周',
   metricReviewCompletion: '复习完成率',
   metricMaintenanceDebt: '后台欠账',
+  // R5 六项度量（v0.12 第三批）：估算项在标签里就说清楚，避免被读成计费口径。
+  metricExposureChars: '注入曝光字符',
+  metricInjectionCount: '首问注入次数',
+  metricActivation: '激活率',
+  metricDrillDown: '下钻率',
+  metricTokenCost: '注入 token 成本',
+  metricStaleAnchor: '锚点过期率',
   filterConfirmed: '仅看已确认',
   filterConfirmedHint: '只列来源分级为「已确认」的条目 —— 代理推断、工具输出、网页内容都不进列表',
   tierBadgeTitle: '来源分级：已确认 → 代理推断 → 工具输出 → 网页内容',

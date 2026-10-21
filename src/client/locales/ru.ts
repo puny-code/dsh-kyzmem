@@ -430,6 +430,13 @@ export const ru: Record<KyzmemKey, string> = {
   metricWeeklyGrowth: 'Рост за неделю',
   metricReviewCompletion: 'Завершение повторений',
   metricMaintenanceDebt: 'Задолженность фона',
+  // R5 (v0.12, третья партия): оценочные величины помечены в самой подписи.
+  metricExposureChars: 'Символы экспозиции',
+  metricInjectionCount: 'Инъекций на первый вопрос',
+  metricActivation: 'Активация',
+  metricDrillDown: 'Доля углублений',
+  metricTokenCost: 'Стоимость токенов (оценка)',
+  metricStaleAnchor: 'Устаревшие якоря',
   filterConfirmed: 'Только подтверждённые',
   filterConfirmedHint: 'Только записи уровня «подтверждено пользователем» — выведенные, инструментальные и веб-строки не попадают',
   tierBadgeTitle: 'Уровень источника: подтверждено → выведено → инструмент → веб',

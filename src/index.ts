@@ -531,6 +531,13 @@ async function preStep(
   // 首问原文做一次轻检索，把最相关的几条并进同一个 <memory_context>——不改检索算法，
   // 只把它调到正确的时机。为什么放在这个位置：上面已确认本步确实在注入路径上
   // （step===1 或压缩后），不会为注定跳过注入的轮次白跑一次检索。
+  const requestText = currentUserRequestText(decision.messages)
+  const agentId = String(agent.id)
+  const sessionId = String(agent.session.id)
+  // `[RESUME]` 恢复简报（方案 §7 D）：素材本来就在库里——`session_summaries` 的最近一条摘要、
+  // 今日待回忆数、未清的 pending 摄取。模型不会主动问「上次聊到哪了」，而这是记忆插件最该
+  // 先回答的问题。只在「本会话第一次注入 / 压缩后重注入」时取一次；项目库必须先存在
+  // （与首问召回同口径：不为一次性 cwd 建空库）。任何 I/O 失败都只是「没有简报」。
   /**
    * 取「上一条会话摘要」：项目库先探存在（不为一次性 cwd 建空库），打开与查询共用
    * RESUME_PROJECT_OPEN_MS 预算——打不开（超时/迁移中）就当作没有简报。失败静默：
@@ -550,13 +557,6 @@ async function preStep(
       return undefined
     }
   }
-  const requestText = currentUserRequestText(decision.messages)
-  const agentId = String(agent.id)
-  const sessionId = String(agent.session.id)
-  // `[RESUME]` 恢复简报（方案 §7 D）：素材本来就在库里——`session_summaries` 的最近一条摘要、
-  // 今日待回忆数、未清的 pending 摄取。模型不会主动问「上次聊到哪了」，而这是记忆插件最该
-  // 先回答的问题。只在「本会话第一次注入 / 压缩后重注入」时取一次；项目库必须先存在
-  // （与首问召回同口径：不为一次性 cwd 建空库）。任何 I/O 失败都只是「没有简报」。
   const resumeGate = shouldRunResumeBriefing({
     enabled: resolved.resumeBriefing,
     agentId,
@@ -905,6 +905,8 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
   const rankBoost = {
     recencyWeight: resolved.rankRecencyWeight,
     proofWeight: resolved.rankProofWeight,
+    // E 采纳率加权：少了这一行 store 侧 adoptionFactor 恒为 1，配置等于没接。
+    adoptionWeight: resolved.rankAdoptionWeight,
     decayAfterDays: resolved.decayAfterDays,
   }
 

@@ -2310,6 +2310,17 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         if (record !== undefined) records.push(record)
       }
       if (records.length === 0) throw new Error(message('tool.examineAllNotFound', { count: tokens.length }))
+      // 下钻审计（R5 的 drillDownRate 分子）：按 scope 归组各写一条，与 recall 审计同粒度，
+      // 这样单库内的 examine/search 比值不会被其它分库稀释。
+      const examinedByScope = new Map<MemoryRecord['scope'], string[]>()
+      for (const record of records) {
+        const bucket = examinedByScope.get(record.scope) ?? []
+        bucket.push(String(record.id))
+        examinedByScope.set(record.scope, bucket)
+      }
+      for (const [scope, ids] of examinedByScope) {
+        await (await deps.openStore(scope)).audit('examine', 'AUX', JSON.stringify({ ids }))
+      }
       // 文件锚实时复验（schema v16）：与 search 同口径——只对将要渲染的前 8 条各 stat 一次，
       // 标注只影响展示、不影响排序与状态。
       const anchorStates = await checkAnchors(

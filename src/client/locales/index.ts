@@ -421,6 +421,14 @@ export type KyzmemKey =
   | 'metricWeeklyGrowth'
   | 'metricReviewCompletion'
   | 'metricMaintenanceDebt'
+  // R5 六项度量（v0.12 第三批）：曝光 / 激活 / 下钻 / token 成本 / 锚点过期。
+  // 前四项里除「首问注入次数」都可能是估算值，标签里点明，避免被读成计费口径。
+  | 'metricExposureChars'
+  | 'metricInjectionCount'
+  | 'metricActivation'
+  | 'metricDrillDown'
+  | 'metricTokenCost'
+  | 'metricStaleAnchor'
   | 'filterConfirmed'
   | 'filterConfirmedHint'
   | 'tierBadgeTitle'

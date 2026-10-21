@@ -100,6 +100,12 @@ export interface KyzmemConfig {
   rankRecencyWeight?: number
   /** 检索排序 proof 因子权重（0 关闭）；默认 0.05（实测 access_count 中位 0，旧 0.1 只会放大少数老条目）。 */
   rankProofWeight?: number
+  /**
+   * 检索排序 adoption 因子权重（0 关闭）；默认 0.05。
+   * 因子 = `1 + min(0.1, w × (used+1)/(used+ignored+2))`，只对「被引用过」的条目加分：
+   * 有效贡献封顶 +10%（反馈回路的安全阀），被忽略只压低增益斜率、不降权。
+   */
+  rankAdoptionWeight?: number
   /** kyzmem_search 是否用辅助 LLM 把查询改写为 ≤3 个互补查询再做 RRF 融合；默认 true。改写失败自动降级单查询。 */
   queryRewrite?: boolean
   /** 写入时自动排桩（房间 + 桩位号）并登记固定巡游路线；默认 true。false 时桩位/路线完全由调用方显式指定。 */
@@ -201,6 +207,8 @@ export interface ResolvedKyzmemConfig {
   readonly resumeBriefingChars: number
   readonly rankRecencyWeight: number
   readonly rankProofWeight: number
+  /** adoption 因子权重（0 = 关闭；贡献封顶 +10%）。 */
+  readonly rankAdoptionWeight: number
   readonly queryRewrite: boolean
   readonly autoSlot: boolean
   readonly reviewScheduling: boolean
@@ -221,7 +229,7 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'maintenanceEnabled', 'maintenanceBudgetMs', 'maintenanceBudgetItems', 'maintenanceBudgetLlmCalls', 'maintenanceIdleDays',
   'reviewRelearnDays', 'ingestDeadLetterAttempts',
   'injectTokenBudget', 'injectItemBudgetStart', 'injectItemBudgetDecay', 'injectItemBudgetFloor',
-  'rankRecencyWeight', 'rankProofWeight', 'queryRewrite',
+  'rankRecencyWeight', 'rankProofWeight', 'rankAdoptionWeight', 'queryRewrite',
   'autoSlot', 'reviewScheduling', 'assessReminder',
   'queryRecall', 'queryRecallBudget', 'queryRecallTop',
   'resumeBriefing', 'resumeBriefingChars',
@@ -280,6 +288,7 @@ export const Config: z<KyzmemConfig> = z.object({
   injectItemBudgetFloor: z.number().step(1).min(8).max(200),
   rankRecencyWeight: z.number().min(0).max(2),
   rankProofWeight: z.number().min(0).max(2),
+  rankAdoptionWeight: z.number().min(0).max(1),
   queryRewrite: z.boolean(),
   autoSlot: z.boolean(),
   reviewScheduling: z.boolean(),
@@ -404,6 +413,11 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
   if (config.rankProofWeight !== undefined && (config.rankProofWeight < 0 || config.rankProofWeight > 2)) {
     throw new Error('dsh-kyzmem: rankProofWeight must be in [0, 2]')
   }
+  // 上限 1：adoption 的实际贡献封顶 +10%（ADOPTION_BOOST_CAP），权重再大也不会生效，
+  // 但保留到 1 便于「先开大看清效果再收回」的实验路径。
+  if (config.rankAdoptionWeight !== undefined && (config.rankAdoptionWeight < 0 || config.rankAdoptionWeight > 1)) {
+    throw new Error('dsh-kyzmem: rankAdoptionWeight must be in [0, 1]')
+  }
   if (config.historyBackfillDays !== undefined && (!Number.isInteger(config.historyBackfillDays) || config.historyBackfillDays < 0 || config.historyBackfillDays > 3650)) {
     throw new Error('dsh-kyzmem: historyBackfillDays must be an integer in [0, 3650] (0 = unlimited)')
   }
@@ -469,6 +483,7 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     resumeBriefingChars: config.resumeBriefingChars ?? 200,
     rankRecencyWeight: config.rankRecencyWeight ?? 0.2,
     rankProofWeight: config.rankProofWeight ?? 0.05,
+    rankAdoptionWeight: config.rankAdoptionWeight ?? 0.05,
     queryRewrite: config.queryRewrite ?? true,
     autoSlot: config.autoSlot ?? true,
     reviewScheduling: config.reviewScheduling ?? true,

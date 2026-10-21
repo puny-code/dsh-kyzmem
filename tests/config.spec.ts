@@ -17,6 +17,8 @@ describe('resolveConfig', () => {
     expect(resolved.injectTokenBudget).toBe(1024)
     expect(resolved.rankRecencyWeight).toBe(0.2)
     expect(resolved.rankProofWeight).toBe(0.05)
+    // E（v0.12 第三批）：adoption 因子默认开、权重 0.05（贡献封顶 +10%，见 sqlite.ts）。
+    expect(resolved.rankAdoptionWeight).toBe(0.05)
     expect(resolved.queryRewrite).toBe(true)
     expect(resolved.injectItemBudgetStart).toBe(160)
     expect(resolved.injectItemBudgetDecay).toBe(0.9)
@@ -36,7 +38,7 @@ describe('resolveConfig', () => {
       hfEndpoint: 'https://hf-mirror.com', ingest: 'eager',
       provider: 'deepseek', model: 'deepseek-v4-flash',
       decayAfterDays: 7,
-      injectTokenBudget: 2048, rankRecencyWeight: 0, rankProofWeight: 1.5,
+      injectTokenBudget: 2048, rankRecencyWeight: 0, rankProofWeight: 1.5, rankAdoptionWeight: 0.3,
       queryRewrite: false,
       injectItemBudgetStart: 200, injectItemBudgetDecay: 0.8, injectItemBudgetFloor: 40,
       assessReminder: false,
@@ -52,6 +54,7 @@ describe('resolveConfig', () => {
     expect(resolved.injectTokenBudget).toBe(2048)
     expect(resolved.rankRecencyWeight).toBe(0)
     expect(resolved.rankProofWeight).toBe(1.5)
+    expect(resolved.rankAdoptionWeight).toBe(0.3)
     expect(resolved.queryRewrite).toBe(false)
     expect(resolved.injectItemBudgetStart).toBe(200)
     expect(resolved.injectItemBudgetDecay).toBe(0.8)
@@ -91,6 +94,9 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({ rankRecencyWeight: -0.1 })).toThrow(/rankRecencyWeight/)
     expect(() => resolveConfig({ rankRecencyWeight: 2.1 })).toThrow(/rankRecencyWeight/)
     expect(() => resolveConfig({ rankProofWeight: 3 })).toThrow(/rankProofWeight/)
+    // adoption 的因子贡献封顶 +10%，权重上界 1（再大也不生效，但不静默接受乱填）。
+    expect(() => resolveConfig({ rankAdoptionWeight: -0.1 })).toThrow(/rankAdoptionWeight/)
+    expect(() => resolveConfig({ rankAdoptionWeight: 1.1 })).toThrow(/rankAdoptionWeight/)
   })
 
   it('分级递减预算参数越界 loud 失败', () => {
@@ -138,6 +144,19 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({ queryRecallTop: 0 })).toThrow(/queryRecallTop/)
     expect(() => resolveConfig({ queryRecallTop: 11 })).toThrow(/queryRecallTop/)
     expect(() => resolveConfig({ queryRecallTop: 2.5 })).toThrow(/queryRecallTop/)
+  })
+
+  it('RESUME 恢复简报：默认开启、整块 200 字符，非法值 loud 失败', () => {
+    // 默认开启：素材（会话摘要）本来就在库里，不给就用不上。
+    expect(resolveConfig({}).resumeBriefing).toBe(true)
+    expect(resolveConfig({}).resumeBriefingChars).toBe(200)
+    expect(resolveConfig({ resumeBriefing: false }).resumeBriefing).toBe(false)
+    expect(resolveConfig({ resumeBriefingChars: 80 }).resumeBriefingChars).toBe(80)
+    expect(resolveConfig({ resumeBriefingChars: 600 }).resumeBriefingChars).toBe(600)
+    expect(() => resolveConfig({ resumeBriefingChars: 79 })).toThrow(/resumeBriefingChars/)
+    expect(() => resolveConfig({ resumeBriefingChars: 601 })).toThrow(/resumeBriefingChars/)
+    expect(() => resolveConfig({ resumeBriefingChars: 120.5 })).toThrow(/resumeBriefingChars/)
+    expect(() => resolveConfig({ resumeBriefing: 'yes' as never })).toThrow(/resumeBriefing/)
   })
 })
 

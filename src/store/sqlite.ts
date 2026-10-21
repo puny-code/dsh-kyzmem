@@ -17,7 +17,7 @@ import { message } from '../i18n/messages.ts'
 // 余弦相似度：store 检索与巩固聚类共享 src/vec.ts 的单一实现（维度不匹配告警一次）。
 import { cosine } from '../vec.ts'
 import type {
-  DecayOptions, KyzmemEdgeType, KyzmemScope, EntityDetail, EntityId, EntityListFilter,
+  AdoptionStat, DecayOptions, KyzmemEdgeType, KyzmemScope, EntityDetail, EntityId, EntityListFilter,
   EntityListResult, EntityMention, EntityRecord, ExportData, FactListFilter, FactListResult,
   FactRecord, FactWriteInput, ForgettingTombstone, ForgottenAuditRow, ImageryLabel,
   ImportEntryClass, ImportOptions, ImportPreview, ImportResult,
@@ -418,14 +418,64 @@ export function ftsMatchExpression(text: string): string | undefined {
   return tokens.map(token => `"${token.replaceAll('"', '""')}"`).join(' OR ')
 }
 
+/**
+ * 解析 recall 采纳审计（`recall-used` / `recall-ignored`）的 detail.ids。
+ * detail 形如 `{batch, ids: [...]}`；坏行/缺字段返回 undefined——一条脏审计不该让
+ * 整个 adoption 统计（以及依赖它的排序）失效。
+ */
+function parseAuditIds(detail: string | null): readonly string[] | undefined {
+  if (detail === null || detail === '') return undefined
+  try {
+    const parsed: unknown = JSON.parse(detail)
+    if (parsed === null || typeof parsed !== 'object') return undefined
+    const ids = (parsed as { ids?: unknown }).ids
+    if (!Array.isArray(ids)) return undefined
+    return ids.filter((id): id is string => typeof id === 'string' && id !== '')
+  } catch {
+    return undefined
+  }
+}
+
 /** 检索排序乘性 boost 参数（RRF 融合分之上逐条乘因子；权重 0 即该因子恒 1）。 */
 export interface RankBoostOptions {
   /** recency 因子权重：`1 + w * max(0, 1 - daysSince(createdAt) / decayAfterDays)`。 */
   readonly recencyWeight: number
   /** proof 因子权重：`1 + w * log2(1 + accessCount)`。 */
   readonly proofWeight: number
+  /**
+   * adoption 因子权重（E）：`1 + min(ADOPTION_BOOST_CAP, w * smoothed(used, ignored))`。
+   * 缺省 0 = 不乘该因子——直接开库的脚本/测试保持旧排序语义；插件侧由
+   * `rankAdoptionWeight` 配置注入（默认 0.05）。
+   */
+  readonly adoptionWeight?: number
   /** recency 因子的衰减窗口天数（与衰减调度共用同一配置值）。 */
   readonly decayAfterDays: number
+}
+
+/** adoption 因子的贡献上限（+10%）：反馈回路的安全阀——「越召回越被召回」必须封顶。 */
+export const ADOPTION_BOOST_CAP = 0.1
+
+/** adoption 统计扫描窗口：最近 N 条 recall-used/recall-ignored 审计。 */
+export const ADOPTION_SCAN_LIMIT = 500
+
+/** adoption 统计的缓存时长（ms）：检索热路径上每 60 秒最多扫一次 op_log。 */
+export const ADOPTION_CACHE_MS = 60_000
+
+/**
+ * adoption 因子：`1 + min(ADOPTION_BOOST_CAP, weight * smoothed)`，`smoothed = (used + 1) / (used + ignored + 2)`。
+ *
+ * 为什么只认 used：`ignored` 只是平滑分母——它压低「被展示很多次却没人用」的条目继续拿加分的
+ * 斜率，但**不产生负分**（不降权）。从未被采纳（used=0）的条目一律回 1：贝叶斯先验在 used=0 时
+ * 给的是 0.5，若照乘等于给所有「没被展示过」的条目统一 +2.5%（权重 0.05 时），对排序是常量平移、
+ * 对指标却是噪声——「只统计被引用」这条设计约束要求它严格为零。
+ *
+ * @param stat - 该条目的采纳计数；undefined = 没有采纳记录（回 1）。
+ * @param weight - 配置权重；≤0 关闭。
+ */
+export function adoptionFactor(stat: AdoptionStat | undefined, weight: number): number {
+  if (!(weight > 0) || stat === undefined || stat.used <= 0) return 1
+  const smoothed = (stat.used + 1) / (stat.used + stat.ignored + 2)
+  return 1 + Math.min(ADOPTION_BOOST_CAP, weight * smoothed)
 }
 
 /** 缺省不加 boost（测试与脚本直开库时保持旧排序行为）。 */
@@ -626,6 +676,10 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   // 会把它永久排除（评审 M6）。批量形态同 sqlTouch。
   const sqlMarkRetrieved = db.prepare(`UPDATE nodes SET last_retrieved_at = ?,
     confidence = MIN(1, confidence + ${RETRIEVAL_CONFIDENCE_BUMP}) WHERE id IN (SELECT value FROM json_each(?))`)
+  // 文件锚取样（R5 stale 命中率）：只回 id + 三列锚字段，不读正文；状态过滤在 SQL 侧，
+  // 避免把「没锚点」的绝大多数条目搬进内存。
+  const sqlListAnchors = db.prepare(`SELECT id, anchor_path, anchor_hash, anchor_checked_at FROM nodes
+    WHERE status = 'active' AND anchor_path IS NOT NULL ORDER BY created_at DESC LIMIT ?`)
   const sqlLog = db.prepare('INSERT INTO op_log (at, op, target_id, detail) VALUES (?, ?, ?, ?)')
   const sqlHasAudit = db.prepare('SELECT 1 AS x FROM op_log WHERE op = ? AND detail = ? LIMIT 1')
   const sqlListAudit = db.prepare('SELECT detail FROM op_log WHERE op = ? AND detail IS NOT NULL ORDER BY seq')
@@ -636,6 +690,10 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   const sqlAuditLastAt = db.prepare('SELECT MAX(at) AS at FROM op_log WHERE op = ?')
   const sqlAuditRecent = db.prepare('SELECT at, op, target_id, detail FROM op_log WHERE op = ? ORDER BY seq DESC LIMIT ?')
   const sqlAuditRecentByTarget = db.prepare('SELECT at, op, target_id, detail FROM op_log WHERE op = ? AND target_id = ? ORDER BY seq DESC LIMIT ?')
+  // E adoption：只扫两类采纳审计（seq 倒序取最近 ADOPTION_SCAN_LIMIT 条），比走
+  // recentOps 全量扫小两个数量级；op 前缀命中既有 op_log_op_detail 索引。
+  const sqlAdoptionAudit = db.prepare(`SELECT op, detail FROM op_log
+    WHERE op IN ('recall-used','recall-ignored') ORDER BY seq DESC LIMIT ?`)
   const sqlOpLogById = db.prepare('SELECT at, op, target_id, detail FROM op_log WHERE target_id = ? ORDER BY seq DESC LIMIT ?')
   const sqlGetManyByIds = db.prepare('SELECT * FROM nodes WHERE id IN (SELECT value FROM json_each(?))')
   const sqlNeighborsBounded = db.prepare(`SELECT * FROM nodes WHERE id IN (
@@ -979,6 +1037,30 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       return { record, content, classification: 'new' as const }
     })
 
+  /**
+   * adoption 统计（E）：实例级缓存 60 秒。缓存放在闭包里而不是模块级，是因为一个进程里
+   * 同时开着 user / project-* / shared 多个库——共享缓存会让 A 库的采纳计数污染 B 库的排序。
+   */
+  let adoptionCache: { readonly at: number; readonly stats: ReadonlyMap<string, AdoptionStat> } | undefined
+  const adoptionStatsImpl = async (): Promise<ReadonlyMap<string, AdoptionStat>> => {
+    const now = Date.now()
+    if (adoptionCache !== undefined && now - adoptionCache.at < ADOPTION_CACHE_MS) return adoptionCache.stats
+    const rows = sqlAdoptionAudit.all(ADOPTION_SCAN_LIMIT) as unknown as { op: string; detail: string | null }[]
+    const used = new Map<string, number>()
+    const ignored = new Map<string, number>()
+    for (const row of rows) {
+      const ids = parseAuditIds(row.detail)
+      if (ids === undefined) continue
+      const bucket = row.op === 'recall-used' ? used : ignored
+      for (const id of ids) bucket.set(id, (bucket.get(id) ?? 0) + 1)
+    }
+    const stats = new Map<string, AdoptionStat>()
+    for (const [id, count] of used) stats.set(id, { used: count, ignored: ignored.get(id) ?? 0 })
+    for (const [id, count] of ignored) if (!stats.has(id)) stats.set(id, { used: 0, ignored: count })
+    adoptionCache = { at: now, stats }
+    return stats
+  }
+
   return {
     async write(input: WriteInput) {
       const content = input.content.trim()
@@ -1085,6 +1167,19 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         }
       }
 
+      // E. adoption 因子：接在 recency/proof 之后，只加不减（见 adoptionFactor）。
+      // 权重 0 时整段跳过——连一次 op_log 扫描都不做，旧部署的检索路径与 v0.12 完全一致。
+      // 为什么用本库的审计：采纳归因写在「检索实际落到的库」（index.ts 的 auditRecallAdoption），
+      // 所以 project 库的条目只吃 project 库的 used/ignored，不会跨库串味。
+      const adoptionWeight = rankBoost.adoptionWeight ?? 0
+      if (adoptionWeight > 0) {
+        const adoption = await adoptionStatsImpl()
+        for (const [id, info] of scores) {
+          const factor = adoptionFactor(adoption.get(id), adoptionWeight)
+          if (factor !== 1) info.score *= factor
+        }
+      }
+
       // TTL 降权（v15）：过期条目不硬过滤（历史事实仍有价值，用户可能正好在回忆旧状态），
       // 命中时分数 ×0.5 并在命中上标 expired，由渲染侧标 [已过期] 让模型自己决定信不信。
       const expiredIds = new Set<string>()
@@ -1182,6 +1277,8 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       }
       return { hits, degraded, channels }
     },
+
+    adoptionStats: adoptionStatsImpl,
 
     async timeline(query: TimelineQuery) {
       const limit = query.limit ?? 20
@@ -1864,6 +1961,22 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       // 因为被展示过一次就逃出衰减候选（评审 M6）；真正被使用的强化走 search 的 touch。
       const unique = [...new Set(ids.map(String))]
       sqlMarkRetrieved.run(Date.now(), JSON.stringify(unique))
+    },
+
+    async listAnchors(limit: number) {
+      const boundedLimit = Math.max(1, Math.floor(limit))
+      const rows = sqlListAnchors.all(boundedLimit) as unknown as {
+        id: string
+        anchor_path: string
+        anchor_hash: string
+        anchor_checked_at: number | null
+      }[]
+      return rows.map(row => ({
+        id: asMemoryId(row.id),
+        // checked_at 理论上非空（写锚点与写路径同一条 INSERT）；老库/手工改库可能留空，
+        // 用 0 表示「不知道上次何时校验」而不是把它当成 1970 年的时间戳去参与判断。
+        anchor: { path: row.anchor_path, hash: row.anchor_hash, checkedAt: row.anchor_checked_at ?? 0 },
+      }))
     },
 
     async supersedeMany(input: WriteInput, oldIds: readonly MemoryId[]) {

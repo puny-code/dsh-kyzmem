@@ -419,6 +419,13 @@ export const en: Record<KyzmemKey, string> = {
   metricWeeklyGrowth: 'Growth / week',
   metricReviewCompletion: 'Review completion',
   metricMaintenanceDebt: 'Backlog',
+  // R5 metrics (v0.12 batch 3): estimates say so in the label; not a billing figure.
+  metricExposureChars: 'Exposure chars',
+  metricInjectionCount: 'First-question injections',
+  metricActivation: 'Activation rate',
+  metricDrillDown: 'Drill-down rate',
+  metricTokenCost: 'Token cost (est.)',
+  metricStaleAnchor: 'Stale-anchor rate',
   filterConfirmed: 'Confirmed only',
   filterConfirmedHint: 'Only rows with the user-confirmed source tier — inferred, tool and web rows stay out',
   tierBadgeTitle: 'Source tier: confirmed → inferred → tool output → web page',

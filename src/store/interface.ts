@@ -5,11 +5,11 @@
  */
 
 import type {
-  ConflictAction, ConflictListResult, DecayOptions, KyzmemEdgeType, KyzmemScope, EntityDetail, EntityId,
+  AdoptionStat, ConflictAction, ConflictListResult, DecayOptions, KyzmemEdgeType, KyzmemScope, EntityDetail, EntityId,
   EntityListFilter, EntityListResult, EntityMention, EntityRecord, EpisodeTimelineQuery, EpisodeTimelineResult,
   ExportData, FactListFilter, FactListResult, FactRecord, FactWriteInput,
   ForgettingTombstone, ForgottenAuditRow, ImportOptions, ImportPreview, ImportResult, ListFilter, ListResult,
-  MemoryId, MemoryOutcome, MemoryRecord, ObservationId, ObservationListFilter, ObservationRecord,
+  MemoryAnchor, MemoryId, MemoryOutcome, MemoryRecord, ObservationId, ObservationListFilter, ObservationRecord,
   ObservationWriteInput, OperationLogRow, ProfileBlock, ProfileBlockVersion,
   ReviewGrade, ReviewView, SearchQuery, SearchResult, SessionSummaryRecord, Slot, StoreStats,
   TimelineQuery, UpdateInput, WriteInput,
@@ -59,6 +59,15 @@ export interface KyzmemStore {
    * @param queryVector - 查询向量；undefined 表示嵌入不可用（结果 degraded）。
    */
   search(query: SearchQuery, queryVector: Float32Array | undefined): Promise<SearchResult>
+  /**
+   * 召回采纳统计（E adoption 进排序的数据源）：扫描最近 500 条 `recall-used|recall-ignored`
+   * 审计，把批次级 `detail.ids` 拆到条目上累加 used/ignored。
+   *
+   * 为什么要缓存：检索是热路径（每次 kyzmem_search 都会问一次），而 op_log 扫描与
+   * 「刚刚采纳了一次」之间的时效性并不重要——60 秒的窗口不会改变排序结论，
+   * 却把扫描频率从「每次检索」压到「每分钟一次」。缓存按实例隔离（不同分库互不影响）。
+   */
+  adoptionStats(): Promise<ReadonlyMap<string, AdoptionStat>>
   /** 时间线查询：缺省按 createdAt 倒序，order='tour' 时按固定巡游路线桩位顺序。 */
   timeline(query: TimelineQuery): Promise<MemoryRecord[]>
   /**
@@ -196,6 +205,12 @@ export interface KyzmemStore {
    * 留 recency 痕迹，但不让条目因为被展示过一次就永久逃过衰减。
    */
   markRetrieved(ids: readonly MemoryId[]): Promise<void>
+  /**
+   * 带文件锚的 active 条目（schema v16；按创建时间倒序至多 limit 条）。
+   * 只回 id 与锚点字段——供遥测做 mtime 实时复验（stale 命中率）取样，
+   * 不读正文：一条要被 stat 的锚点不该顺手把内容也捞出来。
+   */
+  listAnchors(limit: number): Promise<readonly { readonly id: MemoryId; readonly anchor: MemoryAnchor }[]>
   /** 蒸馏写入原语：单事务内写新条目、归档全部旧条目并逐条建立 supersedes 边。 */
   supersedeMany(input: WriteInput, oldIds: readonly MemoryId[]): Promise<MemoryRecord>
   /**

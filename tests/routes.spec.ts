@@ -149,6 +149,34 @@ describe('GET /api/kyzmem/stats（§8 指标 + 通道）', () => {
     const userPart = reply.json.parts.find((part: { scope: string }) => part.scope === 'user')
     expect(userPart.stats.byTier).toMatchObject({ 'user-confirmed': 1, 'tool-output': 1 })
   })
+
+  it('R5 六项随 metrics 一起给出：没有注入时缺省，不抛 500', async () => {
+    const reply = await harness(makeDeps())('GET', '/api/kyzmem/stats')
+    expect(reply.status).toBe(200)
+    // 「跑了是 0」与「还没跑」分开：注入次数是 0，曝光/激活/token 成本缺省（面板显示「—」）。
+    expect(reply.json.metrics.injectionCount).toBe(0)
+    expect(reply.json.metrics.exposureChars).toBeUndefined()
+    expect(reply.json.metrics.activationRate).toBeUndefined()
+    expect(reply.json.metrics.tokenCostEstimate).toBeUndefined()
+    // examine 还不写 op_log ⇒ 下钻率缺省（不是 0%）。
+    expect(reply.json.metrics.drillDownRate).toBeUndefined()
+    // 无带锚条目 ⇒ 锚点过期率缺省。
+    expect(reply.json.metrics.staleAnchorRate).toBeUndefined()
+  })
+
+  it('R5 有注入审计时按 zh 口径折算 token 成本，曝光/激活出炉', async () => {
+    await store.audit('query-recall', 'BATCH', JSON.stringify({ outcome: 'injected', chars: 100, tookMs: 3, top: 3, ids: [] }))
+    const reply = await harness(makeDeps())('GET', '/api/kyzmem/stats')
+    // 夹具把三个 scope 都指到同一个 store（makeDeps 的 openStore 恒返回 store），所以同一条
+    // 审计会被三个 scope 各读一遍——断言按「次数 × 单次口径」写，不写死 1。
+    const injections = reply.json.metrics.injectionCount as number
+    expect(injections).toBeGreaterThan(0)
+    expect(reply.json.metrics.exposureChars).toBe(100 * injections)
+    // deps.language = 'zh' ⇒ 1.5 token/字。
+    expect(reply.json.metrics.tokenCostEstimate).toBe(150 * injections)
+    // 注入过但没有工具检索/下钻 ⇒ 激活率是 0（有样本的 0，不是缺省）。
+    expect(reply.json.metrics.activationRate).toBe(0)
+  })
 })
 
 describe('GET /api/kyzmem/memories（confirmedOnly=1）', () => {

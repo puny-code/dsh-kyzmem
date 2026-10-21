@@ -286,6 +286,25 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           const raw = body?.['project']
           if (typeof raw === 'string' && raw !== '') selectorRef.value = raw
         }
+        /**
+         * 文件锚复验根（R5 stale 命中率）：面板当前工作区目录。
+         * 先按项目选择器找对应工作区，没有选择器就用进程目录兜底项——插件进程的 cwd
+         * 通常就是当前工作区。解析不出来返回 undefined：宁可不复验，也不拿错的根去
+         * 把整库锚点标成「过期」（假阳性比缺省更坏）。
+         */
+        const resolveAnchorRoot = async (): Promise<string | undefined> => {
+          try {
+            const items = await deps.projects.list()
+            const selector = selectorRef.value
+            const picked = selector === undefined
+              ? items.find(item => item.kind === 'process')
+              : items.find(item => item.dbName === selector)
+            const path = picked?.path
+            return path === null || path === undefined || path === '' ? undefined : path
+          } catch {
+            return undefined
+          }
+        }
         try {
           if (req.method === 'GET' && route === 'workspaces') {
             // 项目宫殿清单：面板据此显示当前工作区、并支持手动切换（不建空库）。
@@ -304,9 +323,17 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             // parts 缺 shared 分部而永远显示 0——一行修复前它是真实的幽灵 scope。
             const scopes: KyzmemScope[] = ['user', 'project', 'shared']
             const parts = await Promise.all(scopes.map(async (scope) => ({ scope, stats: await (await storeFor(scope)).stats() })))
-            // §8 十二项指标：与面板复用同一个纯函数聚合（stats + op_log 一起读；单库缺失只是跳过，
+            // §8 指标：与面板复用同一个纯函数聚合（stats + op_log 一起读；单库缺失只是跳过，
             // 不能因为某个库没建就让整个速览 500——面板首屏必须出得来）。
-            const gathering = await collectMetrics(scope => storeFor(scope), scopes)
+            // R5 的两项外部输入：注入语言（token 估算的字符宽度口径）与文件锚复验根。
+            // 锚点根取面板当前工作区目录：user 库的锚点是在会话 cwd（通常就是这个工作区）里
+            // 算的，项目库的也在同一目录；解析不出来就不复验（该项显示「—」，而不是把
+            // 一堆「路径相对谁都不知道」的锚点标成过期）。
+            const anchorRoot = await resolveAnchorRoot()
+            const gathering = await collectMetrics(scope => storeFor(scope), scopes, 7, Date.now(), {
+              language: deps.language,
+              ...(anchorRoot === undefined ? {} : { anchorRoot }),
+            })
             json(res, 200, { parts, metrics: gathering.metrics, channels: gathering.channels, windowDays: 7 })
             return
           }
