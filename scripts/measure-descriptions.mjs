@@ -31,7 +31,10 @@ const BUDGET = { top: 150, param: 60, keys: 6000, emitted: 6600 }
  * 6 个值本身 58 字符，加任意分隔符最少 63，压不进 60；与其用 `search_*` 通配
  * （正是评审要修掉的写法），不如给这一个键单独额度并在此登记。
  */
-const PARAM_ALLOWANCES = { 'tool.assessNextStrategyDescription': 70 }
+const PARAM_ALLOWANCES = {
+  // 6 个枚举字面量 58 + 5 个 `/ ` 分隔符 10 = 68，70 是可读分隔符下的下限；再压只能改成通配或丢值。
+  'tool.assessNextStrategyDescription': 70,
+}
 
 let catalog
 try {

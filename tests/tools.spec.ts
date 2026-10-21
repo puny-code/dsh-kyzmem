@@ -952,6 +952,66 @@ describe('kyzmem_examine 的三种 id 形态（评审 P1-2）', () => {
     const notFound = tools3.get('kyzmem_examine')!.execute({ ids: ['deadbeef'] }, exec)
     await expect(notFound).rejects.toThrow('库里没有')
   })
+
+  it('裸 8 位前缀也查 shared 库（N3：user→project→shared 命中即止）', async () => {
+    const saved = await store3.write({ scope: 'shared', kind: 'fact', content: '共享库里的条目' })
+    const exec = execFor('sess-examine-shared')
+    const result = await tools3.get('kyzmem_examine')!.execute(
+      { ids: [String(saved.id).slice(0, 8)] }, exec,
+    ) as { text: string }
+    expect(result.text).toContain(String(saved.id))
+    expect(result.text).toContain('共享库里的条目')
+  })
+
+  it('同一前缀命中多条时抛 examineIdAmbiguous 并列出候选（X5）', async () => {
+    const now = Date.now()
+    const base = {
+      scope: 'user' as const, kind: 'fact' as const, importance: 0.5, confidence: 0.5, status: 'active' as const,
+      createdAt: now, lastAccessedAt: now, accessCount: 0, sourceSessionId: null, sourceRound: null, sourceSeq: null,
+    }
+    // 正常写入拿不到「同前缀」的两条：UUID 前缀碰撞概率为零，只能像导入备份那样指定 id。
+    await store3.importData({
+      exportedAt: now,
+      records: [
+        { ...base, id: asMemoryIdCompat('abcdef01-0000-4000-8000-000000000001'), content: '同前缀甲' },
+        { ...base, id: asMemoryIdCompat('abcdef01-0000-4000-8000-000000000002'), content: '同前缀乙' },
+      ],
+      edges: [],
+    })
+    const exec = execFor('sess-examine-ambiguous')
+    await expect(tools3.get('kyzmem_examine')!.execute({ ids: ['abcdef01'] }, exec)).rejects.toThrow('命中多条')
+  })
+
+  it('16 个垃圾前缀 + 2000 条夹具：共享扫描，耗时 <150ms（旧逐 token 实测 ~490ms）', async () => {
+    const now = Date.now()
+    const records = Array.from({ length: 2000 }, (_, index) => ({
+      id: asMemoryIdCompat(`ffffffff-0000-4000-8000-${index.toString(16).padStart(12, '0')}`),
+      scope: 'user' as const,
+      kind: 'fact' as const,
+      content: `容量夹具 ${index}`,
+      importance: 0.5,
+      confidence: 0.5,
+      status: 'active' as const,
+      createdAt: now,
+      lastAccessedAt: now,
+      accessCount: 0,
+      sourceSessionId: null,
+      sourceRound: null,
+      sourceSeq: null,
+    }))
+    await store3.importData({ exportedAt: now, records, edges: [] })
+    const exec = execFor('sess-examine-perf')
+    const junk = Array.from({ length: 16 }, (_, index) => `e00000${index.toString(16).padStart(2, '0')}`)
+    const examine = tools3.get('kyzmem_examine')!
+    // 预热一次：首次 list 会编译 SQL 语句，不该算进扫描成本。
+    await examine.execute({ ids: [junk[0]] }, exec).catch(() => undefined)
+    const started = performance.now()
+    await examine.execute({ ids: junk }, exec).catch(() => undefined)
+    const elapsed = performance.now() - started
+    // 本机实测约 27ms（逐 token 旧实现约 490ms）。150ms 留 ~5× 余量；CI 慢机器噪声大时可放宽到 250ms，
+    // 但不要为了让它过而删掉这条断言——它是防「退回逐 token 扫描」的唯一哨兵。
+    expect(elapsed).toBeLessThan(150)
+  })
 })
 
 /** 品牌类型在测试里的最小换算：MemoryId 是 string 的品牌子类型。 */

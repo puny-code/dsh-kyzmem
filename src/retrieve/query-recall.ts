@@ -13,9 +13,10 @@
  *  - **只走 FTS 道**（queryVector 传 undefined）：首轮关键路径上只有 QUERY_RECALL_TIMEOUT_MS
  *    的预算，而嵌入器的冷启动（模型加载/下载）是秒级；方案 §4 已明确「无 embedder 时走 FTS
  *    通道即可」。向量道留给 kyzmem_search 的完整检索。
- *  - **检索词截到 QUERY_RECALL_MAX_QUERY_CHARS**：首问可能是一整段贴进来的日志或报错，
- *    2-gram 切词会变成几百个 OR 词元（SQLite 侧逐词元扫 FTS 索引，成本随长度线性涨），
- *    噪声词还会稀释分数。80 字覆盖「一句话问题」的绝大多数。
+ *  - **检索词先清洗再截到 QUERY_RECALL_MAX_QUERY_CHARS**：首问常是「先贴一大段报错，再问一句
+ *    怎么办」。直接截头部会让检索词变成纯日志（词元全是路径/时间戳/地址），真正的提问在尾部
+ *    却丢了；这里先去掉 fenced code block 与日志/栈帧/时间戳行，再取前 80 字符
+ *    （`buildRecallQuery`）。2-gram 切词对长日志会膨胀成几百个 OR 词元，成本也随长度线性涨。
  *  - **不强化、不落原文**：检索走 `touch: false`（命中不涨 access_count/confidence——
  *    召回只是「展示候选」，不该改变记忆的存储强度；强化只给真正被注入的那些），
  *    `auditQuery: 'hash'`（op_log 只存 queryHash，首问里的 key/token 不进库），
@@ -54,8 +55,12 @@ export const QUERY_RECALL_CANDIDATES = 5
 /** 首问的 CJK 字数下限（中文一个字顶西文约三个字符的信息量）。 */
 export const QUERY_RECALL_MIN_CJK_CHARS = 6
 
-/** 首问的其它语言字符数下限（按去空白后的非 CJK 字符数算）。 */
-export const QUERY_RECALL_MIN_TEXT_CHARS = 20
+/**
+ * 首问的其它语言字符数下限（按去空白后的非 CJK 字符数算）。
+ * 15 而不是 20：实测「how do I build this?」(15)、「fix the build error」(18)、
+ * 「Как собрать проект?」(18) 都是信息充分的短问题，20 会把它们全挡在门外（复审 X1）。
+ */
+export const QUERY_RECALL_MIN_TEXT_CHARS = 15
 
 /** 检索词最大字符数（见模块头：贴进来的长日志不能整段变成 FTS 表达式）。 */
 export const QUERY_RECALL_MAX_QUERY_CHARS = 80
@@ -113,7 +118,7 @@ const CJK_CHAR_GLOBAL = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u
  * 模块私有判断，把它导出会把写入内部实现变成公共 API；这里用**同一数据源**
  * （`chitchatPatterns`，语言包里的同一套正则）重新拼一次，语义等价。
  * 阈值分语言是因为「这个项目怎么构建？」只有 9 个字符却信息充分，而英文 9 个字符
- * （"hi there"）通常没有检索意图：CJK 按 6 字、其余按 20 字符。
+ * （"hi there"）通常没有检索意图：CJK 按 6 字、其余按 15 字符。
  * @param text - 首问原文。
  * @param language - 语言包选择（决定哪些寒暄正则生效）。
  */
@@ -130,6 +135,47 @@ export function shouldQueryRecallText(text: string, language: KyzmemLanguage): b
 
 /** 检索所需的最小 store 视图（两库并行；测试可注入替身）。 */
 export type QueryRecallStore = Pick<KyzmemStore, 'search'>
+
+/**
+ * 日志/栈帧/时间戳行的形状：这类行在检索前整行丢掉。
+ * 它们的 FTS 词元是路径、十六进制地址、时间戳——命中率极低，还会把真正的提问稀释掉。
+ * 大小写敏感（不用 i 标志）：`At the café…` 这种英文句首不该被当成栈帧 `at `。
+ */
+const LOG_LINE = /^(?:\s*(?:at\s+\S|File\s+"|0x[0-9a-fA-F]+|\[?\d{1,2}:\d{2}(?::\d{2})?|\d{4}[-/]\d{2}[-/]\d{2}|Caused by:|\.\.\.\s*\d+\s+more|#\d+\s+\S)|.*\bTraceback\b)/u
+
+/** 去掉 fenced code block；未闭合的尾部（粘贴时常见）一并丢到结尾。 */
+function stripFencedBlocks(text: string): string {
+  return text.replace(/```[\s\S]*?(?:```|$)/gu, '\n')
+}
+
+/** 去掉日志/栈帧/时间戳行（按行判定，保留自然语言行）。 */
+function stripLogLines(text: string): string {
+  return text.split('\n').filter(line => !LOG_LINE.test(line)).join('\n')
+}
+
+/** 清洗后至少还剩「可检索的自然语言」：2 个字母/数字（汉字也算）。 */
+const ANY_WORD = /[\p{L}\p{N}]{2}/u
+
+/**
+ * 构造检索词：先清洗（fenced code block / 日志行）再截断到 QUERY_RECALL_MAX_QUERY_CHARS。
+ *
+ * 为什么不是直接截头部：用户常见「先贴一整段报错，再问一句怎么办」，直接截头部会把检索词
+ * 变成纯日志（FTS 词元全是路径、时间戳、地址），真正的提问落在尾部而检索质量归零（复审 X2）。
+ * 清洗后若连词元都不剩（纯代码/纯日志），退回原始文本头部——宁可带噪声，也别丢检索意图。
+ *
+ * 退回门槛故意比文本门（CJK 6 / 其余 15）低得多：清洗后剩「这个怎么修」这种 5 字短句
+ * 恰恰是最该拿去检索的，用文本门反而会把最典型的「贴报错 + 一句提问」退回成整段日志。
+ * @param text - 首问原文。
+ * @returns 检索词（无可用文本时为空串）。
+ */
+export function buildRecallQuery(text: string): string {
+  const flat = text.trim().replace(/\s+/gu, ' ')
+  if (flat === '') return ''
+  const cleaned = stripLogLines(stripFencedBlocks(text)).replace(/\s+/gu, ' ').trim()
+  const candidate = cleaned.slice(0, QUERY_RECALL_MAX_QUERY_CHARS)
+  if (!ANY_WORD.test(candidate)) return flat.slice(0, QUERY_RECALL_MAX_QUERY_CHARS)
+  return candidate
+}
 
 /** 召回依赖：按 scope 打开分库 + 证据批次登记。 */
 export interface QueryRecallDeps {
@@ -255,7 +301,7 @@ export async function runQueryRecall(
   options: QueryRecallOptions,
 ): Promise<QueryRecallRun> {
   const started = performance.now()
-  const query = options.text.trim().replace(/\s+/gu, ' ').slice(0, QUERY_RECALL_MAX_QUERY_CHARS)
+  const query = buildRecallQuery(options.text)
   if (query === '') return emptyRun('no-hit', 0)
   const settled = await withTimeBudget(
     Promise.allSettled(options.scopes.map(async (scope) => {

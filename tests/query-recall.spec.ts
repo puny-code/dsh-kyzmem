@@ -19,7 +19,7 @@ import { messageIn } from '../src/i18n/messages.ts'
 import { assessEvidence, evidenceBatches } from '../src/retrieve/evidence.ts'
 import {
   QUERY_RECALL_ITEM_CHARS, QUERY_RECALL_MAX_QUERY_CHARS, QUERY_RECALL_TIMEOUT_MS,
-  isPlaceholderRequest, runQueryRecall, shouldQueryRecallText, shouldRunQueryRecall,
+  buildRecallQuery, isPlaceholderRequest, runQueryRecall, shouldQueryRecallText, shouldRunQueryRecall,
 } from '../src/retrieve/query-recall.ts'
 import type { QueryRecallStore } from '../src/retrieve/query-recall.ts'
 import { openKyzmemStore } from '../src/store/sqlite.ts'
@@ -80,15 +80,67 @@ describe('shouldQueryRecallText（值不值得查）', () => {
     expect(shouldQueryRecallText('构建链呢', 'zh')).toBe(false)
   })
 
-  it('非 CJK 门槛 20 字符：19 个字符不查、20 个字符查', () => {
-    expect(shouldQueryRecallText('release flow now?', 'en')).toBe(false)
-    expect(shouldQueryRecallText('how do I build this project?', 'en')).toBe(true)
+  it('非 CJK 门槛 15 字符：信息充分的短问句能过（复审 X1）', () => {
+    // 这三个都是实测被旧门槛 20 挡掉的真实短问句。
+    expect(shouldQueryRecallText('how do I build this?', 'en')).toBe(true)  // 16 个非空白字符
+    expect(shouldQueryRecallText('fix the build error', 'en')).toBe(true)   // 16
+    expect(shouldQueryRecallText('Как собрать проект?', 'ru')).toBe(true)   // 18
+    // 13 个字符的碎片仍然不查。
+    expect(shouldQueryRecallText('build it now ok?', 'en')).toBe(false)
+    expect(shouldQueryRecallText('where is it', 'en')).toBe(false)
   })
 
   it('纯寒暄不查（与写入链路 isPureChitchat 同一数据源）', () => {
     // 长度过门槛，但整条就是寒暄 + 标点：走寒暄分支而不是长度分支。
     expect(shouldQueryRecallText('好的！！！！！！！！！！！！', 'zh')).toBe(false)
     expect(shouldQueryRecallText('thank you!!!!!!!!', 'en')).toBe(false)
+  })
+})
+
+describe('buildRecallQuery（检索词清洗，复审 X2）', () => {
+  it('先贴一整段报错再提问：检索词是提问，不是日志', () => {
+    const log = [
+      'Traceback (most recent call last):',
+      '  File "/app/build.py", line 42, in <module>',
+      '    raise RuntimeError("boom")',
+      '    at Object.<anonymous> (/app/node_modules/x/index.js:12:9)',
+      '2026-10-21 15:20:12 ERROR build failed after 3000ms',
+      '0x7ff8deadbeef',
+      ...Array.from({ length: 6 }, (_, index) => `    at frame${String(index)} (/app/a.js:${String(index)}:1)`),
+      'Caused by: Error: module not found',
+      '这个怎么修',
+    ].join('\n')
+    expect(log.length).toBeGreaterThan(200)
+    const query = buildRecallQuery(log)
+    expect(query).toContain('怎么修')
+    expect(query).not.toContain('Traceback')
+    expect(query).not.toContain('at frame')
+    expect(query).not.toContain('2026-10-21')
+    expect(query.length).toBeLessThanOrEqual(QUERY_RECALL_MAX_QUERY_CHARS)
+  })
+
+  it('fenced code block 被剔除（含未闭合的尾部）', () => {
+    expect(buildRecallQuery('```python\nraise RuntimeError("x")\n```\n这段代码跑不起来'))
+      .toBe('这段代码跑不起来')
+    // 未闭合的围栏按「后面全是代码」处理；整段没剩自然语言 → 退回原文头部（不崩）。
+    expect(buildRecallQuery('```js\nconst x = 1')).toBe('```js const x = 1')
+  })
+
+  it('纯代码/纯日志没有自然语言时退回原文头部，不崩', () => {
+    const code = 'const x = 1\nconst y = 2\nconsole.log(x + y)'
+    const codeQuery = buildRecallQuery(code)
+    expect(codeQuery.length).toBeGreaterThan(0)
+    expect(codeQuery.length).toBeLessThanOrEqual(QUERY_RECALL_MAX_QUERY_CHARS)
+
+    const logsOnly = '    at a (/x.js:1:1)\n    at b (/x.js:2:1)'
+    const logQuery = buildRecallQuery(logsOnly)
+    expect(logQuery.length).toBeGreaterThan(0)
+    expect(logQuery).toContain('at a')
+  })
+
+  it('空文本返回空串；正文过长按 80 字符截断', () => {
+    expect(buildRecallQuery('   ')).toBe('')
+    expect(buildRecallQuery('怎么修'.repeat(50)).length).toBe(QUERY_RECALL_MAX_QUERY_CHARS)
   })
 })
 
@@ -165,7 +217,8 @@ describe('runQueryRecall（检索 + 门 + 渲染 + 预算）', () => {
     text: 'TypeScript 项目的构建链到底用哪个工具？',
     scopes: ['user'] as const,
     top: 3,
-    budget: 480,
+    // 与 resolveConfig({}) 的默认预算一致：容量用例要能直接反映线上默认行为。
+    budget: 640,
     language: 'zh' as const,
     now: Date.now(),
     injectTiers: ['user-confirmed', 'agent-inferred'],
@@ -205,6 +258,22 @@ describe('runQueryRecall（检索 + 门 + 渲染 + 预算）', () => {
     expect(shape.auditQuery).toBe('hash')
     expect(shape.limit).toBe(5)
     expect(shape.text.length).toBeLessThanOrEqual(QUERY_RECALL_MAX_QUERY_CHARS)
+  })
+
+  it('X2 集成：贴 200 字报错再提问 → 实际检索词是提问而不是日志', async () => {
+    const log = [
+      'Traceback (most recent call last):',
+      '  File "/app/build.py", line 42, in <module>',
+      '    raise RuntimeError("boom")',
+      '    at Object.<anonymous> (/app/x.js:12:9)',
+      ...Array.from({ length: 8 }, (_, index) => `    at f${String(index)} (/app/a.js:${String(index)}:1)`),
+      '这个怎么修',
+    ].join('\n')
+    await runQueryRecall(depsOf(), query({ text: log }))
+    expect(captured).toHaveLength(1)
+    expect(captured[0]!.text).toContain('怎么修')
+    expect(captured[0]!.text).not.toContain('Traceback')
+    expect(captured[0]!.text.length).toBeLessThanOrEqual(QUERY_RECALL_MAX_QUERY_CHARS)
   })
 
   it('信任/过期门与画像同口径：web-content 与已过期条目都不注入', async () => {
@@ -258,10 +327,10 @@ describe('runQueryRecall（检索 + 门 + 渲染 + 预算）', () => {
     expect(two.ids).toEqual(three.ids.slice(0, 2))
   })
 
-  it('默认配置（light + 600）下 80 字内容真的放得下 3 条', async () => {
+  it('默认配置（light + 640）下 80 字内容真的放得下 3 条（zh）', async () => {
     const resolved = resolveConfig({})
     expect(resolved.queryRecallTop).toBe(3)
-    expect(resolved.queryRecallBudget).toBe(600)
+    expect(resolved.queryRecallBudget).toBe(640)
     for (const prefix of ['工作区甲', '工作区乙', '工作区丙']) {
       await store.write({
         scope: 'user', kind: 'fact',
@@ -277,6 +346,66 @@ describe('runQueryRecall（检索 + 门 + 渲染 + 预算）', () => {
     expect(outcome.outcome).toBe('injected')
     expect(outcome.ids).toHaveLength(3)
     expect(outcome.chars).toBeLessThanOrEqual(resolved.queryRecallBudget)
+  })
+
+  it('默认配置（light + 640）下 ru/en 也放得下 3 条（复审 N1：600 时 ru 差 1 字符）', async () => {
+    const resolved = resolveConfig({})
+    const cases = [
+      {
+        language: 'ru' as const,
+        // 80 字俄文正文（不触发截断），共享«сборка»词元保证三列都命中。
+        contents: ['Сборка проекта альфа', 'Сборка проекта бета', 'Сборка проекта гамма'].map(head => `${head}: ${'д'.repeat(80 - head.length - 2)}`),
+        text: 'Какая сборка используется в проекте?',
+      },
+      {
+        language: 'en' as const,
+        contents: ['Build pipeline alpha', 'Build pipeline beta', 'Build pipeline gamma'].map(head => `${head}: ${'x'.repeat(80 - head.length - 2)}`),
+        text: 'Which build pipeline is used here?',
+      },
+    ]
+    for (const testCase of cases) {
+      for (const content of testCase.contents) {
+        expect(content.length).toBe(80)
+        await store.write({ scope: 'user', kind: 'fact', content, importance: 0.6 })
+      }
+      const outcome = await runQueryRecall(depsOf(), query({
+        text: testCase.text,
+        language: testCase.language,
+        top: resolved.queryRecallTop,
+        budget: resolved.queryRecallBudget,
+      }))
+      expect(outcome.outcome).toBe('injected')
+      expect(outcome.ids).toHaveLength(3)
+      expect(outcome.chars).toBeLessThanOrEqual(resolved.queryRecallBudget)
+    }
+  })
+
+  it('full 档（top=5 / 预算 960）真的放得下 5 条（zh 与 en 各一次）', async () => {
+    const full = resolveConfig({ queryRecall: 'full' })
+    expect(full.queryRecallTop).toBe(5)
+    expect(full.queryRecallBudget).toBe(960)
+    const cases = [
+      { language: 'zh' as const, head: '工作区规范', text: '工作区的规范是什么？', pad: '细' },
+      { language: 'en' as const, head: 'Build pipeline', text: 'Which build pipeline applies?', pad: 'x' },
+    ]
+    for (const [index, testCase] of cases.entries()) {
+      for (let item = 0; item < 5; item += 1) {
+        const prefix = `${testCase.head} ${String(index)}${String(item)}`
+        await store.write({
+          scope: 'user', kind: 'fact',
+          content: `${prefix}: ${testCase.pad.repeat(80 - prefix.length - 2)}`, importance: 0.6,
+        })
+      }
+      const outcome = await runQueryRecall(depsOf(), query({
+        text: testCase.text,
+        language: testCase.language,
+        top: full.queryRecallTop,
+        budget: full.queryRecallBudget,
+      }))
+      expect(outcome.outcome).toBe('injected')
+      expect(outcome.ids).toHaveLength(5)
+      expect(outcome.chars).toBeLessThanOrEqual(full.queryRecallBudget)
+    }
   })
 
   it('预算装不下就整块放弃（outcome=budget-skip，不留空批次）', async () => {

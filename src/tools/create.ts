@@ -2071,63 +2071,66 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
     },
   })
 
-  /**
-   * 按 8+ 位十六进制前缀找 id。
-   * store 没有前缀查询接口（存储层不在本层改动范围），只能分页 list 后过滤；
-   * examine 是低频路径，5000 条扫描上限足够兜底，真到上限的库应当改用完整 id。
-   */
-  async function findIdsByPrefix(scope: KyzmemScope, prefix: string): Promise<MemoryId[]> {
-    const store = await deps.openStore(scope)
-    const matches: MemoryId[] = []
-    const pageSize = 500
-    for (let offset = 0; offset < 5000; offset += pageSize) {
-      const page = await store.list({ scope, limit: pageSize, offset })
-      for (const record of page.records) {
-        if (String(record.id).toLowerCase().startsWith(prefix)) matches.push(record.id)
-      }
-      if (page.records.length < pageSize) break
-    }
-    return matches
+  /** 前缀扫描的条目上限（与旧实现一致）：超过就要求给完整 id，避免把库扫成无底洞。 */
+  const PREFIX_SCAN_LIMIT = 5000
+  const PREFIX_SCAN_PAGE = 500
+
+  /** 一次调用里的前缀反查需求：`scope` 缺省 = 裸前缀（user → project → shared 依次查）。 */
+  interface PrefixQuery {
+    readonly prefix: string
+    readonly scope: KyzmemScope | undefined
   }
 
-  /** 单个 examine token 的解析结果：命中坐标 / 前缀歧义（列候选）/ 都没命中。 */
-  interface ExamineResolution {
-    readonly target?: CitationRefTarget
-    readonly ambiguous?: readonly MemoryId[]
+  /** 前缀查询在结果表里的键：裸前缀与带 scope 的同名前缀不能互相覆盖。 */
+  function prefixKeyOf(scope: KyzmemScope | undefined, prefix: string): string {
+    return `${scope ?? '*'}\u0000${prefix}`
   }
 
   /**
-   * token → 条目坐标。ref 先查会话里的批次映射（能还原带宫位的 ref），
-   * 查不到再按 `#8` 前缀扫库；完整 UUID 依次在 user / project / shared 里 get。
+   * 一次调用内共享的前缀扫描：每个 scope 只分页一遍，在内存里匹配本批**全部**待查前缀。
+   *
+   * 为什么要批量（评审 X3）：逐 token 扫描是 O(tokens × scopes × records)，实测 16 个未命中
+   * token × 2 scope × 5000 条要 490–647ms；共享后 IO 只剩 O(scopes)，匹配常数由内存承担。
+   * 裸前缀按 user → project → shared 顺序查，命中即止（UUID 不会跨库重复；N3：shared 也要查）。
+   *
+   * @returns key（见 `prefixKeyOf`）→ 命中的条目坐标；未命中的键不出现。
    */
-  async function resolveExamineToken(token: ExamineToken, refs: ReadonlyMap<string, CitationRefTarget>): Promise<ExamineResolution> {
-    if (token.kind === 'invalid') return {}
-    if (token.kind === 'ref') {
-      const direct = refs.get(token.raw) ?? refs.get(token.raw.toLowerCase())
-      if (direct !== undefined) return { target: direct }
-      // `user/#8hex`：会话映射里没有（跨会话/重启后）时，还能拆出前缀按 scope 查。
-      const short = /^#?([0-9a-f]{8,})$/i.exec(token.raw.slice(token.scope.length + 1))
-      if (short === null) return {}
-      const matches = await findIdsByPrefix(token.scope, (short[1] ?? '').toLowerCase())
-      const only = matches[0]
-      if (matches.length === 1 && only !== undefined) return { target: { scope: token.scope, id: only } }
-      return matches.length > 1 ? { ambiguous: matches } : {}
-    }
-    if (token.kind === 'prefix') {
-      const matches: CitationRefTarget[] = []
-      for (const scope of ['user', 'project'] as const) {
-        for (const id of await findIdsByPrefix(scope, token.prefix)) matches.push({ scope, id })
-      }
-      const only = matches[0]
-      if (matches.length === 1 && only !== undefined) return { target: only }
-      return matches.length > 1 ? { ambiguous: matches.map(match => match.id) } : {}
-    }
-    // 完整 UUID：不知道在哪个库，按 user → project → shared 逐个 get（单次最多 16 条，代价可控）。
+  async function scanPrefixMatches(queries: readonly PrefixQuery[]): Promise<Map<string, CitationRefTarget[]>> {
+    const results = new Map<string, CitationRefTarget[]>()
+    const pending = new Map<string, PrefixQuery>()
+    for (const query of queries) pending.set(prefixKeyOf(query.scope, query.prefix), query)
+    if (pending.size === 0) return results
+
     for (const scope of EXAMINE_SCOPES) {
-      const record = await (await deps.openStore(scope)).get(asMemoryId(token.raw))
-      if (record !== undefined) return { target: { scope, id: record.id } }
+      // 本轮要匹配的前缀：属于本库的 ref 前缀 + 尚未命中的裸前缀。
+      const active: { readonly key: string; readonly prefix: string }[] = []
+      for (const [key, query] of pending) {
+        if (query.scope !== undefined && query.scope !== scope) continue
+        active.push({ key, prefix: query.prefix })
+      }
+      if (active.length === 0) continue
+      const store = await deps.openStore(scope)
+      for (let offset = 0; offset < PREFIX_SCAN_LIMIT; offset += PREFIX_SCAN_PAGE) {
+        const page = await store.list({ scope, limit: PREFIX_SCAN_PAGE, offset })
+        for (const record of page.records) {
+          const id = String(record.id).toLowerCase()
+          for (const entry of active) {
+            if (!id.startsWith(entry.prefix)) continue
+            const bucket = results.get(entry.key)
+            if (bucket === undefined) results.set(entry.key, [{ scope, id: record.id }])
+            else bucket.push({ scope, id: record.id })
+          }
+        }
+        if (page.records.length < PREFIX_SCAN_PAGE) break
+      }
+      // 带 scope 的查询扫完自己那一库就定案；裸前缀有命中就「命中即止」，没命中留到下一库。
+      for (const entry of active) {
+        if ((results.get(entry.key)?.length ?? 0) > 0) pending.delete(entry.key)
+        else if (pending.get(entry.key)?.scope === scope) pending.delete(entry.key)
+      }
+      if (pending.size === 0) break
     }
-    return {}
+    return results
   }
 
   /**
@@ -2157,27 +2160,77 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       }
       const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
       const refs = sessionId === undefined ? new Map<string, CitationRefTarget>() : citationRefIndex(sessionId)
+
+      /** 第一轮结论：直接命中的坐标 / 待批量扫描的前缀 / 都查不到。 */
+      interface PendingToken {
+        readonly raw: string
+        readonly target?: CitationRefTarget
+        readonly prefixKey?: string
+      }
+      const pendingTokens: PendingToken[] = []
+      const queries: PrefixQuery[] = []
+      for (const token of tokens) {
+        if (token.kind === 'prefix') {
+          queries.push({ prefix: token.prefix, scope: undefined })
+          pendingTokens.push({ raw: token.raw, prefixKey: prefixKeyOf(undefined, token.prefix) })
+          continue
+        }
+        if (token.kind === 'id') {
+          // 完整 UUID：不知道在哪个库，按 user → project → shared 逐个 get（单次最多 16 条，代价可控）。
+          let found: CitationRefTarget | undefined
+          for (const scope of EXAMINE_SCOPES) {
+            const record = await (await deps.openStore(scope)).get(asMemoryId(token.raw))
+            if (record !== undefined) {
+              found = { scope, id: record.id }
+              break
+            }
+          }
+          pendingTokens.push(found === undefined ? { raw: token.raw } : { raw: token.raw, target: found })
+          continue
+        }
+        // 格式错误已在上面统一报掉，这里只剩 ref；显式收窄让类型系统也能确认。
+        if (token.kind === 'invalid') continue
+        // ref：先查会话映射（带宫位的 ref 只有映射能还原）；映射没有时 `scope/#8` 还能当前缀用。
+        const direct = refs.get(token.raw) ?? refs.get(token.raw.toLowerCase())
+        if (direct !== undefined) {
+          pendingTokens.push({ raw: token.raw, target: direct })
+          continue
+        }
+        const short = /^#?([0-9a-f]{8,})$/i.exec(token.raw.slice(token.scope.length + 1))
+        if (short === null) {
+          pendingTokens.push({ raw: token.raw })
+          continue
+        }
+        const prefix = (short[1] ?? '').toLowerCase()
+        queries.push({ prefix, scope: token.scope })
+        pendingTokens.push({ raw: token.raw, prefixKey: prefixKeyOf(token.scope, prefix) })
+      }
+      // 一次调用只扫一遍库（评审 X3）：所有前缀共享同一轮分页，匹配在内存里完成。
+      const matched = await scanPrefixMatches(queries)
+
       const targets: CitationRefTarget[] = []
       const seen = new Set<string>()
-      let ambiguous: { readonly raw: string; readonly ids: readonly MemoryId[] } | undefined
-      for (const token of tokens) {
-        const outcome = await resolveExamineToken(token, refs)
-        if (outcome.ambiguous !== undefined) {
-          ambiguous = { raw: token.raw, ids: outcome.ambiguous }
-          break
-        }
-        const target = outcome.target
-        if (target === undefined) continue
+      const pushTarget = (target: CitationRefTarget): void => {
         const key = `${target.scope}\u0000${String(target.id)}`
-        if (seen.has(key)) continue
+        if (seen.has(key)) return
         seen.add(key)
         targets.push(target)
       }
-      if (ambiguous !== undefined) {
-        throw new Error(message('tool.examineIdAmbiguous', {
-          prefix: ambiguous.raw,
-          ids: ambiguous.ids.map(id => String(id)).join(message('tool.separatorIdea')),
-        }))
+      // 按 token 顺序定案：歧义错误因此稳定落在最靠前的那条上。
+      for (const item of pendingTokens) {
+        if (item.prefixKey !== undefined) {
+          const candidates = matched.get(item.prefixKey) ?? []
+          if (candidates.length > 1) {
+            throw new Error(message('tool.examineIdAmbiguous', {
+              prefix: item.raw,
+              ids: candidates.map(candidate => String(candidate.id)).join(message('tool.separatorIdea')),
+            }))
+          }
+          const only = candidates[0]
+          if (only !== undefined) pushTarget(only)
+          continue
+        }
+        if (item.target !== undefined) pushTarget(item.target)
       }
       const records: MemoryRecord[] = []
       for (const target of targets) {

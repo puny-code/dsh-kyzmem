@@ -20,8 +20,9 @@ export type IngestModeConfig = 'off' | 'light' | 'eager'
 export type ReflectModeConfig = 'off' | 'suggest' | 'auto'
 
 /**
- * 首问 keyed 召回档位：off 关闭；light 会话首问注入 3 条（默认）；full 注入 5 条且整块预算抬到 640 起。
- * 档位只决定「默认条数 + 默认预算」——显式配置优先，整块字符预算（`queryRecallBudget`）是硬约束。
+ * 首问 keyed 召回档位：off 关闭；light 会话首问注入 3 条（默认，预算 640）；full 注入 5 条（预算下限 960）。
+ * 档位决定「默认条数 + 默认预算」；`queryRecallBudget` 显式值在 light 下原样生效，在 full 下低于 960 会被抬到 960
+ * （否则 full 的 5 条永远装不下，与 light 同效）。
  */
 export type QueryRecallMode = 'off' | 'light' | 'full'
 
@@ -87,7 +88,7 @@ export interface KyzmemConfig {
   assessReminder?: boolean
   /** 会话首问 keyed 召回档位；默认 light（注入 3 条）。off 完全关闭。 */
   queryRecall?: QueryRecallMode
-  /** 首问召回整块字符预算（标题 + 条目 + examine 提示 + 批次行）；默认 600。条数是上限，预算才是硬约束；600 是「zh 3 条 449 / en 3 条 558 / ru 3 条 578 字符」都能装下的最小实用值。 */
+  /** 首问召回整块字符预算（标题 + 条目 + examine 提示 + 批次行）；默认 640（三语都装得下 3 条）；full 档下限 960。条数是上限，预算才是硬约束。 */
   queryRecallBudget?: number
   /** 首问召回条数上限；缺省 light 3 / full 5。 */
   queryRecallTop?: number
@@ -223,10 +224,18 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
 const INGEST_MODES: ReadonlySet<string> = new Set(['off', 'light', 'eager'])
 const REFLECT_MODES: ReadonlySet<string> = new Set(['off', 'suggest', 'auto'])
 const QUERY_RECALL_MODES: ReadonlySet<string> = new Set(['off', 'light', 'full'])
-/** 首问召回整块字符预算缺省值：3 条 × 80 字（截断后 81）+ 标题 + examine 提示 + 批次行。 */
-const QUERY_RECALL_BUDGET_DEFAULT = 600
-/** full 档的预算下限：5 条 + 提示行要装得下，否则 full 与 light 等效。 */
-const QUERY_RECALL_FULL_BUDGET_FLOOR = 640
+/**
+ * 首问召回整块字符预算缺省值。实测（80 字正文截断后 81 + 标题 + examine 提示 + 批次行）：
+ * zh 3 条 = 409 / en 3 条 = 581 / ru 3 条 = 601，取 640 让三语都稳定放得下 3 条。
+ */
+const QUERY_RECALL_BUDGET_DEFAULT = 640
+/**
+ * full 档预算下限 = 960：5 条 × 81 + 标题 + examine 提示 + 批次行在三语下都装得下
+ * （实测 zh 5 条 662 / en 5 条 835 / ru 5 条 855）。
+ * full 是「多给」档，显式调小的预算会被抬到这个下限——这是有意为之（否则 full 的 top=5
+ * 永远兑现不了，等于与 light 同效），调整后的生效值可在 ResolvedKyzmemConfig 里读到。
+ */
+const QUERY_RECALL_FULL_BUDGET_FLOOR = 960
 
 /** Schemastery 校验面（cordis.yml 读取时校验）。 */
 export const Config: z<KyzmemConfig> = z.object({
@@ -390,8 +399,9 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
   }
   const dbDir = config.dbDir ?? join(homedir(), '.dsh', 'kyzmem')
   // 首问召回：档位同时决定默认条数（light 3 / full 5）与整块预算。
-  // full 是「多给」档：预算一并抬到 640 起（显式调小也抬），否则 full 在默认配置下与 light
-  // 等效——3 条 × 80 字塞不进 480，5 条更塞不进（风险报告 M3）。
+  // full 是「多给」档：预算有 960 的下限（见 QUERY_RECALL_FULL_BUDGET_FLOOR），显式调小也会被抬上来——
+  // 否则 top=5 永远兑现不了，full 与 light 等效（风险报告 M3 / 复审 N2）。抬升后的生效值
+  // 就是 ResolvedKyzmemConfig.queryRecallBudget，调用方无需再自己算。
   const queryRecallMode: QueryRecallMode = config.queryRecall ?? 'light'
   const queryRecallBudget = config.queryRecallBudget ?? QUERY_RECALL_BUDGET_DEFAULT
   const resolvedQueryRecallBudget = queryRecallMode === 'full'

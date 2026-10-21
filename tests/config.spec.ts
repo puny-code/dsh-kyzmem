@@ -22,10 +22,11 @@ describe('resolveConfig', () => {
     expect(resolved.injectItemBudgetDecay).toBe(0.9)
     expect(resolved.injectItemBudgetFloor).toBe(24)
     expect(resolved.assessReminder).toBe(true)
-    // 首问 keyed 召回（方案 §4 A）：默认 light / 600 字 / 3 条。
-    // 600 是「3 条 × 80 字 + 标题 + examine 提示 + 批次行」在 zh/en/ru 三语下都装得下的最小实用值。
+    // 首问 keyed 召回（方案 §4 A）：默认 light / 640 字 / 3 条。
+    // 640 让「3 条 × 80 字（截断后 81）+ 标题 + examine 提示 + 批次行」在三语下都装得下
+    // （实测本仓模板：zh 460 / en 569 / ru 589 字符；600 时 ru 差一点装不下第 3 条——复审 N1）。
     expect(resolved.queryRecall).toBe('light')
-    expect(resolved.queryRecallBudget).toBe(600)
+    expect(resolved.queryRecallBudget).toBe(640)
     expect(resolved.queryRecallTop).toBe(3)
   })
 
@@ -114,15 +115,18 @@ describe('resolveConfig', () => {
   it('首问召回档位：full 同时抬条数与预算，避免 full 与 light 等效', () => {
     expect(resolveConfig({ queryRecall: 'off' }).queryRecall).toBe('off')
     expect(resolveConfig({ queryRecall: 'light' }).queryRecallTop).toBe(3)
-    expect(resolveConfig({ queryRecall: 'light' }).queryRecallBudget).toBe(600)
-    // full：5 条 + 预算至少 640。
+    expect(resolveConfig({ queryRecall: 'light' }).queryRecallBudget).toBe(640)
+    // full：5 条 + 预算下限 960（实测本仓模板 5 条 zh 706 / en 817 / ru 837，三语都放得下）。
     expect(resolveConfig({ queryRecall: 'full' }).queryRecallTop).toBe(5)
-    expect(resolveConfig({ queryRecall: 'full' }).queryRecallBudget).toBe(640)
-    // 显式值：条数优先；预算在 full 下有个「至少 640」的下限，light 下原样透传。
+    expect(resolveConfig({ queryRecall: 'full' }).queryRecallBudget).toBe(960)
+    // 显式值：条数优先；预算在 full 下被抬到「至少 960」——这是**有意**的：低于 960 的 full
+    // 兑现不了 5 条，与 light 同效（复审 N2）。生效值就是 ResolvedKyzmemConfig.queryRecallBudget，
+    // 调用方无需自己再算；light 下显式值原样透传。
     expect(resolveConfig({ queryRecall: 'full', queryRecallTop: 2 }).queryRecallTop).toBe(2)
-    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 500 }).queryRecallBudget).toBe(640)
-    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 800 }).queryRecallBudget).toBe(800)
-    expect(resolveConfig({ queryRecallTop: 7, queryRecallBudget: 640 }).queryRecallBudget).toBe(640)
+    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 500 }).queryRecallBudget).toBe(960)
+    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 800 }).queryRecallBudget).toBe(960)
+    expect(resolveConfig({ queryRecall: 'full', queryRecallBudget: 1000 }).queryRecallBudget).toBe(1000)
+    expect(resolveConfig({ queryRecallTop: 7, queryRecallBudget: 1000 }).queryRecallBudget).toBe(1000)
     expect(resolveConfig({ queryRecallBudget: 300 }).queryRecallBudget).toBe(300)
   })
 
