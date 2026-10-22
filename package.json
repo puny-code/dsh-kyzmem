@@ -1,12 +1,8 @@
 {
   "name": "dsh-kyzmem",
+  "version": "0.14.0",
   "description": "深度求索 Harness 插件：跨会话长期记忆（学习核心）。基于 @kenz1117/dsh-engram 的个人修改版，仅本人自用。",
-  "version": "0.13.1",
-  "icon": "icon.svg",
-  "logo": "icon-256.svg",
-  "publishConfig": {
-    "access": "public"
-  },
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/puny-code/dsh-kyzmem.git"
@@ -33,26 +29,11 @@
     "icon.svg",
     "icon-256.svg"
   ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-locale"
-      ],
-      "platform": "web"
-    }
+  "icon": "icon.svg",
+  "logo": "icon-256.svg",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
   },
-  "scripts": {
-    "prepare": "node scripts/link-peers.mjs && node scripts/ensure-build.mjs",
-    "bundle": "tsdown",
-    "watch": "tsdown --watch",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "backfill": "node scripts/backfill-embeddings.mjs"
-  },
-  "license": "MIT",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
@@ -65,8 +46,8 @@
     "embeddings",
     "learning-core"
   ],
-  "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
@@ -74,8 +55,7 @@
     "@deepseek-ai/dsh-client-ui-layout": "*",
     "@deepseek-ai/dsh-llm": "*",
     "@deepseek-ai/dsh-tools": "*",
-    "@deepseek-ai/schemastery": "*",
-    "@huggingface/transformers": "^4.2.0"
+    "@deepseek-ai/schemastery": "*"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
@@ -95,9 +75,6 @@
     },
     "@deepseek-ai/schemastery": {
       "optional": true
-    },
-    "@huggingface/transformers": {
-      "optional": true
     }
   },
   "devDependencies": {
@@ -113,6 +90,28 @@
     "tsdown": "^0.23.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11"
+  },
+  "scripts": {
+    "prepare": "node scripts/link-peers.mjs && node scripts/ensure-build.mjs",
+    "bundle": "tsdown",
+    "watch": "tsdown --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "backfill": "node scripts/backfill-embeddings.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
   },
   "packageManager": "pnpm@10.15.0",
   "homepage": "https://github.com/puny-code/dsh-kyzmem",

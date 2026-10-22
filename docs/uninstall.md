@@ -1,7 +1,7 @@
 # 卸载卡死与「插件损坏」的成因
 
 如果你在面板里点卸载，界面一直显示「卸载中」，最后被看门狗杀掉，再打开时插件已经是一副
-残缺状态——这份文档解释它为什么发生、怎么修，以及 0.13.1 起改了什么。
+残缺状态——这份文档解释它为什么发生、怎么修，以及 0.14.0 起怎么把它绕开。
 
 ## 症状
 
@@ -59,24 +59,26 @@ dsh plugin --profile desktop add <插件 tgz 路径或 https 直链>
 实在清不干净时，删掉整个 `node_modules` 后重新 `dsh plugin add` 也可，但会重装该 profile 的
 所有插件。
 
-## 0.13.1 起的变化
+## 0.14.0 起：模型跑在子进程里
 
-- `@huggingface/transformers` 从 `dependencies` 改为**可选 peerDependencies**。默认安装的
-  插件**不带** onnxruntime，宿主进程不会再加载那个 DLL，卸载/升级不再被文件锁卡住。
-- 本地语义向量因此变成需要手动开启的能力：想在 profile 里启用时，退出 DSH 后在该 profile
-  目录执行 `pnpm add @huggingface/transformers`，再启动。
-- `createLocalEmbedder()` 先做一次只解析、不加载的探测；模块不在就直接返回 `undefined`，
-  检索自动降级为关键词，不会报错，也不会拖慢启动。
-- **启用了可选嵌入之后，卸载/升级前同样必须先完全退出 DSH**——文件锁是 Windows 的行为，
-  插件这边只能用「默认不加载」来规避。
+- `@huggingface/transformers` 回到 `dependencies`——默认安装就有语义检索，效果不打折。
+- 但模型只在 `scripts/embedder-worker.mjs` 子进程里加载，宿主进程**从不** `dlopen`
+  `onnxruntime.dll`，所以锁只存在于子进程。
+- 卸载/热重载时插件 dispose 会先结束子进程（cordis 会等待），DLL 句柄随进程退出释放，
+  pnpm 随后能正常删除文件——不再需要「先退出 DSH 才能卸载」。
+- 宿主被强杀时 stdio 管道断开，子进程自行退出，不会留下持锁的孤儿进程。
+- 代价：多一个常驻子进程（模型常驻内存），首次使用仍要下载模型权重。
+
+如果仍然遇到删不掉的 `onnxruntime.dll`，那说明有别的进程加载过它（例如旧版本残留的
+DSH 实例）。先确认任务管理器里没有旧的 `DeepSeek Harness.exe`，再按上面的修复步骤处理。
 
 ## 安装命令
 
-默认安装不需要 native 构建许可参数：
+`onnxruntime-node` 带构建脚本，pnpm 11 默认拦截，安装时仍要显式放行：
 
 ```bash
-dsh plugin --profile desktop add <tgz 直链>
+dsh plugin --profile desktop add <tgz 直链> --allow-build=onnxruntime-node --allow-build=protobufjs
 ```
 
-（旧文档里的 `--allow-build=onnxruntime-node --allow-build=protobufjs` 现在不再必要；
-只有在你自己装可选嵌入、需要现场编译时才会用到。）
+不带参数时文件其实也装上了，但 pnpm 以非零码退出，插件管理器会提示安装失败，之后容易
+出现「以为没装上又装一遍」的混乱。

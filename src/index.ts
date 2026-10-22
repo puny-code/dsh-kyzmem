@@ -1013,6 +1013,12 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
       return undefined
     })
   void embedder
+  // 卸载/热重载时必须先结束嵌入子进程：onnxruntime.dll 只被它映射，子进程退出后
+  // pnpm 才能删掉文件。cordis 的 disposer 会 await 这里返回的 promise。
+  ctx.effect(() => async () => {
+    const current = await embedder.catch(() => undefined)
+    await current?.close()
+  }, 'dsh-kyzmem: stop embedder worker')
 
   // 辅助请求写 kyzmem 自己的操作日志（下游插件禁止向会话日志写未知事件类型）。
   // 只记归因要用的四个标量：整段 userText 曾把 op_log 撑到平均 15.1KB/条、峰值 142KB，
