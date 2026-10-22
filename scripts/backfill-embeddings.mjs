@@ -6,13 +6,23 @@
  *
  * 用法：node scripts/backfill-embeddings.mjs [dbDir]
  * 默认 dbDir = ~/.dsh/kyzmem；只处理 active 且 embedding IS NULL 的条目。
+ *
+ * 前置条件：本机得先装可选依赖——插件默认不带它（native 的 onnxruntime.dll 会被宿主进程
+ * 锁住，导致卸载卡死，见 docs/uninstall.md）。在插件所在 profile 里：
+ *   pnpm add @huggingface/transformers
  */
 
 import { DatabaseSync } from 'node:sqlite'
 import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { pipeline, env } from '@huggingface/transformers'
+
+const transformers = await import('@huggingface/transformers').catch(() => undefined)
+if (transformers === undefined) {
+  console.error('[backfill] 缺少可选依赖 @huggingface/transformers：请在插件所在 profile 里 `pnpm add @huggingface/transformers` 后重试')
+  process.exit(1)
+}
+const { pipeline, env } = transformers
 
 const dbDir = process.argv[2] ?? join(homedir(), '.dsh', 'kyzmem')
 const modelCacheDir = join(dbDir, 'models')
