@@ -14,7 +14,7 @@
   border-radius: var(--radius-card);
   border: 1px solid var(--dsw-alias-border-l2);
   background:
-    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--brand-1) 5%, transparent), transparent 65%),
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent), transparent 65%),
     color-mix(in srgb, var(--dsw-alias-bg-base) 70%, transparent);
   color: var(--dsw-alias-label-tertiary);
 }
@@ -42,17 +42,17 @@
 .side { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; padding: var(--space-4); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); border-radius: var(--radius-card); }
 .sideTitle { margin: 0; font-size: var(--fs-micro); font-weight: 600; color: var(--dsw-alias-label-tertiary); letter-spacing: 0.06em; text-transform: uppercase; }
 
-.legend { display: flex; flex-direction: column; gap: 6px; padding-bottom: var(--space-3); border-bottom: 1px solid var(--dsw-alias-border-soft); }
+.legend { display: flex; flex-direction: column; gap: 6px; padding-bottom: var(--space-3); border-bottom: 1px solid var(--hairline); }
 .legendItem { display: flex; align-items: center; gap: 8px; font-size: var(--fs-body); color: var(--dsw-alias-label-secondary); }
 .legendDot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 
 .stats { display: flex; flex-direction: column; gap: var(--space-3); }
-.stat { display: flex; flex-direction: column; gap: 2px; padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-control); }
+.stat { display: flex; flex-direction: column; gap: 2px; padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-base); border: 1px solid var(--hairline); border-radius: var(--radius-control); }
 .statLabel { font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); letter-spacing: 0.04em; text-transform: uppercase; }
 .statValue { font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; line-height: 1.2; }
-.statAccent { color: var(--brand-2); }
+.statAccent { color: var(--dsw-alias-brand-primary); }
 .statFaint { font-size: var(--fs-body); font-weight: 500; opacity: 0.7; }
 
 /* 工具条 segmented control 容器：与其他 tab 同款 toolbarCard 表面。 */
-.toolbar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-soft); border-radius: var(--radius-card); margin-bottom: var(--space-3); }
+.toolbar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-2) var(--space-3); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--hairline); border-radius: var(--radius-card); margin-bottom: var(--space-3); }
 .meta { margin-left: auto; font-size: var(--fs-micro); color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }

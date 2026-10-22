@@ -107,11 +107,11 @@ export function SpiralMap({ t, records, windowMs }: SpiralMapProps): ReactElemen
     <div className={styles.wrap}>
       <svg className={styles.canvas} viewBox={`0 0 ${String(VB_W)} ${String(VB_H)}`} role="img" aria-label={t('spiralAriaLabel')}>
         <defs>
-          {/* 中心品牌渐变 ring：amber→rose，与面板 --brand-grad-line 同源。 */}
+          {/* 中心渐变 ring：只取主题 accent 单色，靠透明度收尾——跟随皮肤，不写死色相。 */}
           <radialGradient id="spiralCenterGrad" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#F59E0B" />
-            <stop offset="55%" stopColor="#FB923C" />
-            <stop offset="100%" stopColor="#F43F5E" />
+            <stop offset="0%" style={{ stopColor: "var(--dsw-alias-brand-primary)", stopOpacity: 0.85 }} />
+            <stop offset="55%" style={{ stopColor: "var(--dsw-alias-brand-primary)", stopOpacity: 0.4 }} />
+            <stop offset="100%" style={{ stopColor: "var(--dsw-alias-brand-primary)", stopOpacity: 0.04 }} />
           </radialGradient>
         </defs>
         {/* 外圈装饰：最远记忆所在的圆，提示时间跨度极限（虚线 + 极淡）。 */}

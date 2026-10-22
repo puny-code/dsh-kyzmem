@@ -808,7 +808,16 @@ function PageHeader({ title, subtitle, actions }: {
   return (
     <header className={styles.pageHeader}>
       <div className={styles.pageHeaderMain}>
-        <h2 className={styles.pageTitle}>{title}</h2>
+        <h2 className={styles.pageTitle}>
+          {/* 枢星标记：与侧栏图标同母题，只作页面身份，不参与信息层级 */}
+          <span className={styles.pageTitleRow}>
+            <svg className={styles.pageMark} viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4.6 13.7 10.3 19.4 12 13.7 13.7 12 19.4 10.3 13.7 4.6 12 10.3 10.3Z"
+                fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+            </svg>
+            {title}
+          </span>
+        </h2>
         {subtitle !== undefined && <p className={styles.pageSubtitle}>{subtitle}</p>}
       </div>
       {actions !== undefined && <div className={styles.pageHeaderActions}>{actions}</div>}
