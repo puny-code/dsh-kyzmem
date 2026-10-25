@@ -20,6 +20,7 @@ import type { HistoryBackfillRules, HistoryEstimate, HistoryRunProgress, History
 import type { ProjectPalaceKind } from './project/registry.ts'
 import type { ResolvedHistoryRules } from './config.ts'
 import { writeMirror } from './mirror/markdown.ts'
+import { describeEffective, readOverlay, saveOverlay } from './settings-overlay.ts'
 import type { KyzmemLanguage } from './i18n/language.ts'
 import { messageIn } from './i18n/messages.ts'
 import { createBackup, restoreBackup, BACKUP_SCHEMA_VERSION } from './backup/tar.ts'
@@ -176,6 +177,8 @@ class UnknownProjectError extends Error {
 /** 管理面板的路由依赖。 */
 export interface RouteDeps {
   readonly openStore: (scope: KyzmemScope) => Promise<KyzmemStore>
+  /** 宿主原始配置：设置卡片校验与生效值计算的基线（覆盖层在它之上合并）。 */
+  readonly hostConfig: import('./config.ts').KyzmemConfig
   /**
    * 关闭并清空全部分库缓存。restore-backup 成功后必须调用：restore 用 rename 换掉了
    * .db 的 inode，缓存连接仍指向旧文件，继续写入会落进 .before-restore-* 且重启后丢失
@@ -994,6 +997,35 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
           if (req.method === 'GET' && route === 'version') {
             // 版本握手（审计 F8）：面板比对 client/server 版本，偏斜（客户端已热更、后端进程旧）时挂横幅提示重启。
             json(res, 200, { pluginVersion: deps.pluginVersion })
+            return
+          }
+          if (req.method === 'GET' && route === 'settings') {
+            // 设置卡片读取：生效值 + 覆盖层标记。覆盖层损坏时如实报错，不伪装成默认值。
+            try {
+              const overlay = readOverlay(deps.dbDir)
+              const { values, overridden } = describeEffective(deps.hostConfig, overlay)
+              json(res, 200, { values, overridden, restartRequired: overridden.length > 0 })
+            } catch (error) {
+              json(res, 500, { error: error instanceof Error ? error.message : String(error) })
+            }
+            return
+          }
+          if (req.method === 'POST' && route === 'settings') {
+            if (!guardWrite(req, res)) return
+            const body = await readJsonBody(req)
+            const patch = body !== null && typeof body === 'object' && !Array.isArray(body) ? body : null
+            if (patch === null) {
+              json(res, 400, { error: 'settings patch must be a JSON object' })
+              return
+            }
+            try {
+              saveOverlay(deps.dbDir, patch, deps.hostConfig)
+              const overlay = readOverlay(deps.dbDir)
+              const { values, overridden } = describeEffective(deps.hostConfig, overlay)
+              json(res, 200, { values, overridden, restartRequired: true })
+            } catch (error) {
+              json(res, 400, { error: error instanceof Error ? error.message : String(error) })
+            }
             return
           }
           if (req.method === 'GET' && route === 'models') {

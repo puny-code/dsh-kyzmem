@@ -62,6 +62,7 @@ export const zh = {
 
   // ---- Диагностика (console) ----
   'core.warnReplayPendingFailed': '[dsh-kyzmem] 待补做摄取重放失败（保留 pending，不影响对话）：',
+  'core.warnSettingsOverlayFailed': '[dsh-kyzmem] 设置覆盖层 settings.json 无法读取，已忽略并沿用宿主配置：',
   'ingest.replayKeyFailed': '[dsh-kyzmem] 重放单条 pending 失败（保留，下个会话重试）：',
   'ingest.replayAbandoned': '[dsh-kyzmem] 陈旧 pending 放弃重放（会话超 180 天仍失败，出队）：',
   'ingest.deadLetter': '[dsh-kyzmem] pending 转死信出队（尝试次数达上限或值不可解析，已记 ingest-dead-letter）：',
@@ -137,6 +138,7 @@ export const en = {
 
   // ---- Diagnostics (console) ----
   'core.warnReplayPendingFailed': '[dsh-kyzmem] Replaying a pending ingest failed (pending kept, conversation unaffected):',
+  'core.warnSettingsOverlayFailed': '[dsh-kyzmem] Settings overlay settings.json could not be read; ignored, using host config:',
   'ingest.replayKeyFailed': '[dsh-kyzmem] Replaying one pending key failed (kept for next session):',
   'ingest.replayAbandoned': '[dsh-kyzmem] Stale pending abandoned (session older than 180 days, still failing — dequeued):',
   'ingest.deadLetter': '[dsh-kyzmem] Pending moved to dead letter (retry limit reached or value unparseable; logged as ingest-dead-letter):',
@@ -212,6 +214,7 @@ export const ru = {
 
   // ---- Диагностика (console) ----
   'core.warnReplayPendingFailed': '[dsh-kyzmem] Не удалось повторить отложенное извлечение (pending сохранён, диалог не затронут):',
+  'core.warnSettingsOverlayFailed': '[dsh-kyzmem] Файл настроек settings.json не читается; он проигнорирован, используется конфиг хоста:',
   'ingest.replayKeyFailed': '[dsh-kyzmem] Не удалось повторить один pending (сохранён, повтор в следующей сессии):',
   'ingest.replayAbandoned': '[dsh-kyzmem] Устаревший pending снят с очереди (сессия старше 180 дней, всё ещё падает):',
   'ingest.deadLetter': '[dsh-kyzmem] Pending переведён в dead letter (исчерпан лимит попыток или значение не разбирается; записано ingest-dead-letter):',

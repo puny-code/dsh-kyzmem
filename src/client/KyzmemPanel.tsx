@@ -2556,6 +2556,160 @@ function skipLabel(t: T, reason: string): string {
   return key === undefined ? reason : t(key)
 }
 
+/** GET /api/kyzmem/settings 的返回：生效值（已校验解析）+ 覆盖标记。 */
+interface SettingsView {
+  readonly values: Record<string, unknown>
+  readonly overridden: readonly string[]
+  readonly restartRequired: boolean
+}
+
+/**
+ * 插件设置卡片（运维 tab 顶部）：不用手改 settings / cordis 配置也能调参。
+ * 草稿只记用户改过的字段；保存时仅提交变化的键，值与宿主默认相同则发 null（清除覆盖）。
+ * 写入的是插件自有覆盖层，插件需重启才生效，卡片会明确提示。
+ */
+function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.ReactElement {
+  const [view, setView] = useState<SettingsView | null>(null)
+  const [draft, setDraft] = useState<Record<string, unknown>>({})
+  const [busy, setBusy] = useState(false)
+  const [restartNotice, setRestartNotice] = useState(false)
+
+  const load = useCallback((): void => {
+    api<SettingsView>('settings')
+      .then((data) => { setView(data); setDraft({}) })
+      .catch((error: Error) => { toast.push('error', error.message) })
+  }, [toast])
+  useEffect(() => { load() }, [load])
+
+  if (view === null) return <div className={styles.backfillMuted}>…</div>
+  const effective = view.values
+  const current = (key: string): unknown => (key in draft ? draft[key] : effective[key])
+  const isOverridden = (key: string): boolean => view.overridden.includes(key)
+  const dirty = Object.keys(draft).length > 0
+
+  const setField = (key: string, value: unknown): void => {
+    setDraft((prev) => ({ ...prev, [key]: value }))
+    setRestartNotice(false)
+  }
+
+  const save = (): void => {
+    setBusy(true)
+    // 草稿里与当前生效值相同的字段不发送；要求回到默认的字段以 null 清除覆盖。
+    const patch: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(draft)) {
+      patch[key] = value === effective[key] ? null : value
+    }
+    api<SettingsView>('settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    })
+      .then((data) => {
+        setView(data)
+        setDraft({})
+        setRestartNotice(data.restartRequired)
+        toast.push('success', t('settingsSaved'))
+      })
+      .catch((error: Error) => { toast.push('error', error.message) })
+      .finally(() => { setBusy(false) })
+  }
+
+  const resetAll = (): void => {
+    setBusy(true)
+    const patch: Record<string, null> = {}
+    for (const key of view.overridden) patch[key] = null
+    api<SettingsView>('settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    })
+      .then((data) => { setView(data); setDraft({}); setRestartNotice(data.restartRequired) })
+      .catch((error: Error) => { toast.push('error', error.message) })
+      .finally(() => { setBusy(false) })
+  }
+
+  /** 单个字段的标签 + 「已覆盖 / 默认」标记。 */
+  const fieldLabel = (key: string, text: string): React.ReactNode => (
+    <span>
+      {text}
+      <span className={styles.backfillMuted}>{' · '}{isOverridden(key) ? t('settingsOverridden') : t('settingsDefault')}</span>
+    </span>
+  )
+
+  const selectSetting = (key: string, text: string, options: readonly [string, string][]): React.ReactElement => (
+    <label className={styles.backfillRule}>
+      {fieldLabel(key, text)}
+      <SelectField selectClassName={styles.input} value={String(current(key))}
+        onChange={event => { setField(key, event.target.value) }}>
+        {options.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+      </SelectField>
+    </label>
+  )
+
+  const numberSetting = (key: string, text: string, min: number, max: number): React.ReactElement => (
+    <label className={styles.backfillRule}>
+      {fieldLabel(key, text)}
+      <input className={styles.input} type="number" min={min} max={max} value={String(current(key))}
+        onChange={event => { setField(key, Number(event.target.value)) }} />
+    </label>
+  )
+
+  const toggleSetting = (key: string, text: string): React.ReactElement => (
+    <label className={styles.backfillToggle}>
+      <input type="checkbox" checked={current(key) === true}
+        onChange={event => { setField(key, event.target.checked) }} />
+      <span>{text}</span>
+      <span className={styles.backfillMuted}>{isOverridden(key) ? t('settingsOverridden') : t('settingsDefault')}</span>
+    </label>
+  )
+
+  return (
+    <div className={styles.backfill}>
+      <p className={styles.backfillIntro}>{t('settingsIntro')}</p>
+
+      <div className={styles.sectionHead}>
+        <h5 className={styles.sectionTitle}>{t('settingsGroupIngest')}</h5>
+      </div>
+      <div className={styles.backfillRules}>
+        {selectSetting('ingest', t('settingsGroupIngest'), [
+          ['off', t('settingsIngestOff')], ['light', t('settingsIngestLight')], ['eager', t('settingsIngestEager')],
+        ])}
+        {numberSetting('ingestDeadLetterAttempts', t('settingsDeadLetter'), 1, 20)}
+      </div>
+
+      <div className={styles.sectionHead}>
+        <h5 className={styles.sectionTitle}>{t('settingsGroupRecall')}</h5>
+      </div>
+      <div className={styles.backfillRules}>
+        {selectSetting('queryRecall', t('settingsQueryRecall'), [
+          ['off', t('settingsQueryRecallOff')], ['light', t('settingsQueryRecallLight')], ['full', t('settingsQueryRecallFull')],
+        ])}
+        {numberSetting('recallTotal', t('settingsRecallTotal'), 200, 20000)}
+      </div>
+
+      <div className={styles.sectionHead}>
+        <h5 className={styles.sectionTitle}>{t('settingsGroupMaintenance')}</h5>
+      </div>
+      <div className={styles.backfillToggles}>
+        {toggleSetting('maintenanceEnabled', t('settingsMaintenanceEnabled'))}
+      </div>
+      <div className={styles.backfillRules}>
+        {numberSetting('maintenanceBudgetLlmCalls', t('settingsMaintenanceLlmCalls'), 0, 5)}
+      </div>
+
+      <div className={styles.backfillActions}>
+        <button type="button" className={`${styles.button} ${styles.primary}`} disabled={!dirty || busy} onClick={save}>
+          {t('settingsSave')}
+        </button>
+        <button type="button" className={styles.button} disabled={busy || view.overridden.length === 0} onClick={resetAll}>
+          {t('settingsReset')}
+        </button>
+      </div>
+      {restartNotice && <p className={styles.backfillMuted}>{t('settingsRestartNotice')}</p>}
+    </div>
+  )
+}
+
 /**
  * 历史回填：导入规则由用户选择（时间窗 / 轮数上限 / 三类会话过滤），
  * 先估算（零成本）再执行；运行中每 1.5 秒轮询进度，可暂停续做。
@@ -4077,6 +4231,14 @@ export function KyzmemSection({ t: hostT, workspaces, sessions }: KyzmemSectionP
         <div className={styles.tabPanel}>
           {/* ops tab 是后台管线的容器，不是独立页面：去掉 PageHeader，让每个 sectionHead
               作为唯一标题层，与 library/corridor 等"单页面"tab 的视觉语言对齐。 */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h4 className={styles.sectionTitle}>{t('settingsTitle')}</h4>
+            </div>
+            <div className={styles.panelCard}>
+              <SettingsCard t={t} toast={toast} />
+            </div>
+          </section>
           <OpsPanel t={t} scope={scope} project={projectSelector ?? ''} reloadTick={reloadTick} toast={toast} />
           <section className={styles.section}>
             <div className={styles.sectionHead}>

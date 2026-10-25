@@ -7,6 +7,7 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
@@ -26,6 +27,7 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 import { resolveConfig } from './config.ts'
 import type { KyzmemConfig, ResolvedKyzmemConfig } from './config.ts'
+import { mergeWithOverlay, readOverlay } from './settings-overlay.ts'
 import type { KyzmemLanguage } from './i18n/language.ts'
 import { message, messageIn, setMessageLanguage } from './i18n/messages.ts'
 import { setExtraRedactWords } from './i18n/patterns.ts'
@@ -876,7 +878,17 @@ function makeSessionResolver(
  * @param ctx - host 上下文。
  * @param config - cordis.yml 传入的可选配置；非法值在加载时 loud 失败。
  */
-export function apply(ctx: Context, config: KyzmemConfig = {}): void {
+export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
+  // 设置卡片写入的覆盖层（<dbDir>/settings.json）优先于宿主 config。覆盖层损坏时降级
+  // 为宿主 config 并告警，不因为一个坏文件让整个插件加载失败。
+  const hostDbDir = hostConfig.dbDir ?? join(homedir(), '.dsh', 'kyzmem')
+  let overlay: Partial<KyzmemConfig> = {}
+  try {
+    overlay = readOverlay(hostDbDir)
+  } catch (error) {
+    console.warn(message('core.warnSettingsOverlayFailed'), error)
+  }
+  const config = mergeWithOverlay(hostConfig, overlay)
   const resolved = resolveConfig(config)
   // Язык служебных сообщений — один на процесс. Помощник message() зовут десятки
   // функций, и протаскивать язык в каждую было бы куда грубее, чем задать его здесь
@@ -1292,6 +1304,7 @@ export function apply(ctx: Context, config: KyzmemConfig = {}): void {
       exportDir: `${resolved.dbDir}/exports`,
       mirrorDir: `${resolved.dbDir}/palaces`,
       dbDir: resolved.dbDir,
+      hostConfig,
       pluginVersion: VERSION,
       language: resolved.language,
       embedder,

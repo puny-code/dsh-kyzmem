@@ -221,7 +221,7 @@ export interface ResolvedKyzmemConfig {
 }
 
 /** 合法配置键集合（未知键 loud 失败）。 */
-const CONFIG_KEYS: ReadonlySet<string> = new Set([
+export const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'legacyMigration', 'dbDir', 'injectProfile', 'profileTopN', 'modelCacheDir', 'hfEndpoint',
   'ingest', 'reflect', 'provider', 'model', 'decayAfterDays',
   'ttlFactDays', 'ttlEpisodeDays', 'ttlDecisionDays', 'ttlPreferenceDays', 'ttlSkillDays',
