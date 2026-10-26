@@ -308,9 +308,10 @@ export async function maybeRunIncrementalBackfill(
   const today = new Date(now).toISOString().slice(0, 10)
   const recentRuns = await store.recentAudit(BACKFILL_RUN_OP, 10)
   // 暂停门优先于 today 门：熔断后需要人工跑通一次，操作员看到的应该是 paused 而不是 today。
+  // 同一次熔断收尾 backfill-run 与 backfill-pause 落在同一毫秒（at 相等），必须用 >=。
   const [lastPause] = await store.recentAudit(BACKFILL_PAUSE_OP, 1)
   const [lastRun] = recentRuns.slice(0, 1)
-  if (lastPause !== undefined && (lastRun === undefined || lastPause.at > lastRun.at)) {
+  if (lastPause !== undefined && (lastRun === undefined || lastPause.at >= lastRun.at)) {
     return { outcome: 'skipped-paused' }
   }
   if (recentRuns.some(row => auditDate(row) === today)) return { outcome: 'skipped-today' }
