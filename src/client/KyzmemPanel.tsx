@@ -2556,11 +2556,15 @@ function skipLabel(t: T, reason: string): string {
   return key === undefined ? reason : t(key)
 }
 
-/** GET /api/kyzmem/settings 的返回：生效值（已校验解析）+ 覆盖标记。 */
+/** GET /api/kyzmem/settings 的返回：生效值（已校验解析）+ 全量快照 + 每个键的来源。 */
 interface SettingsView {
   readonly values: Record<string, unknown>
+  readonly snapshot: Record<string, string | number | boolean>
+  readonly sources: Record<string, 'host' | 'overlay' | 'default'>
   readonly overridden: readonly string[]
   readonly restartRequired: boolean
+  readonly settingsPath: string
+  readonly hasOverlay: boolean
 }
 
 /**
@@ -2584,7 +2588,6 @@ function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.Rea
   if (view === null) return <div className={styles.backfillMuted}>…</div>
   const effective = view.values
   const current = (key: string): unknown => (key in draft ? draft[key] : effective[key])
-  const isOverridden = (key: string): boolean => view.overridden.includes(key)
   const dirty = Object.keys(draft).length > 0
 
   const setField = (key: string, value: unknown): void => {
@@ -2628,11 +2631,19 @@ function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.Rea
       .finally(() => { setBusy(false) })
   }
 
-  /** 单个字段的标签 + 「已覆盖 / 默认」标记。 */
+  /** 该键当前值的来源：设置覆盖 / 宿主配置文件 / 默认值。 */
+  const sourceLabel = (key: string): string => {
+    const source = view.sources[key]
+    return source === 'overlay' ? t('settingsSourceOverlay')
+      : source === 'host' ? t('settingsSourceHost')
+        : t('settingsSourceDefault')
+  }
+
+  /** 单个字段的标签 + 来源标记。 */
   const fieldLabel = (key: string, text: string): React.ReactNode => (
     <span>
       {text}
-      <span className={styles.backfillMuted}>{' · '}{isOverridden(key) ? t('settingsOverridden') : t('settingsDefault')}</span>
+      <span className={styles.backfillMuted}>{' · '}{sourceLabel(key)}</span>
     </span>
   )
 
@@ -2659,7 +2670,7 @@ function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.Rea
       <input type="checkbox" checked={current(key) === true}
         onChange={event => { setField(key, event.target.checked) }} />
       <span>{text}</span>
-      <span className={styles.backfillMuted}>{isOverridden(key) ? t('settingsOverridden') : t('settingsDefault')}</span>
+      <span className={styles.backfillMuted}>{sourceLabel(key)}</span>
     </label>
   )
 
@@ -2706,6 +2717,23 @@ function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.Rea
         </button>
       </div>
       {restartNotice && <p className={styles.backfillMuted}>{t('settingsRestartNotice')}</p>}
+
+      {/* 只读快照：把当前生效的每一项摊开，便于了解现状（形式上的默认值也如实标出来）。 */}
+      <div className={styles.sectionHead}>
+        <h5 className={styles.sectionTitle}>{t('settingsSnapshotTitle')}</h5>
+        <span className={styles.backfillMuted}>
+          {view.hasOverlay ? `${view.settingsPath}` : t('settingsNoOverlay')}
+        </span>
+      </div>
+      <div className={styles.settingsSnapshot}>
+        {Object.entries(view.snapshot).map(([key, value]) => (
+          <div key={key} className={styles.settingsRow}>
+            <span className={styles.settingsRowKey} title={key}>{key}</span>
+            <span className={styles.settingsRowValue}>{String(value)}</span>
+            <span className={styles.settingsRowSource}>{sourceLabel(key)}</span>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

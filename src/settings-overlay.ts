@@ -93,14 +93,52 @@ export function editableValues(effective: ResolvedKyzmemConfig): Record<string, 
 }
 
 /**
+ * 只读快照：把解析后的标量字段摊平成一个可以直接渲染的表。嵌套对象（maintenance、
+ * ttlDaysByKind 等）由表单或各自面板负责，这里跳过，避免卡片里出现 `[object Object]`。
+ */
+export function flattenResolved(effective: ResolvedKyzmemConfig): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {}
+  for (const [key, value] of Object.entries(effective as unknown as Record<string, unknown>)) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') out[key] = value
+  }
+  // maintenance 是卡片表单直接管的字段，单独摊平，让快照和表单看到同一组值。
+  out['maintenanceEnabled'] = effective.maintenance.enabled
+  out['maintenanceBudgetLlmCalls'] = effective.maintenance.budgetLlmCalls
+  out['maintenanceBudgetMs'] = effective.maintenance.budgetMs
+  return out
+}
+
+/** 每个配置键的来源：`overlay` = 设置卡片覆盖，`host` = 宿主配置文件，其余为默认值。 */
+export function sourcesFor(hostConfig: KyzmemConfig, overlay: Partial<KyzmemConfig>): Record<string, 'host' | 'overlay' | 'default'> {
+  const out: Record<string, 'host' | 'overlay' | 'default'> = {}
+  for (const key of Object.keys(hostConfig)) {
+    if (key !== 'dbDir' && hostConfig[key as keyof KyzmemConfig] !== undefined) out[key] = 'host'
+  }
+  for (const key of Object.keys(overlay)) out[key] = 'overlay'
+  return out
+}
+
+/**
  * 当前生效配置 + 每个键是否来自覆盖层。供卡片展示「已覆盖」标记与保存后的生效值。
  */
 export function describeEffective(
   hostConfig: KyzmemConfig,
   overlay: Partial<KyzmemConfig>,
-): { effective: ResolvedKyzmemConfig; values: Record<string, unknown>; overridden: string[] } {
+): {
+  effective: ResolvedKyzmemConfig
+  values: Record<string, unknown>
+  snapshot: Record<string, string | number | boolean>
+  sources: Record<string, 'host' | 'overlay' | 'default'>
+  overridden: string[]
+} {
   const merged = mergeWithOverlay(hostConfig, overlay)
   const overridden = Object.keys(overlay).filter((key) => key !== 'dbDir')
   const effective = resolveConfig(merged)
-  return { effective, values: editableValues(effective), overridden }
+  return {
+    effective,
+    values: editableValues(effective),
+    snapshot: flattenResolved(effective),
+    sources: sourcesFor(hostConfig, overlay),
+    overridden,
+  }
 }

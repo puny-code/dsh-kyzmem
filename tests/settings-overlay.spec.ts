@@ -79,6 +79,21 @@ describe('settings overlay', () => {
     expect(overridden).toEqual([])
   })
 
+  it('reports each key source and a flat scalar-only snapshot', () => {
+    const { snapshot, sources } = describeEffective({ ingest: 'eager' }, { recallTotal: 900 })
+    expect(snapshot['ingest']).toBe('eager')
+    expect(snapshot['recallTotal']).toBe(900)
+    expect(snapshot['maintenanceEnabled']).toBe(true)
+    expect(sources['ingest']).toBe('host')
+    expect(sources['recallTotal']).toBe('overlay')
+    // 默认值不记来源，避免把每一项都标成「配置文件」。
+    expect(sources['queryRecall']).toBeUndefined()
+    // 快照只放标量，对象字段（ttlDaysByKind 等）不能漏进表格。
+    for (const value of Object.values(snapshot)) {
+      expect(['string', 'number', 'boolean']).toContain(typeof value)
+    }
+  })
+
   it('throws loudly on a corrupt overlay instead of silently dropping it', () => {
     writeFileSync(settingsPath(dir), '[1,2,3]', 'utf8')
     expect(() => readOverlay(dir)).toThrow(/must contain a JSON object/)
