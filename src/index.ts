@@ -49,6 +49,7 @@ import { parseJsonArray, routeFromEvents, streamText } from './llm/client.ts'
 import type { LlmRoute, SessionEventLike } from './llm/client.ts'
 import { buildJudge } from './automation/judge.ts'
 import { liveHotConfig, primeHotConfig } from './automation/live-config.ts'
+import { applyAdoptionScheduling } from './automation/review-grade.ts'
 import type { MemoryJudge } from './write-disposition.ts'
 import { registerKyzmemRoutes } from './routes.ts'
 import type { ProjectPalaceView, RouteDeps } from './routes.ts'
@@ -317,6 +318,9 @@ async function auditRecallAdoption(
   state.lastRecallBatch = batch
   const used = recallWasUsed(events, latest.ids, latest.at)
   await latest.store.audit(used ? 'recall-used' : 'recall-ignored', 'BATCH', JSON.stringify({ batch, ids: latest.ids }))
+  // Phase 6/7A：采用信号回流排期——被引用的 grade 4 推进，连续 3 次被注入未引用 grade 2 后排。
+  // 只改 review（不碰 confidence/排序）；每日 20 条上限在函数内部计数。
+  await applyAdoptionScheduling(latest.store, latest.ids, used)
 }
 
 /**
