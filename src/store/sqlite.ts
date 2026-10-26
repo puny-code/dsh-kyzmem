@@ -12,6 +12,7 @@ import { dirname } from 'node:path'
 import { KyzmemError, EPISODE_PROXIMITY_MS_DEFAULT, EPISODE_TIMELINE_LIMIT_DEFAULT, asEntityId, asFactId, asMemoryId, asObservationId, normalizeEntityName } from '../types.ts'
 import { assignSlot } from '../palace/slots.ts'
 import { createBackup } from '../backup/tar.ts'
+import { computeAnchor } from '../anchor.ts'
 import { nextSchedule } from '../review/sm2.ts'
 import { scorePlacard } from '../imagery/score.ts'
 import { message } from '../i18n/messages.ts'
@@ -675,6 +676,9 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
   // 恢复 = 重新有效：除 status 外还要清掉 invalid_at——否则 restore 回来的条目仍被检索的
   // 默认过滤（invalid_at IS NULL）挡在门外，恢复动作形同虚设。时间戳一律不动。
   const sqlRestore = db.prepare("UPDATE nodes SET status = 'active', invalid_at = NULL WHERE id = ?")
+  // 重锚（Phase 7）：只刷新指纹与复验时刻。anchor_path 是锚点身份（相对路径），重锚不改它——
+  // 文件改名/移动 = 旧锚点失效，应该删了重建而不是把 path 指过去。
+  const sqlSetAnchor = db.prepare('UPDATE nodes SET anchor_hash = ?, anchor_checked_at = ? WHERE id = ?')
   // 失效标记（update/supersedeMany 的内部原语）：取代式失效 = 置 archived 并打 invalid_at
   // （时点检索靠它还原「当时有效」的库）。COALESCE 保证只记第一次失效时刻——重复 update
   // 不会把历史失效点往后推。
@@ -1658,6 +1662,26 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       sqlRestore.run(id)
       sqlLog.run(Date.now(), 'restore', id, null)
       return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
+    },
+
+    async reanchor(id: MemoryId, root: string, now: number = Date.now()) {
+      const row = getRow(id)
+      if (row === undefined) throw new KyzmemError('NOT_FOUND', message('store.entryNotFound', { id }))
+      // 无锚点的条目：没有 path 可重算，直接返回（不写审计——没发生任何事）。
+      if (row.anchor_path === null || row.anchor_hash === null) {
+        return { reanchored: false as const, reason: 'no-anchor' as const }
+      }
+      // computeAnchor 指纹变了/文件没了都返回 undefined？不：stale 会返回新 hash，
+      // 只有路径非法或文件不存在才 undefined——前者不可能（path 当初校验过），
+      // 所以 undefined = 文件没了。
+      const anchor = await computeAnchor(root, row.anchor_path, now)
+      if (anchor === undefined) {
+        return { reanchored: false as const, reason: 'missing' as const }
+      }
+      const changed = anchor.hash !== row.anchor_hash
+      sqlSetAnchor.run(anchor.hash, now, id)
+      sqlLog.run(now, 'anchor-reanchored', id, JSON.stringify({ id, changed }))
+      return { reanchored: true as const, reason: 'ok' as const }
     },
 
     async topActive(scope: KyzmemScope, n: number) {

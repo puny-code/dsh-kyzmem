@@ -143,6 +143,11 @@ export interface KyzmemStore {
   getProfileBlockVersion(scope: KyzmemScope, version: number): Promise<ProfileBlockVersion | undefined>
   /** 从 archived/forgotten 恢复为 active。 */
   restore(id: MemoryId): Promise<MemoryRecord>
+  /** 重锚：用当前工作区根重算文件指纹（Phase 7）。
+   * 无锚点 → {reanchored:false,reason:'no-anchor'}；文件没了 → {reanchored:false,reason:'missing'}；
+   * 不存在的 id 抛 NOT_FOUND。只动 anchor_hash/anchor_checked_at，内容与状态一律不动。
+   */
+  reanchor(id: MemoryId, root: string, now?: number): Promise<{ reanchored: boolean; reason: 'ok' | 'no-anchor' | 'missing' }>
   /** 画像注入/蒸馏取材：指定 scope 的 active 条目按 importance、confidence 倒序取前 n。 */
   topActive(scope: KyzmemScope, n: number): Promise<MemoryRecord[]>
   /** 管理列表：按 scope/status/kind/子串过滤的分页视图（含全部状态），附总数。 */

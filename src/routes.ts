@@ -409,6 +409,28 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             json(res, 200, { ok: true })
             return
           }
+          if (req.method === 'POST' && route === 'reanchor') {
+            // 重锚（Phase 7）：body = { id, scope? }。根目录复用面板工作区解析：
+            // 项目选择器 → 对应工作区，没有选择器就用进程目录兜底。
+            // 解析不出根 = 宁可 400，也不用错的根把整库锚点标过期（与 stale 统计同一口径）。
+            if (!guardWrite(req, res)) return
+            const body = await readJsonBody(req)
+            const bodyObj = typeof body === 'object' && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : {}
+            adoptBodySelector(bodyObj)
+            const id = bodyObj['id']
+            if (typeof id !== 'string' || id === '') {
+              json(res, 400, { error: 'id is required' })
+              return
+            }
+            const root = await resolveAnchorRoot()
+            if (root === undefined) {
+              json(res, 400, { error: 'anchor root unavailable' })
+              return
+            }
+            const scope = scopeOf(typeof bodyObj['scope'] === 'string' ? bodyObj['scope'] : null, defaultScope())
+            json(res, 200, { ...(await (await storeFor(scope)).reanchor(asMemoryId(id), root)), scope })
+            return
+          }
           if (route === 'search-test' && (req.method === 'GET' || req.method === 'POST')) {
             // 召回测试台：跑真实检索（含命中强化），供面板核对召回质量与命中原委。
             // GET 与 POST 同源：参数少时用 GET 便于直开调试，POST 便于带项目选择器。
