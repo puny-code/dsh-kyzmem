@@ -2580,7 +2580,8 @@ interface SettingsView {
 /**
  * 插件设置卡片（运维 tab 顶部）：不用手改 settings / cordis 配置也能调参。
  * 草稿只记用户改过的字段；保存时仅提交变化的键，值与宿主默认相同则发 null（清除覆盖）。
- * 写入的是插件自有覆盖层，插件需重启才生效，卡片会明确提示。
+ * 写入的是插件自有覆盖层：热键（ttl/decay/rank/inject）下次调用即生效，
+ * 冷键（含 judgeModel）需重启插件，卡片顶部徽标会明确提示。
  */
 function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.ReactElement {
   const [view, setView] = useState<SettingsView | null>(null)
@@ -2684,9 +2685,21 @@ function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.Rea
     </label>
   )
 
+  const textSetting = (key: string, text: string, hint: string): React.ReactElement => (
+    <label className={styles.backfillRule}>
+      {fieldLabel(key, text)}
+      <input className={styles.input} type="text" value={String(current(key) ?? '')}
+        onChange={event => { setField(key, event.target.value) }} />
+      <span className={styles.backfillMuted}>{hint}</span>
+    </label>
+  )
+
   return (
     <div className={styles.backfill}>
       <p className={styles.backfillIntro}>{t('settingsIntro')}</p>
+      {view.restartRequired
+        ? <p className={styles.backfillMuted}>{t('settingsNeedsRestart')}</p>
+        : view.hasOverlay && <p className={styles.backfillMuted}>{t('settingsEffectiveNow')}</p>}
 
       <div className={styles.sectionHead}>
         <h5 className={styles.sectionTitle}>{t('settingsGroupIngest')}</h5>
@@ -2716,6 +2729,13 @@ function SettingsCard({ t, toast }: { t: T; toast: ToastController }): React.Rea
       </div>
       <div className={styles.backfillRules}>
         {numberSetting('maintenanceBudgetLlmCalls', t('settingsMaintenanceLlmCalls'), 0, 5)}
+      </div>
+
+      <div className={styles.sectionHead}>
+        <h5 className={styles.sectionTitle}>{t('settingsGroupLlm')}</h5>
+      </div>
+      <div className={styles.backfillRules}>
+        {textSetting('judgeModel', t('settingsJudgeModel'), t('settingsJudgeModelHint'))}
       </div>
 
       <div className={styles.backfillActions}>

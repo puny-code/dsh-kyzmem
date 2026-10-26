@@ -13,6 +13,7 @@
 import type { KyzmemLanguage } from '../i18n/language.ts'
 import { message } from '../i18n/messages.ts'
 import { autoResolveBatch } from '../automation/orchestrator.ts'
+import { liveHotConfig } from '../automation/live-config.ts'
 import type { MemoryJudge } from '../write-disposition.ts'
 import { DEFAULT_REFURB_OPTIONS, gatherRefurbSuggestions } from '../refurb.ts'
 import { runConsolidation } from '../consolidation/run.ts'
@@ -360,6 +361,11 @@ export interface KickMaintenanceOptions extends MaintenanceRunOptions {
   readonly onRun?: (result: MaintenanceRunResult) => void
   /** 失败回调（缺省 console.warn）。 */
   readonly onError?: (error: unknown) => void
+  /**
+   * 热配置来源（Phase 2.1）：decayAfterDays 按次读覆盖层。
+   * 只传 dbDir；未传 = decay 门槛用装载期快照。预算（ms/items/llmCalls）是冷键，仍走快照。
+   */
+  readonly hotDbDir?: string
 }
 
 /**
@@ -395,9 +401,15 @@ export function kickMaintenance(options?: KickMaintenanceOptions): void {
     if (plan === undefined) return
     const idle = await isIdle(store, effective.idleDays, now)
     const budget = plan.small || idle ? idleBudget(effective.budget) : effective.budget
+    // 热 decay 门槛（Phase 2.1）：面板改完 decayAfterDays，下一次 kick 即生效，不用重启。
+    // 预算仍是冷键，走装载期快照。
+    const live = effective.hotDbDir === undefined ? undefined : liveHotConfig(effective.hotDbDir)
+    const runOptions = live === undefined
+      ? { ...effective, now }
+      : { ...effective, now, olderThanDays: live.decayAfterDays }
     inFlight.add(store)
     try {
-      const result = await runMaintenance(store, plan.job, budget, { ...effective, now })
+      const result = await runMaintenance(store, plan.job, budget, runOptions)
       if (effective.onRun !== undefined) effective.onRun(result)
       // 默认记一条完成日志：维护是后台行为，没有日志时用户完全看不出它跑过。
       else console.log(message('core.logMaintenanceDone', { job: result.job, items: result.items, ms: result.ms }))

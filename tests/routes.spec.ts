@@ -355,3 +355,18 @@ describe('回环守卫', () => {
     expect(reply.status).toBe(403)
   })
 })
+
+describe('POST /api/kyzmem/settings（Phase 2.2 按键 restartRequired）', () => {
+  it('纯热键补丁 restartRequired=false', async () => {
+    const request = harness({ ...makeDeps(), hostConfig: {} })
+    const reply = await request('POST', '/api/kyzmem/settings', { decayAfterDays: 7 })
+    expect(reply.status).toBe(200)
+    expect(reply.json.restartRequired).toBe(false)
+  })
+  it('含 judgeModel 补丁 restartRequired=true', async () => {
+    const request = harness({ ...makeDeps(), hostConfig: {} })
+    const reply = await request('POST', '/api/kyzmem/settings', { judgeModel: 'test-model' })
+    expect(reply.status).toBe(200)
+    expect(reply.json.restartRequired).toBe(true)
+  })
+})

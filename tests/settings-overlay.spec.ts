@@ -2,7 +2,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { describeEffective, mergeWithOverlay, readOverlay, saveOverlay, settingsPath } from '../src/settings-overlay.ts'
+import { describeEffective, EDITABLE_KEYS, editableValues, mergeWithOverlay, needsRestart, readOverlay, saveOverlay, settingsPath } from '../src/settings-overlay.ts'
+import { resolveConfig } from '../src/config.ts'
 
 let dir: string
 
@@ -97,5 +98,20 @@ describe('settings overlay', () => {
   it('throws loudly on a corrupt overlay instead of silently dropping it', () => {
     writeFileSync(settingsPath(dir), '[1,2,3]', 'utf8')
     expect(() => readOverlay(dir)).toThrow(/must contain a JSON object/)
+  })
+})
+
+describe('EDITABLE_KEYS 与 needsRestart（Phase 2.2）', () => {
+  it('卡片可配 judgeModel', () => {
+    expect(EDITABLE_KEYS).toContain('judgeModel')
+    expect(editableValues(resolveConfig({ dbDir: dir })).judgeModel).toBe('')
+  })
+  it('纯热键不需要重启', () => {
+    expect(needsRestart(['decayAfterDays', 'rankProofWeight'])).toBe(false)
+    expect(needsRestart([])).toBe(false)
+  })
+  it('含冷键需要重启', () => {
+    expect(needsRestart(['judgeModel'])).toBe(true)
+    expect(needsRestart(['ingest'])).toBe(true)
   })
 })

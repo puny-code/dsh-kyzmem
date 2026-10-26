@@ -48,6 +48,7 @@ import type { IngestRequestEventData } from './ingest/hook.ts'
 import { parseJsonArray, routeFromEvents, streamText } from './llm/client.ts'
 import type { LlmRoute, SessionEventLike } from './llm/client.ts'
 import { buildJudge } from './automation/judge.ts'
+import { liveHotConfig, primeHotConfig } from './automation/live-config.ts'
 import type { MemoryJudge } from './write-disposition.ts'
 import { registerKyzmemRoutes } from './routes.ts'
 import type { ProjectPalaceView, RouteDeps } from './routes.ts'
@@ -364,6 +365,15 @@ async function compressProfileOverflow(
 }
 
 /**
+ * 热 TTL（Phase 2.1）：写入期 expires_at 折算按次读覆盖层。
+ * pre-step 在 apply 之外，只能看到 resolved 快照；dbDir → liveHotConfig → 新快照，
+ * 未注冊/损坏时 liveHotConfig 内部 warn 并回快照，调用方无需分支。
+ */
+function liveTtl(resolved: ResolvedKyzmemConfig): ResolvedKyzmemConfig['ttlDaysByKind'] {
+  return (liveHotConfig(resolved.dbDir) ?? resolved).ttlDaysByKind
+}
+
+/**
  * P1.2 会话模型裁决器：judge.model 为空用默认对话路由，指定模型只换 model。
  * hook 三站点按调用现建（路由随各自事件快照解析；无路由/调用失败时抛错，
  * 由 decideWrite/confirmContradictions 降级，不中断写入链路）。
@@ -467,7 +477,7 @@ async function preStep(
         call: params => streamText(ctx, { ...params, sessionId: agent.session.id }),
         logRequest,
         signal,
-        ttlDaysByKind: resolved.ttlDaysByKind,
+        ttlDaysByKind: liveTtl(resolved),
         ingestDeadLetterAttempts: resolved.ingestDeadLetterAttempts,
         judge: makeHookJudge(
           ctx,
@@ -498,7 +508,7 @@ async function preStep(
         call: params => streamText(ctx, { ...params, sessionId: agent.session.id }),
         logRequest,
         signal,
-        ttlDaysByKind: resolved.ttlDaysByKind,
+        ttlDaysByKind: liveTtl(resolved),
         judge: makeHookJudge(
           ctx,
           resolved.judgeModel,
@@ -930,6 +940,10 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
   }
   const config = mergeWithOverlay(hostConfig, overlay)
   const resolved = resolveConfig(config)
+  // 热键按次读（Phase 2.1）：ttl/decay/rank/inject 四族不固化在快照里，
+  // 调用点经 liveHotConfig(dbDir) 重读覆盖层；冷键（ingest 开关、路由、judge.model 等）
+  // 仍走这里的 resolved。config 是全量 host 配置，重校验时冷键不会回退缺省。
+  primeHotConfig(resolved.dbDir, config, resolved)
   // Язык служебных сообщений — один на процесс. Помощник message() зовут десятки
   // функций, и протаскивать язык в каждую было бы куда грубее, чем задать его здесь
   // один раз при сборке плагина (см. src/i18n/messages.ts).
@@ -974,9 +988,10 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
       autoSlot: resolved.autoSlot,
       reviewScheduling: resolved.reviewScheduling,
       // 写入期自动折算 expires_at：TTL 按 kind 配置在插件层解析，store 只认天数；
+      // 热读（Phase 2.1）：面板改完 ttl* 下一次写入即生效，不用重启。
       // 复习重学窗口同理（纯函数 nextSchedule 需要调用方注入）。
       // 迁移前整库备份（前置工作 4）：版本落后时先 tar 再迁移，备份失败 loud 中断。
-      ttlDaysByKind: resolved.ttlDaysByKind,
+      ttlDaysByKind: liveTtl(resolved),
       reviewRelearnDays: resolved.reviewRelearnDays,
       backupBeforeMigrate: { dbDir: resolved.dbDir, pluginVersion: VERSION },
     })
@@ -1520,6 +1535,8 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
     idleDays: resolved.maintenance.idleDays,
     enabled: resolved.maintenance.enabled,
     olderThanDays: resolved.decayAfterDays,
+    // 热 decay 门槛（Phase 2.1）：kick 时按次重读覆盖层；预算仍是冷键，走上面快照。
+    hotDbDir: resolved.dbDir,
     language: resolved.language,
     embedder,
     // P2 自动裁决联动：欠账门（待裁决 >5）+ 预算门（llmCalls > 0 才带 judge）由调度器判。

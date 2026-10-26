@@ -20,7 +20,7 @@ import type { HistoryBackfillRules, HistoryEstimate, HistoryRunProgress, History
 import type { ProjectPalaceKind } from './project/registry.ts'
 import type { ResolvedHistoryRules } from './config.ts'
 import { writeMirror } from './mirror/markdown.ts'
-import { describeEffective, readOverlay, saveOverlay, settingsPath } from './settings-overlay.ts'
+import { describeEffective, needsRestart, readOverlay, saveOverlay, settingsPath } from './settings-overlay.ts'
 import type { KyzmemLanguage } from './i18n/language.ts'
 import { messageIn } from './i18n/messages.ts'
 import { createBackup, restoreBackup, BACKUP_SCHEMA_VERSION } from './backup/tar.ts'
@@ -1004,7 +1004,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             try {
               const overlay = readOverlay(deps.dbDir)
               const { values, snapshot, sources, overridden } = describeEffective(deps.hostConfig, overlay)
-              json(res, 200, { values, snapshot, sources, overridden, restartRequired: overridden.length > 0, settingsPath: settingsPath(deps.dbDir), hasOverlay: overridden.length > 0 })
+              json(res, 200, { values, snapshot, sources, overridden, restartRequired: needsRestart(overridden), settingsPath: settingsPath(deps.dbDir), hasOverlay: overridden.length > 0 })
             } catch (error) {
               json(res, 500, { error: error instanceof Error ? error.message : String(error) })
             }
@@ -1022,7 +1022,7 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
               saveOverlay(deps.dbDir, patch, deps.hostConfig)
               const overlay = readOverlay(deps.dbDir)
               const { values, snapshot, sources, overridden } = describeEffective(deps.hostConfig, overlay)
-              json(res, 200, { values, snapshot, sources, overridden, restartRequired: true, settingsPath: settingsPath(deps.dbDir), hasOverlay: overridden.length > 0 })
+              json(res, 200, { values, snapshot, sources, overridden, restartRequired: needsRestart(Object.keys(patch)), settingsPath: settingsPath(deps.dbDir), hasOverlay: overridden.length > 0 })
             } catch (error) {
               json(res, 400, { error: error instanceof Error ? error.message : String(error) })
             }

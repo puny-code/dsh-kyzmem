@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { CONFIG_KEYS, resolveConfig } from './config.ts'
+import { CONFIG_KEYS, RETRIEVAL_KEYS, resolveConfig } from './config.ts'
 import type { KyzmemConfig, ResolvedKyzmemConfig } from './config.ts'
 
 export const SETTINGS_FILE = 'settings.json'
@@ -75,7 +75,17 @@ export const EDITABLE_KEYS = [
   'recallTotal',
   'maintenanceEnabled',
   'maintenanceBudgetLlmCalls',
+  'judgeModel',
 ] as const
+
+/**
+ * 补丁是否需要重启才生效：只要含一个非热键就需重启。
+ * 热键（ttl/decay/rank/inject 四族）按次读取，见 RETRIEVAL_KEYS；其余一律固化在加载期。
+ */
+export function needsRestart(keys: readonly string[]): boolean {
+  const hot = new Set<string>(RETRIEVAL_KEYS)
+  return keys.some(key => !hot.has(key))
+}
 
 /**
  * 卡片表单的扁平视图。解析后的配置里 maintenance 是嵌套对象，直接摊给前端会让表单读不到
@@ -89,6 +99,7 @@ export function editableValues(effective: ResolvedKyzmemConfig): Record<string, 
     recallTotal: effective.recallTotal,
     maintenanceEnabled: effective.maintenance.enabled,
     maintenanceBudgetLlmCalls: effective.maintenance.budgetLlmCalls,
+    judgeModel: effective.judgeModel,
   }
 }
 

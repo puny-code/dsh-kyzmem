@@ -246,6 +246,19 @@ export const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'language', 'redactWords',
 ])
 
+/**
+ * 热键（Phase 2.1）：允许按次读取、无需重启的配置键。
+ * 只有检索/注入/衰减四族：ttl*、decayAfterDays、rank*、injectTiers/injectItemBudget*。
+ * 其余键（ingest 开关、路由、预算、judge.model 等）全部固化在加载期快照里——
+ * 注意 `injectItemBudget` 这个单数名在 KyzmemConfig 里不存在，实际是 Start/Decay/Floor 三键。
+ */
+export const RETRIEVAL_KEYS: readonly (keyof KyzmemConfig)[] = [
+  'ttlFactDays', 'ttlEpisodeDays', 'ttlDecisionDays', 'ttlPreferenceDays', 'ttlSkillDays',
+  'decayAfterDays',
+  'rankRecencyWeight', 'rankProofWeight', 'rankAdoptionWeight',
+  'injectTiers', 'injectItemBudgetStart', 'injectItemBudgetDecay', 'injectItemBudgetFloor',
+]
+
 const INGEST_MODES: ReadonlySet<string> = new Set(['off', 'light', 'eager'])
 const REFLECT_MODES: ReadonlySet<string> = new Set(['off', 'suggest', 'auto'])
 const QUERY_RECALL_MODES: ReadonlySet<string> = new Set(['off', 'light', 'full'])
