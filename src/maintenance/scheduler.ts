@@ -12,6 +12,8 @@
 
 import type { KyzmemLanguage } from '../i18n/language.ts'
 import { message } from '../i18n/messages.ts'
+import { autoResolveBatch } from '../automation/orchestrator.ts'
+import type { MemoryJudge } from '../write-disposition.ts'
 import { DEFAULT_REFURB_OPTIONS, gatherRefurbSuggestions } from '../refurb.ts'
 import { runConsolidation } from '../consolidation/run.ts'
 import type { KyzmemEmbedder } from '../embedder/interface.ts'
@@ -42,6 +44,18 @@ export interface MaintenanceBudget {
   readonly mergeItems?: number
 }
 
+/** 自动裁决联动的运行依赖（P2）：欠账门与预算门都在调度器侧判定。 */
+export interface MaintenanceAutoResolveOptions {
+  /** 后台裁决器（makeJudge 按路由现建；缺省 = 只跑规则轨）。 */
+  readonly judge?: MemoryJudge
+  /** 本轮最多自动解决的对数（autoResolveBatch 的 maxAuto，缺省 5）。 */
+  readonly maxAuto?: number
+  /** 24 小时自动解决上限（autoResolveBatch 的 dailyMax，缺省 20）。 */
+  readonly dailyMax?: number
+  /** 审计版本号（auto-action/auto-proposed 的 version 字段，调用方传插件 VERSION）。 */
+  readonly version: string
+}
+
 /** 整理任务的运行依赖（由 index 注入）。 */
 export interface MaintenanceRunOptions {
   /** 当前时间（测试可注入）。 */
@@ -58,6 +72,11 @@ export interface MaintenanceRunOptions {
    * 未传时退回「只在当前 store 上跑 runConsolidation」。
    */
   readonly consolidate?: (store: KyzmemStore, maxItems: number, deadline: number) => Promise<number>
+  /**
+   * 自动裁决联动（P2）：欠账门（待裁决 >5）+ 预算门（llmCalls > 0 才带 judge）都在这里判。
+   * 未传 = 本轮不跑自动裁决，只做既有整理三任务。
+   */
+  readonly autoResolve?: MaintenanceAutoResolveOptions
 }
 
 /** shouldRun 的判定依据（用于面板/测试解释为什么跳过）。 */
@@ -226,8 +245,35 @@ async function runJob(store: KyzmemStore, job: MaintenanceJob, budget: Maintenan
 }
 
 /**
- * 跑一次整理任务（单任务）。
- * 语义：先抢租约（跨进程单飞），跑完写 'maintenance-run'（含 job/items/ms/debt），
+ * 跑一次自动裁决（P2 联动位）：内部 try/catch，失败只告警、不触碰既有整理的返回值。
+ * 预算门：llmCalls <= 0 时不带 judge（纯规则轨）；双重失败（judge 和规则都抛错）
+ * 由 autoResolveBatch 内部静默吞掉，这里只防它自身抛出的意外错误。
+ */
+async function runAutoResolve(
+  store: KyzmemStore,
+  opts: MaintenanceAutoResolveOptions,
+  budget: MaintenanceBudget,
+  now: number,
+): Promise<MaintenanceRunResult['autoResolve']> {
+  try {
+    return await autoResolveBatch(store, {
+      ...(opts.judge === undefined || budget.llmCalls <= 0 ? {} : { judge: opts.judge }),
+      ...(opts.maxAuto === undefined ? {} : { maxAuto: opts.maxAuto }),
+      ...(opts.dailyMax === undefined ? {} : { dailyMax: opts.dailyMax }),
+      version: opts.version,
+      now: () => now,
+    })
+  } catch (error) {
+    console.warn(message('core.warnAutoResolveFailed'), error)
+    return undefined
+  }
+}
+
+/**
+ * 跑一次整理任务（单任务 + 可选自动裁决联动）。
+ * 语义：先抢租约（跨进程单飞），欠账门（待裁决 >5）通过且传了 autoResolve 依赖时先跑
+ * 自动裁决，再跑本轮任务，最后写 'maintenance-run'（含 job/items/ms/debt，联动跑过
+ * 则附 autoResolve 结果），
  * 租约在 finally 释放。时间预算为软上限：靠各任务的条数上限与 deadline 自查控制。
  * @returns 未抢到租约时 items=0、ms=0（不写 maintenance-run，避免伪造「刚整理过」）。
  */
@@ -244,16 +290,23 @@ export async function runMaintenance(
   const lease = await acquireLease(store, now, owner)
   if (lease === undefined) return { job, items: 0, ms: 0, debt }
   try {
+    // P2 联动位：欠账门（待裁决 >5，与 merge 任务同阈值）通过且调用方传了依赖时，
+    // 先跑自动裁决再跑本轮任务；无欠账 = 纯规则也判不出东西，直接省掉。
+    const autoResolve = options.autoResolve !== undefined && debt.openConflicts > OPEN_CONFLICTS_THRESHOLD
+      ? await runAutoResolve(store, options.autoResolve, budget, now)
+      : undefined
     const deadline = started + Math.max(budget.ms, 1)
     const items = await runJob(store, job, budget, options, deadline)
     const ms = Date.now() - started
     // 审计失败不应吞掉整理结果，但也不能让 fire-and-forget 逃逸成未处理 rejection。
     try {
-      await store.audit(MAINTENANCE_RUN_OP, 'BATCH', JSON.stringify({ job, items, ms, debt }))
+      await store.audit(MAINTENANCE_RUN_OP, 'BATCH', JSON.stringify({
+        job, items, ms, debt, ...(autoResolve === undefined ? {} : { autoResolve }),
+      }))
     } catch (error) {
       console.warn(message('core.warnMaintenanceAuditFailed'), error)
     }
-    return { job, items, ms, debt }
+    return { job, items, ms, debt, ...(autoResolve === undefined ? {} : { autoResolve }) }
   } finally {
     await releaseLease(store, lease)
   }

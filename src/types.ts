@@ -708,6 +708,17 @@ export interface MaintenanceRunResult {
   readonly items: number
   readonly ms: number
   readonly debt: MaintenanceDebt
+  /**
+   * 自动裁决联动结果（P2）：只有「冲突欠账超阈 + 预算就绪」时才有，无欠账时缺省。
+   * 形状与 automation/orchestrator 的 AutoResolveBatchResult 同构——词汇表层不反向
+   * 依赖自动化层，调用方按结构赋值即可，字段增减以 orchestrator 的接口为准。
+   */
+  readonly autoResolve?: {
+    readonly processed: number
+    readonly autoResolved: number
+    readonly proposed: number
+    readonly skippedCap: number
+  }
 }
 
 /** 闭馆三问的答案（墓志铭）。写入 op_log 的 forget 详情，方便 kyzmem_audit_forgotten 考古。 */

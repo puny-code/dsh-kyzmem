@@ -1522,6 +1522,17 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
     olderThanDays: resolved.decayAfterDays,
     language: resolved.language,
     embedder,
+    // P2 自动裁决联动：欠账门（待裁决 >5）+ 预算门（llmCalls > 0 才带 judge）由调度器判。
+    // 后台裁决器没有会话上下文：路由只走 routeOverride（缺省 = 默认对话路由），
+    // judgeModel 为空同样回退默认路由；signal 不传，靠 buildJudge 内部 60s 上限兜底。
+    autoResolve: {
+      judge: buildJudge({
+        call: params => streamText(ctx, { ...params }),
+        getRoute: () => resolved.routeOverride,
+        judgeModel: resolved.judgeModel,
+      }),
+      version: VERSION,
+    },
     // 合并任务要覆盖「本机上所有宫殿」：user.db + 全部 project-*.db。
     // 只整理 user.db 会让项目宫殿的重复记忆永远不被合并（多库逐个整理由 consolidation 层负责）。
     consolidate: async (_store, maxItems, deadline) => {

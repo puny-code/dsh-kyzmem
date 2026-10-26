@@ -280,3 +280,42 @@ describe('本地遥测 aggregateTelemetry', () => {
     expect(snapshot.scopes[0]!.signalRatio).toBeCloseTo(1.0, 1) // 1 active / 1 total
   })
 })
+
+describe('computeMetrics 自动裁决三项（P2，纯函数）', () => {
+  /** 一条 conflict-rule 系自动审计行。 */
+  const autoOp = (name: string, ruleId: string, at = 1000): OperationLogRow =>
+    op(name, { ruleId, leftId: 'a', rightId: 'b', batchId: 'auto-conflict-1', version: 'test' }, at)
+  it('autoResolved 只数 conflict-rule 系 auto-action；无关 auto-action 不进数', () => {
+    const metrics = computeMetrics({
+      windowDays: 7,
+      stats: [],
+      ops: [
+        autoOp('auto-action', 'conflict-rule/r-tier'),
+        autoOp('auto-action', 'conflict-rule/judge-newer'),
+        autoOp('auto-action', 'review-adopt'),
+      ],
+    })
+    expect(metrics.autoResolved).toBe(2)
+  })
+  it('autoProposed 只数 conflict-rule 系 auto-proposed；shadowRate = proposed / (resolved + proposed)', () => {
+    const metrics = computeMetrics({
+      windowDays: 7,
+      stats: [],
+      ops: [
+        autoOp('auto-action', 'conflict-rule/r-tier'),
+        autoOp('auto-action', 'conflict-rule/r-tier'),
+        autoOp('auto-proposed', 'conflict-rule/r-newer'),
+        autoOp('auto-proposed', 'conflict-rule/r-abstain'),
+        autoOp('auto-proposed', 'conflict-rule/r-abstain'),
+      ],
+    })
+    expect(metrics.autoProposed).toBe(3)
+    expect(metrics.shadowRate).toBeCloseTo(0.6, 5)
+  })
+  it('窗口内无自动裁决审计时三项全缺省而非 0', () => {
+    const metrics = computeMetrics({ windowDays: 7, stats: [], ops: [op('write')] })
+    expect(metrics.autoResolved).toBeUndefined()
+    expect(metrics.autoProposed).toBeUndefined()
+    expect(metrics.shadowRate).toBeUndefined()
+  })
+})

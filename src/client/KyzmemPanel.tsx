@@ -143,6 +143,12 @@ interface OpsMetrics {
   readonly tokenCostEstimate?: number
   /** R5：带锚条目里「可能过期」的比例（mtime 实时抽样复验）。 */
   readonly staleAnchorRate?: number
+  /** P2：窗口内自动解决的冲突对数（缺省 = 自动裁决没跑，不是 0）。 */
+  readonly autoResolved?: number
+  /** P2：窗口内记 proposed 留人工的冲突对数。 */
+  readonly autoProposed?: number
+  /** P2：影子率 = proposed / (resolved + proposed)（分母为 0 时缺省）。 */
+  readonly shadowRate?: number
 }
 
 /** /stats 的响应（parts 为既有多作用域统计；channels/metrics 是 v0.11 新增的顶层字段）。 */
@@ -295,6 +301,10 @@ const METRIC_ROWS: readonly {
   { label: 'metricDrillDown', pick: metrics => metrics.drillDownRate, format: 'ratio' },
   { label: 'metricTokenCost', pick: metrics => metrics.tokenCostEstimate, format: 'tokens' },
   { label: 'metricStaleAnchor', pick: metrics => metrics.staleAnchorRate, format: 'ratio' },
+  // P2 三项（自动裁决）：已解决 / 留人工 / 影子率；缺省显示「—」，不把 0 和「没跑」混淆。
+  { label: 'metricAutoResolved', pick: metrics => metrics.autoResolved, format: 'count' },
+  { label: 'metricAutoProposed', pick: metrics => metrics.autoProposed, format: 'count' },
+  { label: 'metricShadowRate', pick: metrics => metrics.shadowRate, format: 'ratio' },
 ]
 
 /** 大数字缩写（磁贴宽度有限）：1234 → 1.2K，1_234_567 → 1.2M；万以下照原样显示。 */

@@ -222,6 +222,18 @@ export interface TelemetryMetrics {
   readonly tokenCostEstimate?: number
   /** 带锚条目里「可能过期」（stale + missing）的比例（R5，mtime 实时抽样复验）；无样本时缺省。 */
   readonly staleAnchorRate?: number
+  /**
+   * 窗口内自动解决的冲突对数（P2，op_log auto-action 里 ruleId 前缀 conflict-rule/ 的行数）。
+   * 无自动裁决审计时缺省——0 会被读成「一个没解决」，而真相可能是「自动裁决没开」。
+   */
+  readonly autoResolved?: number
+  /** 窗口内记 proposed 留人工的冲突对数（P2，口径同上，op 名 auto-proposed）。 */
+  readonly autoProposed?: number
+  /**
+   * 影子率（P2）= proposed / (resolved + proposed)：自动管线里「不敢自己动手」的比例。
+   * 分母为 0（窗口内无自动裁决）时缺省——0 会被读成「全自动」，真相是「没跑」。
+   */
+  readonly shadowRate?: number
 }
 
 /** 指标聚合的输入（全部是已查好的数据，便于单测直接构造）。 */
@@ -454,6 +466,21 @@ export function computeMetrics(inputs: MetricInputs): TelemetryMetrics {
     ? anchors.stale / anchors.checked
     : undefined
 
+  // —— P2 自动裁决：只数 conflict-rule 系（review-adopt 等别的自动动作不进数） ——
+  let autoResolved = 0
+  let autoProposed = 0
+  let autoSeen = false
+  for (const row of inWindow) {
+    if (row.op !== 'auto-action' && row.op !== 'auto-proposed') continue
+    const ruleId = parseDetail(row.detail)?.['ruleId']
+    if (typeof ruleId !== 'string' || !ruleId.startsWith('conflict-rule/')) continue
+    autoSeen = true
+    if (row.op === 'auto-action') autoResolved++
+    else autoProposed++
+  }
+  const shadowDenom = autoResolved + autoProposed
+  const shadowRate = autoSeen && shadowDenom > 0 ? autoProposed / shadowDenom : undefined
+
   return {
     recallUsed,
     recallIgnored,
@@ -473,6 +500,8 @@ export function computeMetrics(inputs: MetricInputs): TelemetryMetrics {
     ...(drillDownRate === undefined ? {} : { drillDownRate }),
     ...(tokenCostEstimate === undefined ? {} : { tokenCostEstimate }),
     ...(staleAnchorRate === undefined ? {} : { staleAnchorRate }),
+    ...(autoSeen ? { autoResolved, autoProposed } : {}),
+    ...(shadowRate === undefined ? {} : { shadowRate }),
   }
 }
 
