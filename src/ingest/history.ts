@@ -97,7 +97,8 @@ export interface HistoryEstimate {
 
 /** 执行进度（面板轮询 / 工具输出用）。 */
 export interface HistoryRunProgress {
-  /** 状态；failed = 整批因环境/依赖错误中断（单轮失败只计入 turnsFailed）。 */
+  /** 状态；failed = 整批因环境/依赖错误中断，或连败熔断（maxConsecutiveFailures）。
+   * 单轮失败只计入 turnsFailed，不改 state。 */
   readonly state: 'running' | 'done' | 'cancelled' | 'failed'
   /** 候选会话总数。 */
   readonly sessionsTotal: number
@@ -342,6 +343,8 @@ export async function estimateHistoryBackfill(
  * @param overrides - 本次覆盖项。
  * @param onProgress - 进度回调（每个会话结束时调用一次）。
  * @param signal - 取消信号（面板「暂停」/工具超时）。
+ * @param options - 可选：maxConsecutiveFailures（连败熔断，默认关闭；触发即停，
+ *   state='failed'，调用方据此记暂停——手动跑不传，保持原行为）。
  * @returns 运行结果。
  */
 export async function runHistoryBackfill(
@@ -350,6 +353,7 @@ export async function runHistoryBackfill(
   overrides: HistoryBackfillRules,
   onProgress: (progress: HistoryRunProgress) => void,
   signal: AbortSignal,
+  options?: { maxConsecutiveFailures?: number },
 ): Promise<HistoryRunResult> {
   const rules = mergeHistoryRules(defaults, overrides)
   const { candidates } = deps.source === undefined
@@ -384,10 +388,15 @@ export async function runHistoryBackfill(
     skipReasons: {},
   }
   onProgress({ ...progress })
+  // 连败熔断（Phase 4）：连续 N 轮抛错说明辅助模型/环境持续不可用，继续跑只是烧调用。
+  // 只在调用方显式传入 maxConsecutiveFailures 时启用；手动跑默认关闭，行为不变。
+  const maxConsecutiveFailures = options?.maxConsecutiveFailures
+  let consecutiveFailures = 0
+  let tripped = false
   for (const candidate of candidates) {
-    if (signal.aborted) break
+    if (signal.aborted || tripped) break
     for (const turn of candidate.turns) {
-      if (signal.aborted) break
+      if (signal.aborted || tripped) break
       try {
         const outcome = await ingestPreviousTurn({
           events: candidate.events,
@@ -410,13 +419,17 @@ export async function runHistoryBackfill(
           history: true,
         })
         progress.memoriesWritten += outcome.written
+        consecutiveFailures = 0
         if (outcome.skipped !== null) {
           progress.turnsSkipped += 1
           progress.skipReasons[outcome.skipped] = (progress.skipReasons[outcome.skipped] ?? 0) + 1
         }
       } catch (error) {
         // 单轮失败（限流/超时/解析失败）不中断整批；重跑时该轮会再试。
+        // 连败达到阈值则熔断：后边的轮次大概率同样失败，直接停，state 记 failed。
         progress.turnsFailed += 1
+        consecutiveFailures += 1
+        if (maxConsecutiveFailures !== undefined && consecutiveFailures >= maxConsecutiveFailures) tripped = true
         failures.push({ sessionId: candidate.header.id, turn, reason: error instanceof Error ? error.message : String(error) })
       }
       progress.turnsDone += 1
@@ -424,7 +437,9 @@ export async function runHistoryBackfill(
       onProgress({ ...progress, currentSession: candidate.header.id })
     }
     // 会话收尾：生成一句话摘要（增强信息，失败静默），供情景时间线组头展示。
-    await ensureSessionSummary({
+    // 熔断后跳过：摘要同样调辅助模型，此时调了也大概率失败，没必要再烧一次调用。
+    if (!tripped) {
+      await ensureSessionSummary({
       events: candidate.events,
       sessionId: candidate.header.id,
       openStore: () => candidate.openStore(),
@@ -435,11 +450,12 @@ export async function runHistoryBackfill(
       signal,
       // 摘要请求挂在会话最后一轮的 round 上（请求日志按轮次归档，摘要是会话级收尾动作）。
       round: candidate.turns[candidate.turns.length - 1],
-    })
+      })
+    }
     progress.sessionsDone += 1
     onProgress({ ...progress, currentSession: candidate.header.id })
   }
-  const state = signal.aborted ? 'cancelled' : 'done'
+  const state = tripped ? 'failed' : signal.aborted ? 'cancelled' : 'done'
   onProgress({ ...progress, state })
   return { ...progress, state, failures }
 }

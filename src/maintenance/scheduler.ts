@@ -17,6 +17,8 @@ import { liveHotConfig } from '../automation/live-config.ts'
 import type { MemoryJudge } from '../write-disposition.ts'
 import { DEFAULT_REFURB_OPTIONS, gatherRefurbSuggestions } from '../refurb.ts'
 import { runConsolidation } from '../consolidation/run.ts'
+import type { HistoryBackfillRules, HistoryRunResult } from '../ingest/history.ts'
+import type { ResolvedHistoryRules } from '../config.ts'
 import type { KyzmemEmbedder } from '../embedder/interface.ts'
 import type { KyzmemStore } from '../store/interface.ts'
 import type { KyzmemScope, MaintenanceDebt, MaintenanceJob, MaintenanceRunResult } from '../types.ts'
@@ -245,6 +247,96 @@ async function runJob(store: KyzmemStore, job: MaintenanceJob, budget: Maintenan
   return runRefurbJob(store, budget, options)
 }
 
+/** 增量回填窗口（天）：每天覆盖最近 7 天，幂等键保证重复跑不写重复记忆。 */
+export const INCREMENTAL_BACKFILL_DAYS = 7
+/** 增量回填连败熔断：连续 3 轮抛错即停，记暂停，当天不再跑。 */
+export const INCREMENTAL_BACKFILL_MAX_CONSECUTIVE_FAILURES = 3
+/** 增量回填单次超时（毫秒）：到期 abort，state 记 cancelled，不记暂停（下次 kick 重试）。 */
+export const INCREMENTAL_BACKFILL_TIMEOUT_MS = 10 * 60_000
+const BACKFILL_RUN_OP = 'backfill-run'
+const BACKFILL_PAUSE_OP = 'backfill-pause'
+
+/** 增量回填的运行依赖（index 注入：复用回填引擎，规则沿用配置默认值）。 */
+export interface IncrementalBackfillRunner {
+  readonly run: (
+    rules: HistoryBackfillRules,
+    signal: AbortSignal,
+    options?: { maxConsecutiveFailures?: number },
+  ) => Promise<HistoryRunResult>
+  readonly defaults: ResolvedHistoryRules
+}
+
+export type IncrementalBackfillOutcome =
+  | 'ran' | 'skipped-unconfigured' | 'skipped-idle' | 'skipped-no-budget' | 'skipped-today' | 'skipped-paused'
+
+function parseBackfillDetail(detail: string | null): Record<string, unknown> | undefined {
+  if (detail === null) return undefined
+  try {
+    const parsed: unknown = JSON.parse(detail)
+    if (typeof parsed === 'object' && parsed !== null) return parsed as Record<string, unknown>
+  } catch {
+    // 损坏的审计行当不存在：只影响今天跑不跑，不影响正确性。
+  }
+  return undefined
+}
+
+function auditDate(row: { at: number; detail: string | null } | undefined): string | undefined {
+  const parsed = row === undefined ? undefined : parseBackfillDetail(row.detail)
+  return typeof parsed?.['date'] === 'string' ? parsed['date'] as string : undefined
+}
+
+/**
+ * 每日增量回填（Phase 4）：最近 7 天、配额内、连败暂停、减载档跳过。
+ * - 减载档（久未活跃）不跑：开机回来先让人用，整理靠边站；
+ * - llmCalls 预算为 0 不跑：回填每轮都要调辅助模型，无调用额度硬跑只会全失败；
+ * - 一天只跑一次（backfill-run 按 UTC 日期去重，手动跑也算一次）；
+ * - 上次以连败熔断收尾且之后没有成功完成过，不跑（等人工跑通一次自动清除）。
+ * 跑完记 backfill-run（含 state/turnsDone/memoriesWritten）；熔断收尾额外记 backfill-pause。
+ * @returns outcome 供 kick 解释「为什么没跑」；state 仅 ran 时有值。
+ */
+export async function maybeRunIncrementalBackfill(
+  store: KyzmemStore,
+  backfill: IncrementalBackfillRunner | undefined,
+  budget: MaintenanceBudget,
+  options?: { idle?: boolean; now?: number },
+): Promise<{ outcome: IncrementalBackfillOutcome; state?: HistoryRunResult['state'] }> {
+  if (backfill === undefined) return { outcome: 'skipped-unconfigured' }
+  if (options?.idle === true) return { outcome: 'skipped-idle' }
+  if (budget.llmCalls <= 0) return { outcome: 'skipped-no-budget' }
+  const now = options?.now ?? Date.now()
+  const today = new Date(now).toISOString().slice(0, 10)
+  const recentRuns = await store.recentAudit(BACKFILL_RUN_OP, 10)
+  // 暂停门优先于 today 门：熔断后需要人工跑通一次，操作员看到的应该是 paused 而不是 today。
+  const [lastPause] = await store.recentAudit(BACKFILL_PAUSE_OP, 1)
+  const [lastRun] = recentRuns.slice(0, 1)
+  if (lastPause !== undefined && (lastRun === undefined || lastPause.at > lastRun.at)) {
+    return { outcome: 'skipped-paused' }
+  }
+  if (recentRuns.some(row => auditDate(row) === today)) return { outcome: 'skipped-today' }
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), INCREMENTAL_BACKFILL_TIMEOUT_MS)
+  try {
+    const result = await backfill.run(
+      {
+        days: INCREMENTAL_BACKFILL_DAYS,
+        maxTotalTurns: Math.min(budget.items, backfill.defaults.maxTotalTurns),
+      },
+      controller.signal,
+      { maxConsecutiveFailures: INCREMENTAL_BACKFILL_MAX_CONSECUTIVE_FAILURES },
+    )
+    await store.audit(BACKFILL_RUN_OP, 'BATCH', JSON.stringify({
+      date: today, auto: true, state: result.state,
+      turnsDone: result.turnsDone, memoriesWritten: result.memoriesWritten,
+    }))
+    if (result.state === 'failed') {
+      await store.audit(BACKFILL_PAUSE_OP, 'BATCH', JSON.stringify({ date: today, reason: 'consecutive-failures' }))
+    }
+    return { outcome: 'ran', state: result.state }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 /**
  * 跑一次自动裁决（P2 联动位）：内部 try/catch，失败只告警、不触碰既有整理的返回值。
  * 预算门：llmCalls <= 0 时不带 judge（纯规则轨）；双重失败（judge 和规则都抛错）
@@ -362,6 +454,11 @@ export interface KickMaintenanceOptions extends MaintenanceRunOptions {
   /** 失败回调（缺省 console.warn）。 */
   readonly onError?: (error: unknown) => void
   /**
+   * 增量回填（Phase 4）：index 注入回填引擎，kick 按「每日一次」顺带跑。
+   * 未传 = 不跑增量回填（手动回填照常用）。
+   */
+  readonly backfill?: IncrementalBackfillRunner
+  /**
    * 热配置来源（Phase 2.1）：decayAfterDays 按次读覆盖层。
    * 只传 dbDir；未传 = decay 门槛用装载期快照。预算（ms/items/llmCalls）是冷键，仍走快照。
    */
@@ -397,9 +494,20 @@ export function kickMaintenance(options?: KickMaintenanceOptions): void {
     const now = effective.now ?? Date.now()
     const lastRunAt = await store.lastAuditAt(MAINTENANCE_RUN_OP)
     const debt = await computeDebt(store, now)
+    const idle = await isIdle(store, effective.idleDays, now)
+    // Phase 4：每日增量回填（独立于 plan，有自己的 today/pause/预算门）。
+    // 跑过一次就返回：一次 kick 只做一件重活，plan 留给下一次事件触发。
+    if (effective.backfill !== undefined && !inFlight.has(store)) {
+      inFlight.add(store)
+      try {
+        const backfill = await maybeRunIncrementalBackfill(store, effective.backfill, effective.budget, { idle, now })
+        if (backfill.outcome === 'ran') return
+      } finally {
+        inFlight.delete(store)
+      }
+    }
     const plan = planMaintenance(debt, lastRunAt, await lastRunJob(store), now)
     if (plan === undefined) return
-    const idle = await isIdle(store, effective.idleDays, now)
     const budget = plan.small || idle ? idleBudget(effective.budget) : effective.budget
     // 热 decay 门槛（Phase 2.1）：面板改完 decayAfterDays，下一次 kick 即生效，不用重启。
     // 预算仍是冷键，走装载期快照。

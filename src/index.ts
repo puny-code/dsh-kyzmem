@@ -1287,8 +1287,8 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
     },
     estimate: (rules: HistoryBackfillRules): Promise<HistoryEstimate> =>
       estimateHistoryBackfill(buildHistoryDeps(), resolved.historyBackfill, rules),
-    run: (rules: HistoryBackfillRules, signal: AbortSignal): Promise<HistoryRunResult> =>
-      runHistoryBackfill(buildHistoryDeps(), resolved.historyBackfill, rules, () => { /* 同步运行不对外播报进度 */ }, signal),
+    run: (rules: HistoryBackfillRules, signal: AbortSignal, options?: { maxConsecutiveFailures?: number }): Promise<HistoryRunResult> =>
+      runHistoryBackfill(buildHistoryDeps(), resolved.historyBackfill, rules, () => { /* 同步运行不对外播报进度 */ }, signal, options),
     /** 启动后台回填；已有任务在跑时拒绝（面板按钮据此禁用）。 */
     start: (rules: HistoryBackfillRules): { ok: boolean; reason?: string } => {
       if (backfillJob !== undefined && backfillJob.progress.state === 'running') {
@@ -1308,8 +1308,27 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
         buildHistoryDeps(), resolved.historyBackfill, rules,
         progress => { job.progress = progress },
         controller.signal,
+        // 手动跑同样连败熔断（Phase 4）：失败模式与自动跑一致，面板看到的 state 口径统一。
+        { maxConsecutiveFailures: 3 },
       )
-        .then((result) => { job.progress = result; job.failures = result.failures })
+        .then((result) => {
+          job.progress = result
+          job.failures = result.failures
+          // 手动完成的记录同样记 backfill-run：自动调度的暂停门靠「最新的 run 记录」
+          // 判断，手动跑通一次即清除暂停（否则一次熔断后自动跑永远不再启动）。
+          void (async () => {
+            try {
+              const userStore = await buildHistoryDeps().openUserStore()
+              await userStore.audit('backfill-run', 'BATCH', JSON.stringify({
+                date: new Date().toISOString().slice(0, 10),
+                manual: true, state: result.state,
+                turnsDone: result.turnsDone, memoriesWritten: result.memoriesWritten,
+              }))
+            } catch {
+              // 审计写失败不影响回填结果本身：observability 缺一笔，不值得惊动用户。
+            }
+          })()
+        })
         .catch((error: unknown) => {
           // 整批失败（如枚举会话出错）：置 failed 并保留已累计进度，不抛给宿主。
           console.warn(message('core.warnHistoryBackfillFailed'), error)
@@ -1549,6 +1568,12 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
         judgeModel: resolved.judgeModel,
       }),
       version: VERSION,
+    },
+    // Phase 4 每日增量回填：复用回填引擎，规则沿用配置默认值（days 强制 7 走调度器），
+    // 配额/暂停/减载门由调度器判。手动跑与工具跑走 historyApi（同样连败熔断）。
+    backfill: {
+      run: (rules, signal, options) => historyApi.run(rules, signal, options),
+      defaults: resolved.historyBackfill,
     },
     // 合并任务要覆盖「本机上所有宫殿」：user.db + 全部 project-*.db。
     // 只整理 user.db 会让项目宫殿的重复记忆永远不被合并（多库逐个整理由 consolidation 层负责）。
