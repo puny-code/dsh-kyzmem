@@ -1,21 +1,50 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- 天枢图标（48）：北斗 α 星「枢星」的四芒，外围一道星轨。单色 currentColor，
-     与侧栏图标同形，深浅主题都随宿主文字色。 -->
+<!-- 天枢图标（48）：与插件页大图同源——椭圆纸面 + 细椭圆框 + 金色枢星 + 青色星轨。
+     小尺寸专用：描边按 48px 视觉重量加粗（大图的 3px 缩到 48 只剩 0.5px，会消失），
+     闪星与后轨虚线减到最低限度，避免 16px 下糊成一团。 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="天枢">
   <defs>
-    <linearGradient id="core" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="currentColor" stop-opacity="0.95"/>
-      <stop offset="100%" stop-color="currentColor" stop-opacity="0.62"/>
+    <linearGradient id="star48" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#FFF7DC"/>
+      <stop offset="45%" stop-color="#FBD47A"/>
+      <stop offset="100%" stop-color="#E79F1F"/>
     </linearGradient>
+    <linearGradient id="paper48" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#EAF0F8"/>
+    </linearGradient>
+    <radialGradient id="halo48" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#FDEFBF" stop-opacity="0.8"/>
+      <stop offset="70%" stop-color="#FDEFBF" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#FDEFBF" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <!-- 枢星：四芒 -->
-  <path d="M24 6 L27.2 20.8 L42 24 L27.2 27.2 L24 42 L20.8 27.2 L6 24 L20.8 20.8 Z"
-        fill="url(#core)" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+
+  <!-- 椭圆纸面 + 外圈细框 -->
+  <g transform="rotate(-18 24 24)">
+    <ellipse cx="24" cy="24" rx="21.4" ry="16.1" fill="url(#paper48)"/>
+    <ellipse cx="24" cy="24" rx="21.4" ry="16.1" fill="none" stroke="#C9D6EA" stroke-width="0.9"/>
+    <!-- 星轨后半：虚线极淡，16px 下让它退成背景 -->
+    <ellipse cx="24" cy="24" rx="18.75" ry="11.25" fill="none"
+             stroke="#0E9B94" stroke-opacity="0.22" stroke-width="0.9" stroke-dasharray="1.4 2.2" stroke-linecap="round"/>
+  </g>
+
+  <!-- 淡金辉光 -->
+  <circle cx="24" cy="24" r="17.2" fill="url(#halo48)"/>
+
+  <!-- 枢星：四芒（几何由 256 版等比缩放，描边加粗保轮廓） -->
+  <path d="M24 8.6 L27.2 20.8 L38.6 24 L27.2 27.2 L24 38.6 L20.8 27.2 L9.4 24 L20.8 20.8 Z"
+        fill="url(#star48)" stroke="#9A6307" stroke-width="1.1" stroke-linejoin="round"/>
   <!-- 星芯 -->
-  <circle cx="24" cy="24" r="3.4" fill="currentColor"/>
-  <!-- 星轨：绕枢星的一段弧 -->
-  <path d="M38.6 12.8 A 19.6 19.6 0 0 1 32.2 39.4"
-        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
-  <!-- 伴星 -->
-  <circle cx="40.4" cy="11.2" r="2" fill="currentColor" opacity="0.55"/>
+  <circle cx="24" cy="24" r="1.8" fill="#FFFDF3" stroke="#E9A22B" stroke-width="0.7"/>
+
+  <!-- 星轨前半：实线，粗于后轨，星前穿过 -->
+  <g transform="rotate(-18 24 24)" fill="none">
+    <path d="M8.1 28.7 A 18.75 11.25 0 0 0 39.9 25.9"
+          stroke="#0E9B94" stroke-opacity="0.75" stroke-width="1.6" stroke-linecap="round"/>
+  </g>
+
+  <!-- 伴星（白圈隔离轨道线） -->
+  <circle cx="36.4" cy="15.4" r="1.9" fill="#0E9B94" stroke="#FFFFFF" stroke-width="0.6"/>
+  <circle cx="10.6" cy="33.2" r="1.5" fill="#E9A22B" stroke="#FFFFFF" stroke-width="0.6"/>
 </svg>
