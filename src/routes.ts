@@ -25,6 +25,8 @@ import type { KyzmemLanguage } from './i18n/language.ts'
 import { messageIn } from './i18n/messages.ts'
 import { createBackup, restoreBackup, BACKUP_SCHEMA_VERSION } from './backup/tar.ts'
 import { runConsolidation } from './consolidation/run.ts'
+import { SCHEMA_VERSION } from './store/sqlite.ts'
+import { runHealthChecks } from './automation/health-check.ts'
 import { aggregateTelemetry, collectMetrics } from './telemetry/aggregate.ts'
 import { resolveDefaultScope } from './scope.ts'
 import { buildTourProposal } from './tour-proposal.ts'
@@ -887,7 +889,11 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
                 missingSummaries: 0,
               }
             }
-            json(res, 200, { overall, parts, evaluatedAt: Date.now(), debt })
+            json(res, 200, { overall, parts, evaluatedAt: Date.now(), debt, checks: (await runHealthChecks({
+              dbDir: deps.dbDir,
+              expectedSchemaVersion: SCHEMA_VERSION,
+              embedder: deps.embedder,
+            })).checks })
             return
           }
           if (req.method === 'GET' && route === 'corridor') {

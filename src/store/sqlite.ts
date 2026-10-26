@@ -32,8 +32,9 @@ import type {
 import type { KyzmemStore, RoomState, UndoAutoBatchResult } from './interface.ts'
 
 /** 当前 schema 版本；结构性变更必须 +1。可空列与伴随表走增量迁移（见 openKyzmemStore 的迁移段）。
- *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。 */
-const SCHEMA_VERSION = 16
+ *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。
+ *  导出给启动自检（health-check 只读比对，不打开迁移）。 */
+export const SCHEMA_VERSION = 16
 /** 增量迁移表：key 为起始版本，value 为升到下一版本的 SQL（可多语句）。
  *  v2 → v3：nodes 补可空列 outcome（使用效果回报）。
  *  v3 → v4：新增 nodes_revisions 修订表（update 归档旧条目时的内容快照）。
