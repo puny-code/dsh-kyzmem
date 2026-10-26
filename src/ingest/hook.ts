@@ -772,6 +772,101 @@ export async function bumpPendingIngest(
   return 'pending'
 }
 
+/** 死信每日重试配额：一天最多捞回 10 条（重跑是 LLM 调用，先到先得，剩下的明天）。 */
+export const DEAD_LETTER_RETRY_PER_DAY = 10
+/** 死信终身重试上限：同一 turn 最多记 3 条 retry 标记（第 3 次之后只留 exhausted 标记）。 */
+export const DEAD_LETTER_RETRY_LIFETIME = 3
+/** 每日重试的审计 op：记 {date, retried, exhausted}，同一 UTC 日期只跑一遍。 */
+const DEAD_LETTER_RETRY_OP = 'dead-letter-retry'
+const RETRY_MARK_REASON = 'retry'
+const RETRY_EXHAUSTED_REASON = 'retry-exhausted'
+
+export interface DeadLetterRetryResult {
+  readonly retried: number
+  readonly exhausted: number
+  readonly skipped: number
+}
+
+interface DeadLetterRow {
+  readonly key: string
+  readonly reason: string
+}
+
+function parseDeadLetterRow(detail: string | null): DeadLetterRow | undefined {
+  if (detail === null) return undefined
+  try {
+    const parsed = JSON.parse(detail) as { key?: unknown; reason?: unknown }
+    if (typeof parsed.key !== 'string' || typeof parsed.reason !== 'string') return undefined
+    if (decodeTurnKey(parsed.key) === undefined) return undefined
+    return { key: parsed.key, reason: parsed.reason }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 死信每日重试（Phase 5）：把「可能是 transient 失败」的死信捞回 pending 队列。
+ * - 一天只跑一遍（按 UTC 日期去重，手动/自动共用同一标记）；
+ * - 一遍最多捞 10 条（先死先捞），超出的留到明天——重跑要调辅助模型，不能无上限；
+ * - 同一 turn 终身最多 3 次 retry 标记；超限的不再捞，只补一条 retry-exhausted
+ *   标记（且只补一次），之后彻底跳过；
+ * - 已经 ingest-done 或仍在 pending 的键跳过（状态变了就不需要捞）。
+ * 捞回 = 重新记一条 pending（attempts 从 0 起），下一次 pre-step 重放会正常处理它。
+ */
+export async function retryDeadLetters(
+  store: KyzmemStore,
+  options: { now?: number; maxPerDay?: number; maxLifetimeRetries?: number } = {},
+): Promise<DeadLetterRetryResult> {
+  const now = options.now ?? Date.now()
+  const today = new Date(now).toISOString().slice(0, 10)
+  const maxPerDay = options.maxPerDay ?? DEAD_LETTER_RETRY_PER_DAY
+  const maxLifetimeRetries = options.maxLifetimeRetries ?? DEAD_LETTER_RETRY_LIFETIME
+  // 每日门：今天已经跑过一遍（无论捞没捞到），直接返回零。
+  for (const row of await store.recentAudit(DEAD_LETTER_RETRY_OP, 5)) {
+    try {
+      const parsed = JSON.parse(row.detail ?? '{}') as { date?: unknown }
+      if (parsed.date === today) return { retried: 0, exhausted: 0, skipped: 0 }
+    } catch {
+      // 坏行跳过：继续往后找今天的标记。
+    }
+  }
+  // recentAudit 是 seq 倒序（新的在前）；先死先捞，所以反转。
+  const rows = (await store.recentAudit(INGEST_DEAD_LETTER_OP, 1000)).reverse()
+  const byKey = new Map<string, DeadLetterRow[]>()
+  for (const row of rows) {
+    const parsed = parseDeadLetterRow(row.detail)
+    if (parsed === undefined) continue
+    const list = byKey.get(parsed.key)
+    if (list === undefined) byKey.set(parsed.key, [parsed])
+    else list.push(parsed)
+  }
+  let retried = 0
+  let exhausted = 0
+  let skipped = 0
+  for (const [key, entries] of byKey) {
+    if (await store.hasAudit(INGEST_DONE_OP, key)) { skipped += 1; continue }
+    if ((await findPendingDetail(store, key)) !== undefined) { skipped += 1; continue }
+    const retries = entries.filter(entry => entry.reason === RETRY_MARK_REASON).length
+    const exhaustedMarked = entries.some(entry => entry.reason === RETRY_EXHAUSTED_REASON)
+    if (retries >= maxLifetimeRetries) {
+      if (!exhaustedMarked) {
+        await store.audit(INGEST_DEAD_LETTER_OP, 'BATCH', JSON.stringify({ key, reason: RETRY_EXHAUSTED_REASON }))
+        exhausted += 1
+      } else {
+        skipped += 1
+      }
+      continue
+    }
+    if (retried >= maxPerDay) { skipped += 1; continue }
+    const decoded = decodeTurnKey(key)
+    await store.audit(INGEST_PENDING_OP, decoded?.sessionId ?? 'BATCH', encodePendingValue({ key, attempts: 0, firstAt: now }))
+    await store.audit(INGEST_DEAD_LETTER_OP, 'BATCH', JSON.stringify({ key, reason: RETRY_MARK_REASON, retry: retries + 1 }))
+    retried += 1
+  }
+  await store.audit(DEAD_LETTER_RETRY_OP, 'BATCH', JSON.stringify({ date: today, retried, exhausted }))
+  return { retried, exhausted, skipped }
+}
+
 /**
  * 写入 pending 键（done 已存在时不写；已 pending 则 attempts+1）。仅在末轮摄取失败/超时后调用。
  * 为什么每失败一次都要重写 detail：死信阈值与「30 天解析不到会话」都以次数/时间为判据，

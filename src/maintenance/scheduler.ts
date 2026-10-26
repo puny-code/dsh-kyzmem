@@ -14,6 +14,7 @@ import type { KyzmemLanguage } from '../i18n/language.ts'
 import { message } from '../i18n/messages.ts'
 import { autoResolveBatch } from '../automation/orchestrator.ts'
 import { liveHotConfig } from '../automation/live-config.ts'
+import { retryDeadLetters } from '../ingest/hook.ts'
 import type { MemoryJudge } from '../write-disposition.ts'
 import { DEFAULT_REFURB_OPTIONS, gatherRefurbSuggestions } from '../refurb.ts'
 import { runConsolidation } from '../consolidation/run.ts'
@@ -505,6 +506,13 @@ export function kickMaintenance(options?: KickMaintenanceOptions): void {
       } finally {
         inFlight.delete(store)
       }
+    }
+    // Phase 5：死信每日重试（轻量：只读审计 + 重记 pending，不调 LLM）。
+    // 每日门在函数内部（同一 UTC 日期只跑一遍）；这里失败也不阻断整理主流程。
+    try {
+      await retryDeadLetters(store)
+    } catch {
+      // 审计读失败：下一次 kick 会重试；整理主流程不受影响。
     }
     const plan = planMaintenance(debt, lastRunAt, await lastRunJob(store), now)
     if (plan === undefined) return
