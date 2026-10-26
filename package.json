@@ -81,7 +81,7 @@
     "@huggingface/transformers": "^4.2.0",
     "@types/node": "^26.4.0",
     "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
+    "@types/react-dom": "^19.0.1",
     "compression": "^1.8.2",
     "content-type": "^3.1.1",
     "ipaddr.js": "^2.5.0",
