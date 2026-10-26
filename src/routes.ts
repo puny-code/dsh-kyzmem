@@ -1028,6 +1028,18 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             }
             return
           }
+          if (req.method === 'POST' && route === 'auto-undo') {
+            // 批次撤销（前置工作 2）：把一个自动动作批次的归档/建边/改排期全部回滚。
+            if (!guardWrite(req, res)) return
+            const body = await readJsonBody(req)
+            const batchId = typeof body?.batchId === 'string' ? body.batchId : ''
+            if (batchId === '') { json(res, 400, { error: 'batchId required' }); return }
+            const rawScope = typeof body?.scope === 'string' ? body.scope : 'user'
+            const scope: 'user' | 'project' | 'shared' = rawScope === 'project' ? 'project' : rawScope === 'shared' ? 'shared' : 'user'
+            const store = await storeFor(scope)
+            json(res, 200, { ...(await store.undoAutoBatch(batchId)), scope })
+            return
+          }
           if (req.method === 'GET' && route === 'models') {
             // 已注册的 provider 与模型清单：面板「辅助模型」下拉的数据源。
             json(res, 200, await deps.history.models())

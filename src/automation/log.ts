@@ -9,9 +9,36 @@
  * @module dsh-kyzmem/automation-log
  */
 import type { KyzmemStore } from '../store/interface.ts'
+import type { KyzmemEdgeType, ReviewSchedule } from '../types.ts'
 
 /** 自动动作的审计 op 名：`auto-action` = 已生效；`auto-proposed` = 影子期只记录。 */
 export type AutoAuditOp = 'auto-action' | 'auto-proposed'
+
+/** 撤销一条 supersedes/contradicts 边（无向语义，两个方向都删）。 */
+export interface AutoUndoEdge {
+  readonly from: string
+  readonly to: string
+  readonly type: KyzmemEdgeType
+}
+
+/** 撤销一次排期变更：把条目的 SM-2 四元组写回快照值。 */
+export interface AutoUndoSchedule {
+  readonly id: string
+  readonly review: ReviewSchedule
+}
+
+/**
+ * 撤销规格（随动作一起记进 detail，`undoAutoBatch` 按此回滚）。
+ * 只描述「如何回到动作前」，不含任何判断逻辑。
+ */
+export interface AutoUndoSpec {
+  /** 需要重新置 active 的条目 id（归档类动作填输家）。 */
+  readonly restoreIds?: readonly string[]
+  /** 需要删除的边（归档时建的 supersedes、误建的 contradicts）。 */
+  readonly removeEdges?: readonly AutoUndoEdge[]
+  /** 需要写回的排期快照（改排期类动作填动作前的值）。 */
+  readonly restoreSchedule?: readonly AutoUndoSchedule[]
+}
 
 /** 自动动作审计条目：缺省项一律存 undefined（不进 JSON），必填 6 键缺一不可。 */
 export interface AutoActionEntry {
@@ -33,6 +60,8 @@ export interface AutoActionEntry {
   readonly note?: string
   /** 排期类动作的回滚数据（如改排期前的 review 值）。 */
   readonly prevReview?: unknown
+  /** 撤销规格：有它才能被 `undoAutoBatch` 回滚；纯标注类动作可省略。 */
+  readonly undo?: AutoUndoSpec
 }
 
 /**

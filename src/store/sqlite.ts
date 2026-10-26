@@ -28,7 +28,7 @@ import type {
   TimelineQuery, UpdateInput, WriteInput, MemoryAnchor, SessionSummaryRecord,
   EpisodeTimelineQuery, EpisodeTimelineResult,
 } from '../types.ts'
-import type { KyzmemStore, RoomState } from './interface.ts'
+import type { KyzmemStore, RoomState, UndoAutoBatchResult } from './interface.ts'
 
 /** 当前 schema 版本；结构性变更必须 +1。可空列与伴随表走增量迁移（见 openKyzmemStore 的迁移段）。
  *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。 */
@@ -731,6 +731,12 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
       AND l.scope IN (SELECT value FROM json_each(?)) AND r.scope IN (SELECT value FROM json_each(?))`)
   const sqlDeleteConflictEdge = db.prepare(`DELETE FROM edges WHERE type = 'contradicts'
     AND ((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?))`)
+  // 批次撤销（undoAutoBatch）：按调用方指定的边类型双向删除。
+  const sqlDeleteEdge = db.prepare(`DELETE FROM edges WHERE type = ?
+    AND ((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?))`)
+  // 批次撤销（undoAutoBatch）：把 SM-2 四元组写回动作前快照。
+  const sqlRestoreSchedule = db.prepare(`UPDATE nodes
+    SET next_review_at = ?, ease_factor = ?, interval_days = ?, review_reps = ? WHERE id = ?`)
   // 命中详情里的 contradicts 提示（只进 cues 不计分）：只对最终 top-N 命中逐条查，
   // N ≤ limit（通常 8），比每次检索都做一次全边 join 划算。
   const sqlContradictsByNode = db.prepare(`SELECT from_id, to_id FROM edges
@@ -1923,6 +1929,66 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         // 契约 §6：target=BATCH、detail={left,right,action}——面板「冲突裁决历史」的数据源。
         sqlLog.run(at, 'conflict-resolve', 'BATCH', JSON.stringify({ left: String(left), right: String(right), action }))
       })
+    },
+
+    async undoAutoBatch(batchId: string): Promise<UndoAutoBatchResult> {
+      // 批次可能很旧：recentAudit 按 seq 倒序取，个人库量级下 10000 行足够覆盖自动动作全史。
+      const rows = sqlAuditRecent.all('auto-action', 10000) as unknown as { detail: string | null }[]
+      const restored: string[] = []
+      const schedulesRestored: string[] = []
+      const seenRestore = new Set<string>()
+      let edgesRemoved = 0
+      const at = Date.now()
+      withTransaction(() => {
+        for (const row of rows) {
+          if (row.detail === null) continue
+          let detail: {
+            batchId?: unknown
+            undo?: {
+              restoreIds?: readonly unknown[]
+              removeEdges?: readonly { from?: unknown; to?: unknown; type?: unknown }[]
+              restoreSchedule?: readonly { id?: unknown; review?: {
+                nextReviewAt?: unknown; easeFactor?: unknown; intervalDays?: unknown; reps?: unknown } }[]
+            }
+          }
+          try {
+            detail = JSON.parse(row.detail) as typeof detail
+          } catch {
+            continue
+          }
+          // 损坏的 detail 跳过：审计行是只写的历史，不能因为一条坏 JSON 让整个撤销失败。
+          if (detail.batchId !== batchId || detail.undo === undefined) continue
+          for (const rawId of detail.undo.restoreIds ?? []) {
+            if (typeof rawId !== 'string' || seenRestore.has(rawId)) continue
+            // 条目已被物理删除（purge）时跳过：撤销保证「回到动作前」，但保证不了「复活已删数据」。
+            if (getRow(rawId) === undefined) continue
+            sqlRestore.run(rawId)
+            seenRestore.add(rawId)
+            restored.push(rawId)
+          }
+          for (const edge of detail.undo.removeEdges ?? []) {
+            if (typeof edge.from !== 'string' || typeof edge.to !== 'string' || typeof edge.type !== 'string') continue
+            const info = sqlDeleteEdge.run(edge.type, edge.from, edge.to, edge.to, edge.from)
+            edgesRemoved += Number(info.changes)
+          }
+          for (const item of detail.undo.restoreSchedule ?? []) {
+            if (typeof item.id !== 'string' || item.review === undefined) continue
+            if (getRow(item.id) === undefined) continue
+            const review = item.review
+            // JSON 里 age 过的值只认数字：字符串/布尔一律回退缺省，避免把脏数写进排期。
+            const nextReviewAt = typeof review.nextReviewAt === 'number' ? review.nextReviewAt : null
+            const easeFactor = typeof review.easeFactor === 'number' ? review.easeFactor : 2.5
+            const intervalDays = typeof review.intervalDays === 'number' ? review.intervalDays : 0
+            const reps = typeof review.reps === 'number' ? review.reps : 0
+            sqlRestoreSchedule.run(nextReviewAt, easeFactor, intervalDays, reps, item.id)
+            schedulesRestored.push(item.id)
+          }
+        }
+        sqlLog.run(at, 'auto-undo', 'BATCH', JSON.stringify({
+          batchId, restored: restored.length, edgesRemoved, schedulesRestored: schedulesRestored.length,
+        }))
+      })
+      return { restored, edgesRemoved, schedulesRestored }
     },
 
     async linkEdge(from: MemoryId, to: MemoryId, type: KyzmemEdgeType) {

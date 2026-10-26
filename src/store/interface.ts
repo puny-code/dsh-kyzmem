@@ -35,6 +35,16 @@ export interface RouteStop {
   readonly id: MemoryId
 }
 
+/** 按批次撤销自动动作的结果：三类回滚各自计数。 */
+export interface UndoAutoBatchResult {
+  /** 重新置 active 的条目 id。 */
+  readonly restored: string[]
+  /** 删除的边数。 */
+  readonly edgesRemoved: number
+  /** 写回排期快照的条目 id。 */
+  readonly schedulesRestored: string[]
+}
+
 /** 存储接口。所有方法在库不可用时抛 KyzmemError。 */
 export interface KyzmemStore {
   /** 追加一条 active 记忆，content 非空。 */
@@ -185,6 +195,14 @@ export interface KyzmemStore {
    * 'conflict-resolve'（target=BATCH，detail={left,right,action}）供面板回看裁决历史。
    */
   resolveConflict(left: MemoryId, right: MemoryId, action: ConflictAction): Promise<void>
+  /**
+   * 按批次 id 撤销自动动作（前置工作 2）：扫描 `auto-action` 审计行，把 detail.batchId
+   * 等于给定值的条目逐条回滚——`undo.restoreIds` 逐个 `restore`（幂等：重复调只重复记
+   * 审计，不改状态），`undo.removeEdges` 双向删边，`undo.restoreSchedule` 把 SM-2
+   * 四元组写回快照。没有撤销规格的条目跳过；未知批次返回全零结果。
+   * 回滚本身再记一条 `auto-undo`（target=BATCH），供面板回看。
+   */
+  undoAutoBatch(batchId: string): Promise<UndoAutoBatchResult>
   /** 最近邻：同库 active（user/project 行）中与给定向量余弦最高的条目及相似度；空库或无向量条目返回 undefined。 */
   nearestNeighbor(embedding: Float32Array): Promise<{ record: MemoryRecord; similarity: number } | undefined>
   /**
