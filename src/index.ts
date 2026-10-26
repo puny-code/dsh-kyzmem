@@ -935,8 +935,10 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
       reviewScheduling: resolved.reviewScheduling,
       // 写入期自动折算 expires_at：TTL 按 kind 配置在插件层解析，store 只认天数；
       // 复习重学窗口同理（纯函数 nextSchedule 需要调用方注入）。
+      // 迁移前整库备份（前置工作 4）：版本落后时先 tar 再迁移，备份失败 loud 中断。
       ttlDaysByKind: resolved.ttlDaysByKind,
       reviewRelearnDays: resolved.reviewRelearnDays,
+      backupBeforeMigrate: { dbDir: resolved.dbDir, pluginVersion: VERSION },
     })
       // 存量排桩：首次打开时幂等补齐（slot_room 为空的 active 条目按 kind 分房、创建时间定序）。
       .then(async store => {

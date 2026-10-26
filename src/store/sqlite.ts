@@ -11,6 +11,7 @@ import { copyFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { KyzmemError, EPISODE_PROXIMITY_MS_DEFAULT, EPISODE_TIMELINE_LIMIT_DEFAULT, asEntityId, asFactId, asMemoryId, asObservationId, normalizeEntityName } from '../types.ts'
 import { assignSlot } from '../palace/slots.ts'
+import { createBackup } from '../backup/tar.ts'
 import { nextSchedule } from '../review/sm2.ts'
 import { scorePlacard } from '../imagery/score.ts'
 import { message } from '../i18n/messages.ts'
@@ -494,6 +495,12 @@ export interface StoreAutomation {
   /** 按 kind 的 TTL（天，0 = 不过期）：WriteInput 未显式给 expiresAt 时由写入期自动折算。
    *  缺省不设置 = 不自动过期（保持旧库/脚本直开库的既有行为）。 */
   readonly ttlDaysByKind?: Readonly<Record<string, number>>
+  /**
+   * 迁移前自动备份（前置工作 4/方案 6D）：打开时发现版本落后，先对整个 dbDir 做一次
+   * tar 备份再迁移。备份失败 loud 中断（关库抛错），绝不带着没备份的库往新 schema 走。
+   * 缺省不备份（脚本直开库、单测保持旧行为）。
+   */
+  readonly backupBeforeMigrate?: { readonly dbDir: string; readonly pluginVersion: string }
 }
 /** 缺省全开（config 的默认值也在此处对齐）。 */
 const DEFAULT_AUTOMATION: StoreAutomation = { autoSlot: true, reviewScheduling: true }
@@ -612,6 +619,16 @@ export async function openKyzmemStore(path: string, rankBoost: RankBoostOptions 
         await copyFile(path, `${path}.pre-migration`)
       } catch (error) {
         console.warn(message('store.preMigrationSnapshotFailed', { path, msg: error instanceof Error ? error.message : String(error) }))
+      }
+      // 前置工作 4（方案 6D）：整库 tar 备份先行——备份写不出来就关库 loud 失败，
+      // 迁移一步也不跑；恢复走既有的 restore-backup 路由。
+      if (automation.backupBeforeMigrate !== undefined) {
+        try {
+          await createBackup(automation.backupBeforeMigrate.dbDir, automation.backupBeforeMigrate.pluginVersion)
+        } catch (error) {
+          db.close()
+          throw new KyzmemError('BACKUP_FAILED', `dsh-kyzmem: pre-migration backup failed for ${path}: ${error instanceof Error ? error.message : String(error)}`)
+        }
       }
     }
     while (version < SCHEMA_VERSION) {
