@@ -3444,6 +3444,75 @@ function ConflictQueue({ t, items, busy, onResolve }: {
   )
 }
 
+/** 一条自动动作审计行（/auto-history 的 entries 元素）。 */
+interface AutoHistoryEntry {
+  readonly at: number
+  readonly op: string
+  readonly targetId: string
+  readonly detail: string | null
+  readonly scope: string
+}
+
+interface AutoHistoryResult {
+  readonly entries: readonly AutoHistoryEntry[]
+}
+
+/** 审计 detail 里与面板有关的字段：解析失败一律按「无可撤销内容」处理。 */
+function parseAutoDetail(detail: string | null): { ruleId: string; batchId: string; undoable: boolean } {
+  if (detail === null) return { ruleId: '', batchId: '', undoable: false }
+  try {
+    const parsed = JSON.parse(detail) as { ruleId?: unknown; batchId?: unknown; undo?: unknown }
+    return {
+      ruleId: typeof parsed.ruleId === 'string' ? parsed.ruleId : '',
+      batchId: typeof parsed.batchId === 'string' ? parsed.batchId : '',
+      undoable: parsed.undo !== undefined,
+    }
+  } catch {
+    return { ruleId: '', batchId: '', undoable: false }
+  }
+}
+
+/**
+ * 自动裁决历史：auto-action 审计倒序，可撤销的批次给「撤销本批」按钮。
+ * 撤销走 POST auto-undo（整批回滚），成功后自增 tick 让队列与本表一起刷新。
+ */
+function AutoHistory({ t, entries, busy, onUndo }: {
+  readonly t: T
+  readonly entries: readonly AutoHistoryEntry[]
+  readonly busy: string | null
+  readonly onUndo: (batchId: string) => void
+}): React.ReactElement {
+  const locked = busy !== null
+  return (
+    <div className={styles.conflictList}>
+      {entries.map((row, index) => {
+        const parsed = parseAutoDetail(row.detail)
+        const key = parsed.batchId === '' ? `row-${String(index)}` : parsed.batchId
+        return (
+          <div key={key} className={styles.conflictRow}>
+            <div className={styles.conflictFoot}>
+              <span>{t('opsConflictCreatedAt', { time: relTime(t, row.at) })}</span>
+              <span>{parsed.ruleId === '' ? row.op : parsed.ruleId}</span>
+            </div>
+            {parsed.undoable && parsed.batchId !== '' && (
+              <div className={styles.conflictActions}>
+                <button
+                  type="button"
+                  className={styles.button}
+                  disabled={locked || busy === key}
+                  onClick={() => { onUndo(parsed.batchId) }}
+                >
+                  {t('opsAutoUndo')}
+                </button>
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 /**
  * 运维总览（ops tab 顶部四张卡）：待裁决冲突、检索通道、采用率、十二项指标。
  * /stats 与 /conflicts 各自失败只降级对应卡片，不影响 ops tab 里的历史回填区块；
@@ -3460,6 +3529,8 @@ function OpsPanel({ t, scope, project, reloadTick, toast }: {
   const [statsError, setStatsError] = useState<string | null>(null)
   const [conflicts, setConflicts] = useState<ConflictListResult | null>(null)
   const [conflictError, setConflictError] = useState<string | null>(null)
+  const [autoHistory, setAutoHistory] = useState<AutoHistoryResult | null>(null)
+  const [autoHistoryError, setAutoHistoryError] = useState<string | null>(null)
   /** 正在裁决的冲突对键；非空时所有裁决按钮禁用。 */
   const [busy, setBusy] = useState<string | null>(null)
   /** 裁决计数器：自增即触发上面的 effect 重拉两个接口。 */
@@ -3473,6 +3544,9 @@ function OpsPanel({ t, scope, project, reloadTick, toast }: {
     api<ConflictListResult>(`conflicts?scope=${scope}&limit=${String(CONFLICT_LIMIT)}`)
       .then((data) => { if (!cancelled) { setConflicts(data); setConflictError(null) } })
       .catch((error: Error) => { if (!cancelled) { setConflicts(null); setConflictError(error.message) } })
+    api<AutoHistoryResult>(`auto-history?scope=${scope}&limit=20`)
+      .then((data) => { if (!cancelled) { setAutoHistory(data); setAutoHistoryError(null) } })
+      .catch((error: Error) => { if (!cancelled) { setAutoHistory(null); setAutoHistoryError(error.message) } })
     return () => { cancelled = true }
   }, [scope, project, reloadTick, tick])
 
@@ -3488,6 +3562,22 @@ function OpsPanel({ t, scope, project, reloadTick, toast }: {
     })
       .then(() => {
         toast.push('success', t('opsConflictResolved'))
+        setTick(current => current + 1)
+      })
+      .catch((error: Error) => { toast.push('error', error.message) })
+      .finally(() => { setBusy(null) })
+  }
+
+  const undoBatch = (batchId: string): void => {
+    if (busy !== null) return
+    setBusy(`undo:${batchId}`)
+    void api<{ readonly restored: readonly string[] }>('auto-undo', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ batchId, scope }),
+    })
+      .then(() => {
+        toast.push('success', t('opsAutoUndone'))
         setTick(current => current + 1)
       })
       .catch((error: Error) => { toast.push('error', error.message) })
@@ -3520,6 +3610,21 @@ function OpsPanel({ t, scope, project, reloadTick, toast }: {
                     </div>
                   </Fragment>
                 )}
+        </div>
+      </section>
+      <section className={styles.section}>
+        <div className={styles.sectionHead}>
+          <h4 className={styles.sectionTitle}>{t('opsAutoHistoryTitle')}</h4>
+          <span className={styles.sectionHint}>{t('opsAutoHistoryHint')}</span>
+        </div>
+        <div className={styles.panelCard}>
+          {autoHistoryError !== null
+            ? <div className={styles.opsEmpty}>{`${t('opsAutoHistoryUnavailable')} · ${autoHistoryError}`}</div>
+            : autoHistory === null
+              ? <div className={styles.opsEmpty}>{t('loading')}</div>
+              : autoHistory.entries.length === 0
+                ? <div className={styles.opsEmpty}>{t('opsAutoHistoryEmpty')}</div>
+                : <AutoHistory t={t} entries={autoHistory.entries} busy={busy} onUndo={undoBatch} />}
         </div>
       </section>
       <section className={styles.section}>

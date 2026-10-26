@@ -1028,6 +1028,21 @@ export function registerKyzmemRoutes(ctx: Context, deps: RouteDeps): void {
             }
             return
           }
+          if (req.method === 'GET' && route === 'auto-history') {
+            // 自动动作裁决历史（P1.4）：各库 auto-action 审计倒序合并，面板据此渲染
+            // 「冲突裁决历史」+ 逐批撤销按钮（撤销走 POST auto-undo）。
+            const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
+            const rawScope = url.searchParams.get('scope')
+            const scopes: KyzmemScope[] = rawScope === 'all'
+              ? ['user', 'project', 'shared']
+              : [scopeOf(rawScope, defaultScope())]
+            const merged = (await Promise.all(scopes.map(async scope => {
+              const rows = await (await storeFor(scope)).recentAudit('auto-action', limit)
+              return rows.map(row => ({ ...row, scope }))
+            }))).flat().sort((a, b) => b.at - a.at).slice(0, limit)
+            json(res, 200, { entries: merged })
+            return
+          }
           if (req.method === 'POST' && route === 'auto-undo') {
             // 批次撤销（前置工作 2）：把一个自动动作批次的归档/建边/改排期全部回滚。
             if (!guardWrite(req, res)) return

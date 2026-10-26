@@ -252,6 +252,55 @@ describe('冲突路由（§8）', () => {
   })
 })
 
+describe('自动动作审计路由（P1.4）', () => {
+  it('GET /auto-history 返回 auto-action 审计行（含 scope），面板据此渲染裁决历史', async () => {
+    const { logAutoAction } = await import('../src/automation/log.ts')
+    await logAutoAction(store, {
+      op: 'auto-action',
+      ruleId: 'conflict-rule/r-tier',
+      thresholds: { newerMinAgeDays: 30 },
+      leftId: 'left-1',
+      rightId: 'right-1',
+      batchId: 'auto-conflict-1',
+      version: '0.16.0-test',
+      undo: { restoreIds: ['right-1'] },
+    })
+    const reply = await harness(makeDeps())('GET', '/api/kyzmem/auto-history?scope=user&limit=10')
+    expect(reply.status).toBe(200)
+    expect(Array.isArray(reply.json.entries)).toBe(true)
+    expect(reply.json.entries.length).toBe(1)
+    const row = reply.json.entries[0]
+    expect(row.op).toBe('auto-action')
+    expect(row.scope).toBe('user')
+    expect(typeof row.at).toBe('number')
+    const detail = JSON.parse(row.detail) as { ruleId: string; batchId: string }
+    expect(detail.ruleId).toBe('conflict-rule/r-tier')
+    expect(detail.batchId).toBe('auto-conflict-1')
+  })
+
+  it('POST /auto-undo 回滚批次归档并返回计数', async () => {
+    const { logAutoAction } = await import('../src/automation/log.ts')
+    const doomed = await store.write({ scope: 'user', kind: 'fact', content: '待撤销归档' })
+    await store.resolveConflict(
+      (await store.write({ scope: 'user', kind: 'fact', content: '胜者' })).id as never,
+      doomed.id as never,
+      'keep-left',
+    )
+    await logAutoAction(store, {
+      op: 'auto-action',
+      ruleId: 'conflict-rule/r-tier',
+      thresholds: {},
+      batchId: 'auto-conflict-undo-1',
+      version: '0.16.0-test',
+      undo: { restoreIds: [String(doomed.id)] },
+    })
+    const reply = await harness(makeDeps())('POST', '/api/kyzmem/auto-undo', { batchId: 'auto-conflict-undo-1', scope: 'user' })
+    expect(reply.status).toBe(200)
+    expect(reply.json.restored).toEqual([String(doomed.id)])
+    expect((await store.get(doomed.id as never))?.status).toBe('active')
+  })
+})
+
 describe('GET /api/kyzmem/health（后台欠账 + 维护 kick）', () => {
   it('返回 overall/parts/debt；维护调度器未落地时 debt 退化但结构完整', async () => {
     await store.write({ scope: 'user', kind: 'fact', content: '健康检查用条目' })
