@@ -47,6 +47,8 @@ import { reflectObservations } from './consolidation/reflect.ts'
 import type { IngestRequestEventData } from './ingest/hook.ts'
 import { parseJsonArray, routeFromEvents, streamText } from './llm/client.ts'
 import type { LlmRoute, SessionEventLike } from './llm/client.ts'
+import { buildJudge } from './automation/judge.ts'
+import type { MemoryJudge } from './write-disposition.ts'
 import { registerKyzmemRoutes } from './routes.ts'
 import type { ProjectPalaceView, RouteDeps } from './routes.ts'
 import { migrateProjectDb, migrationWarning, resolveProjectIdentity } from './project/identity.ts'
@@ -362,6 +364,28 @@ async function compressProfileOverflow(
 }
 
 /**
+ * P1.2 会话模型裁决器：judge.model 为空用默认对话路由，指定模型只换 model。
+ * hook 三站点按调用现建（路由随各自事件快照解析；无路由/调用失败时抛错，
+ * 由 decideWrite/confirmContradictions 降级，不中断写入链路）。
+ * 模块级函数：preStep 在 apply 之外定义，ctx/resolved/judgeModel 都走参数传入。
+ */
+function makeHookJudge(
+  ctx: Context,
+  judgeModel: string,
+  routeOverride: LlmRoute | undefined,
+  events: readonly SessionEventLike[],
+  sessionId: string | undefined,
+  signal: AbortSignal,
+): MemoryJudge {
+  return buildJudge({
+    call: params => streamText(ctx, { ...params, sessionId }),
+    getRoute: () => routeOverride ?? routeFromEvents(events),
+    judgeModel,
+    signal,
+  })
+}
+
+/**
  * agent/pre-step waterfall：每轮第一步注入画像（内容与上次相同则跳过重复注入）；
  * 同时 fire-and-forget 触发上一轮的自动摄取（不阻塞请求）；进程内首次第一步
  * 重放待补做的末轮摄取。必须调用 next() 委托链路；reject 决策原样透传，
@@ -445,6 +469,14 @@ async function preStep(
         signal,
         ttlDaysByKind: resolved.ttlDaysByKind,
         ingestDeadLetterAttempts: resolved.ingestDeadLetterAttempts,
+        judge: makeHookJudge(
+          ctx,
+          resolved.judgeModel,
+          resolved.routeOverride,
+          agent.session.snapshotEvents() as unknown as readonly SessionEventLike[],
+          String(agent.session.id),
+          signal,
+        ),
         // 减载档：久未活跃时只补最近的几条 pending，别在用户回来第一轮就补一堆。
         ...(idle ? { maxItems: IDLE_REPLAY_MAX_ITEMS } : {}),
       }).catch((error: unknown) => {
@@ -467,6 +499,14 @@ async function preStep(
         logRequest,
         signal,
         ttlDaysByKind: resolved.ttlDaysByKind,
+        judge: makeHookJudge(
+          ctx,
+          resolved.judgeModel,
+          resolved.routeOverride,
+          agent.session.snapshotEvents() as unknown as readonly SessionEventLike[],
+          String(agent.session.id),
+          signal,
+        ),
       }).catch((error: unknown) => {
         console.warn(message('core.warnIngestPreviousFailed'), error)
       })
@@ -1275,13 +1315,35 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
     }),
   }
 
+  // 工具侧裁决器工厂（P1.2）：工具 deps 在加载期构造、路由却在执行期才有，
+  // 因此只给工厂，save 执行时按本次执行解析的路由现建 judge。
+  // 无路由（routeOverride 与执行期事件都解析不出）返回 undefined → 降级纯规则。
+  const toolCall = (callParams: {
+    route: LlmRoute; system: string; userText: string; maxTokens: number;
+    purpose: string; signal: AbortSignal; sessionId: string | undefined;
+  }): Promise<string> => streamText(ctx, callParams)
+  const makeToolJudge = (
+    route: LlmRoute | undefined,
+    sessionId: string | undefined,
+    signal: AbortSignal,
+  ): MemoryJudge | undefined => {
+    if (route === undefined) return undefined
+    return buildJudge({
+      call: params => toolCall({ ...params, route, sessionId, signal }),
+      getRoute: () => route,
+      judgeModel: resolved.judgeModel,
+      signal,
+    })
+  }
+
   // 工具注册（历史回填的估算/执行由 historyApi 提供；project scope 按会话 cwd 归属解析）。
   for (const tool of createKyzmemTools({
     openStore,
     resolveProjectStore,
     embedder,
-    call: callParams => streamText(ctx, callParams),
+    call: toolCall,
     routeOverride: resolved.routeOverride,
+    makeJudge: makeToolJudge,
     queryRewrite: resolved.queryRewrite,
     exportDir: `${resolved.dbDir}/exports`,
     language: resolved.language,
@@ -1342,6 +1404,8 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
       const events = session.snapshotEvents() as unknown as readonly SessionEventLike[]
       const sessionId = String(session.id)
       const cwd = sessionCwd(session)
+      // 末轮调用预算与 judge 共用同一个超时信号：任一超时整体放弃，pending 由重放补做。
+      const finalSignal = AbortSignal.timeout(FINAL_INGEST_TIMEOUT_MS)
       void ingestFinalTurn({
         events,
         sessionId,
@@ -1356,7 +1420,8 @@ export function apply(ctx: Context, hostConfig: KyzmemConfig = {}): void {
         routeOverride: resolved.routeOverride,
         call: params => streamText(ctx, { ...params, sessionId: session.id }),
         logRequest: logIngestRequest,
-        signal: AbortSignal.timeout(FINAL_INGEST_TIMEOUT_MS),
+        signal: finalSignal,
+        judge: makeHookJudge(ctx, resolved.judgeModel, resolved.routeOverride, events, sessionId, finalSignal),
       })
         // 末轮摄取完成后收尾生成整场会话的一句话摘要：摄取失败（null）通常意味着
         // LLM 不可达，摘要同样会失败，不再起调用。摘要用独立 5 秒预算，不吃摄取的超时额度。

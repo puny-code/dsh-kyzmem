@@ -48,6 +48,12 @@ export interface KyzmemConfig {
   provider?: string
   /** 蒸馏/摄取覆盖路由的 model；必须与 provider 成对提供。 */
   model?: string
+  /**
+   * 裁决器模型覆盖（P1.2）：只换 model，不换 provider。空 = 用默认对话路由
+   * （当前会话在用的 provider/model）；指定模型不可用时回退默认路由，
+   * 调用失败退化为规则或只标注，绝不中断流程。
+   */
+  judgeModel?: string
   /** 衰减：从未被检索命中、且最近访问超过该天数才可能被归档；默认 90。 */
   decayAfterDays?: number
   /** TTL（schema v15）：各类记忆的有效天数，0 = 永不过期；默认 fact 180 / episode 90 / decision 365 / preference 0 / skill 0。 */
@@ -175,6 +181,8 @@ export interface ResolvedKyzmemConfig {
   readonly reflect: ReflectModeConfig
   /** 成对校验后的路由覆盖；undefined = 从会话日志解析路由。 */
   readonly routeOverride: { readonly provider: string; readonly model: string } | undefined
+  /** 裁决器模型覆盖（空 = 默认对话路由；指定模型只换 model）。 */
+  readonly judgeModel: string
   readonly decayAfterDays: number
   /** 各类记忆的 TTL 天数（0 = 永不过期，schema v15）。 */
   readonly ttlDaysByKind: Readonly<Record<KyzmemKind, number>>
@@ -223,7 +231,7 @@ export interface ResolvedKyzmemConfig {
 /** 合法配置键集合（未知键 loud 失败）。 */
 export const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'legacyMigration', 'dbDir', 'injectProfile', 'profileTopN', 'modelCacheDir', 'hfEndpoint',
-  'ingest', 'reflect', 'provider', 'model', 'decayAfterDays',
+  'ingest', 'reflect', 'provider', 'model', 'judgeModel', 'decayAfterDays',
   'ttlFactDays', 'ttlEpisodeDays', 'ttlDecisionDays', 'ttlPreferenceDays', 'ttlSkillDays',
   'injectTiers', 'recallPerItem', 'recallTotal',
   'maintenanceEnabled', 'maintenanceBudgetMs', 'maintenanceBudgetItems', 'maintenanceBudgetLlmCalls', 'maintenanceIdleDays',
@@ -266,6 +274,7 @@ export const Config: z<KyzmemConfig> = z.object({
   reflect: z.string() as unknown as z<ReflectModeConfig>,
   provider: z.string(),
   model: z.string(),
+  judgeModel: z.string(),
   decayAfterDays: z.number().step(1).min(1).max(3650),
   ttlFactDays: z.number().step(1).min(0).max(3650),
   ttlEpisodeDays: z.number().step(1).min(0).max(3650),
@@ -451,6 +460,7 @@ export function resolveConfig(config: KyzmemConfig = {}): ResolvedKyzmemConfig {
     language: resolveLanguage(config.language ?? 'auto'),
     redactWords: config.redactWords ?? [],
     routeOverride: hasProvider && hasModel ? { provider: config.provider!, model: config.model! } : undefined,
+    judgeModel: config.judgeModel ?? '',
     decayAfterDays: config.decayAfterDays ?? 90,
     ttlDaysByKind: {
       fact: config.ttlFactDays ?? 180,

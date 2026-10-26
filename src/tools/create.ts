@@ -57,8 +57,23 @@ export interface ToolDeps {
   readonly call: ((params: { route: LlmRoute; system: string; userText: string; maxTokens: number; purpose: string; signal: AbortSignal; sessionId: string | undefined }) => Promise<string>) | undefined
   /** 显式路由覆盖（Config provider+model）；缺省从会话日志解析。 */
   readonly routeOverride: LlmRoute | undefined
-  /** Jev 判断器（Config jev.enabled 时注入）；undefined = 纯规则四态，DEFER 落库即建边。 */
+  /**
+   * 写入裁决器：DEFER 模糊带与矛盾确认用；undefined = 纯规则四态，不中断写入。
+   * 工具 deps 在加载期构造、路由却在执行期才有：此槽位仅作无执行上下文路径的
+   * 兜底；save 执行优先用 makeJudge 按本次执行解析的路由现建。
+   */
   readonly judge?: MemoryJudge
+  /**
+   * 按执行构造裁决器的工厂（P1.2）：路由随执行解析，无路由返回 undefined 降级纯规则。
+   * @param route - 本次执行解析出的路由（routeOverride ?? 会话事件）。
+   * @param sessionId - 本次执行的会话 id（可缺省；宿主按用途拼稳定兜底标识）。
+   * @param signal - 本次执行的取消信号。
+   */
+  readonly makeJudge?: (
+    route: LlmRoute | undefined,
+    sessionId: string | undefined,
+    signal: AbortSignal,
+  ) => MemoryJudge | undefined
   /** 是否启用检索查询改写（Config queryRewrite）；false 时 kyzmem_search 直接单查询。 */
   readonly queryRewrite: boolean
   /** 导出文件目录（kyzmem_export 写入）。 */
@@ -553,10 +568,13 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       /** 文件锚（schema v16）：调用方已按工作区算好；缺省 = 不写锚点。 */
       anchor?: MemoryAnchor
     },
+    /** 本次执行现建的裁决器（路由随执行解析）；缺省用 deps.judge；都没有 = 纯规则。 */
+    judge?: MemoryJudge,
   ): Promise<WriteOutcome | { readonly dropped: DropReason }> {
     const { embedding } = item
+    const activeJudge = judge ?? deps.judge
     // judge + content 成对提供时，DEFER 模糊带交判断器三路裁决；未注入 judge 时行为与纯规则四态一致。
-    const decision = await decideWrite(store, item.kind, embedding, deps.judge === undefined ? { content: item.content } : { judge: deps.judge, content: item.content })
+    const decision = await decideWrite(store, item.kind, embedding, activeJudge === undefined ? { content: item.content } : { judge: activeJudge, content: item.content })
     if (decision.disposition === 'drop') return { dropped: decision.reason }
     if (decision.disposition === 'merge') {
       const record = await applyMerge(store, decision, item.content, embedding)
@@ -583,10 +601,10 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
       // каждая отложенная запись порождает связь «противоречит сама себе».
       const candidates = (await store.findContradictions(embedding as Float32Array))
         .filter(candidate => candidate.id !== record.id)
-      // judge 在场时矛盾边先经 Jev 确认（失败返回 undefined = 降级为全量建边，与旧行为一致）。
-      const confirmed = deps.judge === undefined
+      // judge 在场时矛盾边先经裁决器确认（失败返回 undefined = 降级为全量建边，与旧行为一致）。
+      const confirmed = activeJudge === undefined
         ? candidates
-        : (await confirmContradictions(deps.judge, item.content, candidates)) ?? candidates
+        : (await confirmContradictions(activeJudge, item.content, candidates)) ?? candidates
       for (const candidate of confirmed) {
         await store.linkEdge(record.id, candidate.id, 'contradicts')
       }
@@ -627,7 +645,7 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
   }
 
   /** 批量保存：统一清洗/校验/批量内去重，一次批量嵌入，逐条写入；单条失败不阻塞其余。 */
-  async function saveBatch(sourceSessionId: string | null, items: readonly unknown[], rawScope: unknown): Promise<SaveBatchResult> {
+  async function saveBatch(sourceSessionId: string | null, items: readonly unknown[], rawScope: unknown, judge?: MemoryJudge): Promise<SaveBatchResult> {
     if (items.length > MAX_SAVE_BATCH) throw new Error(message('tool.saveTooManyInBatch', { max: MAX_SAVE_BATCH }))
     const scope = scopeOf(rawScope, 'project')
     const store = await deps.openStore(scope)
@@ -679,7 +697,8 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
           // 批量 save 同样是显式保存动作：整批记 user-confirmed。
           sourceTier: 'user-confirmed',
           ...(embedding === undefined ? {} : { embedding }),
-        })
+        },
+        judge)
         // DROP：过短或逐字重复，不落库、不计失败（op_log 已在判定处留痕）。
         if ('dropped' in outcome) { droppedCount += 1; continue }
         // merge 处置无新条目，实体挂被并入的既有条目；其余挂新条目。
@@ -780,7 +799,17 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         if (!Array.isArray(input.items) || input.items.length === 0) {
           throw new Error(message('tool.saveItemsMustBeNonEmpty'))
         }
-        return saveBatch(sourceSessionId, input.items, input.scope)
+        return saveBatch(
+          sourceSessionId,
+          input.items,
+          input.scope,
+          // P1.2：批量与单条同一口径——路由随执行解析，现建 judge；无路由降级纯规则。
+          deps.makeJudge?.(
+            deps.routeOverride ?? routeFromEvents((exec.agent?.session?.snapshotEvents() ?? []) as unknown as Parameters<typeof routeFromEvents>[0]),
+            exec.agent?.session === undefined ? undefined : String(exec.agent.session.id),
+            exec.signal,
+          ),
+        )
       }
       if (typeof input.content !== 'string' || typeof input.kind !== 'string') {
         throw new Error(message('tool.saveParamsRequired'))
@@ -820,7 +849,13 @@ export function createKyzmemTools(baseDeps: ToolDeps): ToolDefinition[] {
         ...(embeddings?.[0] === undefined ? {} : { embedding: embeddings[0] }),
         ...(imagery === undefined ? {} : { imagery }),
         ...(anchor === undefined ? {} : { anchor }),
-      })
+      },
+      // P1.2：路由随执行解析，save 执行时现建 judge；无路由返回 undefined → 降级纯规则。
+      deps.makeJudge?.(
+        deps.routeOverride ?? routeFromEvents((exec.agent?.session?.snapshotEvents() ?? []) as unknown as Parameters<typeof routeFromEvents>[0]),
+        exec.agent?.session === undefined ? undefined : String(exec.agent.session.id),
+        exec.signal,
+      ))
       // 实体关联：merge 挂被并入的既有条目，accept/defer 挂新条目；失败静默。
       if ('dropped' in outcome) {
         // DROP：如实告知模型「这次没记」，原因来自规则判定（寒暄/逐字重复/跨 kind 近重复），op_log 已有审计行。
